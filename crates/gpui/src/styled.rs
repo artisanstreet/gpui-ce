@@ -969,3 +969,33 @@ pub trait Styled: Sized {
         self
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Filter, div, px};
+
+    #[test]
+    fn backdrop_blur_appends_to_the_backdrop_filter_chain() {
+        let mut element = div().backdrop_blur(px(8.)).backdrop_blur(px(4.));
+        assert_eq!(
+            element.style().backdrop_filter,
+            Some(vec![Filter::Blur(px(8.)), Filter::Blur(px(4.))])
+        );
+        // The content-filter chain is untouched by backdrop setters.
+        assert_eq!(element.style().filter, None);
+    }
+
+    #[test]
+    fn backdrop_filter_replaces_the_chain_while_blur_targets_content() {
+        let mut element = div()
+            .backdrop_blur(px(8.))
+            .backdrop_filter(vec![Filter::Blur(px(2.))])
+            .blur(px(5.));
+        assert_eq!(
+            element.style().backdrop_filter,
+            Some(vec![Filter::Blur(px(2.))])
+        );
+        assert_eq!(element.style().filter, Some(vec![Filter::Blur(px(5.))]));
+    }
+}
