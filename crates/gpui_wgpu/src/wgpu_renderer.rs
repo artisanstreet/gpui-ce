@@ -3505,3 +3505,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "shadow_tests.rs"]
+mod shadow_tests;

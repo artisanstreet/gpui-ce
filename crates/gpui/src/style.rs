@@ -827,15 +827,17 @@ impl Style {
 
         let current_color = self.text.color.unwrap_or_else(|| window.text_style().color);
 
+        // Blur the content behind this element before its (typically translucent) background
+        // and its own shadows are painted on top, so the background tints the frosted backdrop
+        // without the element's shadows becoming part of the sampled content (CSS
+        // `backdrop-filter`).
+        if !self.backdrop_filter.is_empty() {
+            window.paint_backdrop_filter(bounds, corner_radii, &self.backdrop_filter);
+        }
+
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
         if let Some(ring) = self.ring.shadow(current_color, false) {
             window.paint_drop_shadows(bounds, corner_radii, std::slice::from_ref(&ring));
-        }
-
-        // Blur the content behind this element before its (typically translucent) background
-        // is painted on top, so the background tints the frosted backdrop (CSS `backdrop-filter`).
-        if !self.backdrop_filter.is_empty() {
-            window.paint_backdrop_filter(bounds, corner_radii, &self.backdrop_filter);
         }
 
         // The element's own box — background, inset shadows, children, and border — painted as a
@@ -1701,5 +1703,71 @@ mod tests {
         assert_eq!(inset.color, explicit_color);
         assert!(inset.inset);
         assert_eq!(style.ring, RingStyle::default());
+    }
+
+    #[crate::test]
+    fn style_paint_orders_backdrop_before_outer_shadows_and_element_contents(
+        cx: &mut crate::TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, app| {
+            let bounds = Bounds {
+                origin: point(px(10.), px(10.)),
+                size: size(px(80.), px(80.)),
+            };
+            let mut style = Style::default();
+            style.background = Some(Fill::from(red().with_alpha(0.2)));
+            style.border_color = Some(green());
+            style.border_widths = Edges::all(px(1.).into());
+            style.backdrop_filter = vec![Filter::Blur(px(8.))];
+            style.box_shadow = vec![
+                BoxShadow::new(px(0.), px(0.), blue()).blur_radius(px(4.)),
+                BoxShadow::new(px(0.), px(0.), yellow()).inset(),
+            ];
+            style.ring = RingStyle {
+                width: px(2.),
+                color: RingColor::Color(red()),
+            };
+            style.inset_ring = RingStyle {
+                width: px(1.),
+                color: RingColor::Color(blue()),
+            };
+
+            window.next_frame.scene.clear();
+            window.invalidator.set_phase(crate::DrawPhase::Paint);
+            style.paint(bounds, window, app, |window, _| {
+                window.paint_quad(quad(
+                    bounds,
+                    Corners::default(),
+                    blue(),
+                    Edges::default(),
+                    black().with_alpha(0.0),
+                    BorderStyle::default(),
+                ));
+            });
+            window.invalidator.set_phase(crate::DrawPhase::None);
+
+            window.next_frame.scene.finish();
+            let scene = &window.next_frame.scene;
+            assert_eq!(scene.backdrop_filters.len(), 1);
+            assert_eq!(scene.shadows.len(), 4);
+            // The border may be split into disjoint quads by the overdraw optimizer.
+            assert!(scene.quads.len() >= 3);
+
+            let orders = [
+                scene.backdrop_filters[0].order,
+                scene.shadows[0].order,
+                scene.shadows[1].order,
+                scene.quads[0].order,
+                scene.shadows[2].order,
+                scene.shadows[3].order,
+                scene.quads[1].order,
+            ];
+            assert!(
+                orders.windows(2).all(|orders| orders[0] < orders[1]),
+                "style paint order changed: {orders:?}"
+            );
+            assert!(scene.quads[2..].iter().all(|border| border.order > scene.quads[1].order));
+        });
     }
 }
