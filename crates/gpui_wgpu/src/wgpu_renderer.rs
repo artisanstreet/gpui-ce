@@ -3509,3 +3509,7 @@ mod tests {
 #[cfg(all(test, not(target_family = "wasm")))]
 #[path = "shadow_tests.rs"]
 mod shadow_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "gradient_tests.rs"]
+mod gradient_tests;

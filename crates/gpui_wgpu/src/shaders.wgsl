@@ -394,6 +394,50 @@ fn blend_color(color: vec4<f32>, alpha_factor: f32) -> vec4<f32> {
     return vec4<f32>(color.rgb * multiplier, alpha);
 }
 
+// 4x4 Bayer threshold for ordered dithering, returned as 0..15.
+//
+// Closed form of the standard matrix
+//     0  8  2 10
+//    12  4 14  6
+//     3 11  1  9
+//    15  7 13  5
+// derived from M_{2n} = [[4M_n, 4M_n + 2], [4M_n + 3, 4M_n + 1]] with
+// M_2(a, b) = 2 * (a ^ b) + b. Pure integer math, so the CPU reference in
+// `gradient_tests.rs` reproduces it bit-exactly.
+fn bayer4_threshold(x: i32, y: i32) -> f32 {
+    let qx = (x >> 1) & 1;
+    let qy = (y >> 1) & 1;
+    let lx = x & 1;
+    let ly = y & 1;
+    let inner = 2 * (lx ^ ly) + ly;
+    let offset = 2 * (qx ^ qy) + qy;
+    return f32(4 * inner + offset);
+}
+
+// Ordered dither for linear-gradient ramps, in units of one 8-bit code.
+//
+// The same scalar is added to all three channels so near-neutral ramps (the
+// S900 -> S925 face) keep their hue instead of scattering chroma noise. The
+// range is [(0.5 / 16) - 0.5, (15.5 / 16) - 0.5], strictly inside ±0.5 LSB,
+// so flat endpoints never round into a neighbouring code because of dither.
+fn gradient_dither(position: vec2<f32>) -> f32 {
+    let x = i32(floor(position.x)) & 3;
+    let y = i32(floor(position.y)) & 3;
+    return (bayer4_threshold(x, y) + 0.5) / 16.0 - 0.5;
+}
+
+// Encode linear light to sRGB for storage in the swapchain and intermediate
+// targets. Every target in this backend uses a non-sRGB UNORM format, so the
+// stored bytes are expected gamma-encoded: solids, sprites, shadows and text
+// already store encoded values, and gradients must too.
+//
+// The clamp keeps out-of-gamut Oklab mixes (negative linear channels) from
+// producing NaN in `pow`; in-gamut colors are unaffected, and values above
+// 1.0 saturate to 1.0 on store either way.
+fn linear_to_srgb_clamped(linear: vec3<f32>) -> vec3<f32> {
+    return linear_to_srgb(clamp(linear, vec3<f32>(0.0), vec3<f32>(1.0)));
+}
+
 
 struct GradientColor {
     solid: vec4<f32>,
@@ -408,17 +452,19 @@ fn prepare_gradient_color(tag: u32, color_space: u32,
     if (tag == 0u || tag == 2u || tag == 3u) {
         result.solid = hsla_to_rgba(solid);
     } else if (tag == 1u) {
-        // The hsla_to_rgba is returns a linear sRGB color
-        result.color0 = hsla_to_rgba(colors[0].color);
-        result.color1 = hsla_to_rgba(colors[1].color);
+        // hsla_to_rgba returns gamma-encoded sRGB. Decode to linear light
+        // FIRST so interpolation starts from true linear stops: previously
+        // the encoded stops were used as if they were already linear, which
+        // pushed dark Oklab ramps (S900 -> S925) toward black and quantized
+        // them into visible bands.
+        result.color0 = srgba_to_linear(hsla_to_rgba(colors[0].color));
+        result.color1 = srgba_to_linear(hsla_to_rgba(colors[1].color));
 
         // Prepare color space in vertex for avoid conversion
-        // in fragment shader for performance reasons
-        if (color_space == 0u) {
-            // sRGB
-            result.color0 = linear_to_srgba(result.color0);
-            result.color1 = linear_to_srgba(result.color1);
-        } else if (color_space == 1u) {
+        // in fragment shader for performance reasons.
+        // sRGB stops stay linear; the fragment mixes in linear light and
+        // encodes once before storage. Oklab converts further here.
+        if (color_space == 1u) {
             // Oklab
             result.color0 = linear_srgb_to_oklab(result.color0);
             result.color1 = linear_srgb_to_oklab(result.color1);
@@ -468,15 +514,23 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
             t = (t - stop0_percentage) / (stop1_percentage - stop0_percentage);
             t = clamp(t, 0.0, 1.0);
 
-            switch (background.color_space) {
-                default: {
-                    background_color = srgba_to_linear(mix(color0, color1, t));
-                }
-                case 1u: {
-                    let oklab_color = mix(color0, color1, t);
-                    background_color = oklab_to_linear_srgb(oklab_color);
-                }
+            // Both spaces interpolate from linear-light stops and encode
+            // exactly once to the gamma-encoded storage every other
+            // primitive uses, so a gradient endpoint equals the same solid
+            // fill color instead of a double-gamma or missing-gamma variant.
+            var linear_color = mix(color0, color1, t);
+            if (background.color_space == 1u) {
+                linear_color = oklab_to_linear_srgb(mix(color0, color1, t));
             }
+            let encoded = linear_to_srgb_clamped(linear_color.rgb);
+            // Deterministic ordered dither at the final 8-bit quantization,
+            // in encoded space where the quantization happens. Applied
+            // pre-premultiplication, so opaque ramps carry the full ±0.5 LSB
+            // and transparent edges scale with their contribution; alpha
+            // itself is never dithered. Solid/sprite/text/blur paths never
+            // reach this branch, so flat fills stay bit-exact.
+            let dither = gradient_dither(position);
+            background_color = vec4<f32>(encoded + vec3<f32>(dither / 255.0), linear_color.a);
         }
         case 2u: {
             // pattern slash
