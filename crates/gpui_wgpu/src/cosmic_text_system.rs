@@ -1050,8 +1050,14 @@ fn face_info_into_properties(
 }
 
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
-    // TODO: Include other common emoji fonts
-    postscript_name == "NotoColorEmoji"
+    // Glyphs from these faces rasterize through the color sources
+    // (`ColorOutline`/`ColorBitmap`); every other face stays on the
+    // monochrome outline path so ordinary text and symbol fonts never
+    // change appearance.
+    matches!(
+        postscript_name,
+        "NotoColorEmoji" | "SegoeUIEmoji" | "AppleColorEmoji" | ".AppleColorEmojiUI"
+    )
 }
 
 #[cfg(test)]
@@ -1300,6 +1306,100 @@ mod tests {
             }]
         );
         assert!(clip_font_runs(&runs, 5..5).is_empty());
+    }
+
+    /// Color-emoji faces per shipped platform take the color raster path;
+    /// body and symbol faces stay monochrome. `Segoe UI Symbol` is the
+    /// deliberate negative: text-presentation symbols must not flip.
+    #[test]
+    fn known_emoji_fonts_cover_shipped_platforms() {
+        for name in [
+            "NotoColorEmoji",
+            "SegoeUIEmoji",
+            "AppleColorEmoji",
+            ".AppleColorEmojiUI",
+        ] {
+            assert!(
+                check_is_known_emoji_font(name),
+                "{name} must take the color raster path"
+            );
+        }
+        for name in [
+            "Spline Sans",
+            "Segoe UI",
+            "Segoe UI Symbol",
+            "Arial",
+            "",
+        ] {
+            assert!(
+                !check_is_known_emoji_font(name),
+                "{name} must stay on the outline path"
+            );
+        }
+    }
+
+    /// End to end on Windows: the inbox `Segoe UI Emoji` face shapes
+    /// U+1F389 with the emoji flag set and rasterizes BGRA bytes holding
+    /// real color variance — not a monochrome mask. Skips (passes) where
+    /// the platform does not provide the face.
+    #[test]
+    fn system_emoji_rasterizes_color_where_platform_provides_it() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI Emoji"))?;
+        let size = gpui::px(32.0);
+        let text = "\u{1F389}";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id,
+            letter_spacing: None,
+        }];
+        let layout = text_system.layout_line(text, size, &runs);
+
+        let (run_font_id, glyph_id) = layout
+            .runs
+            .iter()
+            .flat_map(|run| run.glyphs.iter().map(|glyph| (run.font_id, glyph)))
+            .find(|(_, glyph)| glyph.is_emoji)
+            .map(|(font_id, glyph)| (font_id, glyph.id))
+            .expect("party popper must shape with the emoji flag set");
+
+        let params = RenderGlyphParams {
+            font_id: run_font_id,
+            glyph_id,
+            font_size: size,
+            subpixel_variant: gpui::point(0u8, 0u8),
+            scale_factor: 1.0,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = text_system.glyph_raster_bounds(&params)?;
+        assert!(!bounds.is_zero(), "emoji raster bounds must be non-empty");
+        let (_, data) = text_system.rasterize_glyph(&params, bounds)?;
+        assert!(
+            !data.is_empty() && data.len() % 4 == 0,
+            "emoji raster must be BGRA bytes, not a 1-byte mask"
+        );
+        let vivid = data.chunks_exact(4).any(|pixel| {
+            let opaque = pixel[3] > 0;
+            opaque && (pixel[0] != pixel[1] || pixel[1] != pixel[2])
+        });
+        assert!(
+            vivid,
+            "rasterized emoji must hold non-grayscale color pixels"
+        );
+        Ok(())
     }
 
     #[test]
