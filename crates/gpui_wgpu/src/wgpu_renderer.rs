@@ -299,6 +299,34 @@ const MAX_FILTER_DEPTH: usize = 2;
 /// Each frame uses 4 passes per backdrop/group plus one blit; 256 covers dozens of filters.
 const BLUR_PARAMS_SLOTS: u64 = 256;
 
+/// Typed wgpu fixture readback: tightly-packed RGBA bytes in top-to-bottom
+/// row order plus dimensions. Built by
+/// [`WgpuRenderer::render_to_rgba_image`] from the same scene texture the
+/// shipping [`WgpuRenderer::draw`] presents; the caller (e.g. the Windows
+/// test-support window) wraps it in `image::RgbaImage`, so this crate gains
+/// no new dependency.
+pub struct WgpuCapturedImage {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+/// Staging upload for one armed capture frame, without its submission index.
+struct CaptureStaging {
+    buffer: wgpu::Buffer,
+    width: u32,
+    height: u32,
+    padded_bytes_per_row: u32,
+    is_bgra: bool,
+}
+
+/// Readback encoded by the capturing `draw` call and consumed by
+/// `render_to_rgba_image` after present. `None` in all production draws.
+struct PendingCapture {
+    staging: CaptureStaging,
+    submission: wgpu::SubmissionIndex,
+}
+
 pub struct WgpuRenderer {
     /// Shared GPU context for device recovery coordination (unused on WASM).
     #[allow(dead_code)]
@@ -334,6 +362,14 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    /// Opt-in fixture capture, armed only by `render_to_rgba_image` for the
+    /// duration of one `draw` call. Forces the offscreen scene path and a
+    /// pre-present copy of the scene texture to a staging buffer. `false` in
+    /// all normal production draws, so behavior/performance is unchanged.
+    capture_armed: std::cell::Cell<bool>,
+    /// Staging readback encoded by the capturing `draw` call. `None` in
+    /// production.
+    pending_capture: RefCell<Option<PendingCapture>>,
 }
 
 impl WgpuRenderer {
@@ -753,6 +789,8 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            capture_armed: std::cell::Cell::new(false),
+            pending_capture: RefCell::new(None),
         })
     }
 
@@ -1315,7 +1353,12 @@ impl WgpuRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_SRC is inert for normal draws; it lets an opt-in fixture
+            // capture (`render_to_rgba_image`) copy the scene texture to a
+            // staging buffer before present without reconfiguring anything.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -1627,8 +1670,13 @@ impl WgpuRenderer {
 
         // Blur is the only thing that needs the offscreen scene texture; allocate it (and the
         // ping/pong/group targets) lazily so non-blurring apps pay no extra VRAM or blit.
-        let use_offscreen =
-            !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
+        // An armed fixture capture forces the same offscreen path so the scene texture holds
+        // the frame for the pre-present staging copy below. `take` clears the flag, so a
+        // draw that bails before presenting cannot arm a later production frame.
+        let capture = self.capture_armed.take();
+        let use_offscreen = capture
+            || !scene.backdrop_filters.is_empty()
+            || !scene.filter_boundaries.is_empty();
         if use_offscreen {
             self.ensure_blur_textures();
         }
@@ -1961,17 +2009,205 @@ impl WgpuRenderer {
             }
 
             // Present the offscreen scene by copying it into the swapchain texture. Skipped when
-            // rendering went straight to the swapchain (no filters this frame).
+            // rendering went straight to the swapchain (no filters this frame). An armed fixture
+            // capture forces the offscreen path above, so the scene texture holds the frame.
             if let Some(scene_color_view) = &scene_color_view {
                 self.blit_to_frame(&mut encoder, scene_color_view, &frame_view);
             }
 
-            self.resources()
+            // Opt-in only (`capture` is false for every production draw): copy the same scene
+            // texture the blit just presented into a staging buffer, before present. Encode
+            // failures are logged; the frame still presents normally and the capturer reports
+            // the missing readback as an error.
+            let staging = if capture {
+                match self.encode_capture(&mut encoder) {
+                    Ok(staging) => Some(staging),
+                    Err(error) => {
+                        log::error!("wgpu fixture capture failed to encode: {error:#}");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let submission = self
+                .resources()
                 .queue
                 .submit(std::iter::once(encoder.finish()));
+            if let Some(staging) = staging {
+                *self.pending_capture.borrow_mut() = Some(PendingCapture {
+                    staging,
+                    submission,
+                });
+            }
             frame.present();
             return true;
         }
+    }
+
+    /// Render `scene` through the shipping [`Self::draw`] pipeline into this
+    /// window's surface and return the frame as tightly-packed RGBA bytes.
+    ///
+    /// This is the wgpu analogue of the DirectX `render_to_image`: no OS
+    /// screenshot and no user-app manipulation. The hidden test window may be
+    /// drawn; the staging copy reads only this window's own scene texture.
+    /// The frame still presents normally, so the draw pipeline under test is
+    /// identical to production. Callers must route through the platform
+    /// test-support `render_to_image`, which wraps the bytes in
+    /// `image::RgbaImage`.
+    ///
+    /// Returns an error (without presenting guarantees) for zero/invalid
+    /// size, unsupported surface formats, the WebGL instance-data path, a
+    /// lost device, or a frame the compositor skipped (occluded/timeout).
+    pub fn render_to_rgba_image(&mut self, scene: &Scene) -> Result<WgpuCapturedImage> {
+        if self.uses_webgl_instance_data {
+            anyhow::bail!(
+                "fixture capture not supported on the WebGL instance-data path"
+            );
+        }
+        if self.resources.is_none() {
+            anyhow::bail!("fixture capture unavailable: GPU resources not available");
+        }
+        if !self.surface_configured {
+            anyhow::bail!("fixture capture unavailable: surface not configured");
+        }
+        if self.device_lost() {
+            anyhow::bail!("fixture capture unavailable while recovering from a lost device");
+        }
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        if width == 0 || height == 0 {
+            anyhow::bail!("fixture capture with zero surface size");
+        }
+        // Drop any stale readback; the capturing draw below replaces it on success.
+        self.pending_capture.borrow_mut().take();
+        self.capture_armed.set(true);
+        let presented = self.draw(scene);
+        // `draw` takes (clears) the armed flag on entry; clear defensively so
+        // an early-bailing draw cannot arm a later production frame.
+        self.capture_armed.set(false);
+        if !presented {
+            self.pending_capture.borrow_mut().take();
+            anyhow::bail!(
+                "fixture capture: frame was not presented (surface lost, occluded, or GPU error)"
+            );
+        }
+        let pending = self
+            .pending_capture
+            .borrow_mut()
+            .take()
+            .context("fixture capture: readback was not encoded")?;
+        if pending.staging.width != width || pending.staging.height != height {
+            anyhow::bail!("fixture capture: surface resized mid-frame");
+        }
+        self.map_capture(pending)
+    }
+
+    /// Encode a copy of the offscreen scene texture into a staging buffer.
+    /// Must be called from the capturing `draw` after the scene (and blit)
+    /// passes, before the encoder is submitted. Reads the same scene texture
+    /// production presents; row pitch is padded to the 256-byte texture-copy
+    /// alignment and stripped on map.
+    fn encode_capture(&self, encoder: &mut wgpu::CommandEncoder) -> Result<CaptureStaging> {
+        let resources = self.resources();
+        let texture = resources
+            .scene_color_texture
+            .as_ref()
+            .context("fixture capture: scene texture missing")?;
+        let (width, height) = (self.surface_config.width, self.surface_config.height);
+        if width == 0 || height == 0 {
+            anyhow::bail!("fixture capture with zero surface size");
+        }
+        let is_bgra = match self.surface_config.format {
+            wgpu::TextureFormat::Bgra8Unorm => true,
+            wgpu::TextureFormat::Rgba8Unorm => false,
+            format => anyhow::bail!("fixture capture unsupported for surface format {format:?}"),
+        };
+        let unpadded = (width as u64)
+            .checked_mul(4)
+            .and_then(|bytes| u32::try_from(bytes).ok())
+            .context("fixture capture row size overflow")?;
+        // Texture-to-buffer copies require 256-byte-aligned rows.
+        let padded_bytes_per_row = unpadded.next_multiple_of(256);
+        let buffer_size = (padded_bytes_per_row as u64)
+            .checked_mul(height as u64)
+            .context("fixture capture buffer size overflow")?;
+        if buffer_size == 0 {
+            anyhow::bail!("fixture capture with empty surface");
+        }
+        let buffer = resources.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fixture_capture_staging"),
+            size: buffer_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        Ok(CaptureStaging {
+            buffer,
+            width,
+            height,
+            padded_bytes_per_row,
+            is_bgra,
+        })
+    }
+
+    /// Block on the capturing submission, strip copy padding, and convert to
+    /// tightly-packed RGBA. Mirrors the readback pattern in this crate's
+    /// pixel-regression tests (`shadow_tests`, `gradient_tests`).
+    fn map_capture(&self, pending: PendingCapture) -> Result<WgpuCapturedImage> {
+        let staging = pending.staging;
+        let resources = self.resources();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        staging.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        resources
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: Some(pending.submission),
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })
+            .context("fixture capture: polling GPU for readback")?;
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .context("fixture capture: waiting for buffer mapping")?
+            .context("fixture capture: mapping readback buffer")?;
+        let unpadded = (staging.width as usize) * 4;
+        let padded = staging.padded_bytes_per_row as usize;
+        let mut rgba = vec![0u8; unpadded * staging.height as usize];
+        {
+            let mapped = staging.buffer.slice(..).get_mapped_range();
+            for (dst_row, src_row) in rgba.chunks_exact_mut(unpadded).zip(mapped.chunks_exact(padded))
+            {
+                dst_row.copy_from_slice(&src_row[..unpadded]);
+            }
+        }
+        staging.buffer.unmap();
+        if staging.is_bgra {
+            for px in rgba.chunks_exact_mut(4) {
+                px.swap(0, 2);
+            }
+        }
+        Ok(WgpuCapturedImage {
+            width: staging.width,
+            height: staging.height,
+            rgba,
+        })
     }
 
     fn record_frame(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> Result<()> {

@@ -1137,10 +1137,23 @@ impl PlatformWindow for WindowsWindow {
 
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
-        self.state
-            .renderer
-            .borrow_mut()
-            .render_to_image(scene, self.state.background_appearance.get())
+        #[cfg(feature = "wgpu")]
+        {
+            let captured = self
+                .state
+                .renderer
+                .borrow_mut()
+                .render_to_rgba_image(scene)?;
+            image::RgbaImage::from_raw(captured.width, captured.height, captured.rgba)
+                .context("Failed to build RgbaImage from wgpu fixture readback")
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            self.state
+                .renderer
+                .borrow_mut()
+                .render_to_image(scene, self.state.background_appearance.get())
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
