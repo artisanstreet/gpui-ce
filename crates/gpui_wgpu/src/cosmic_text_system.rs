@@ -1314,12 +1314,10 @@ fn is_single_combined_cluster(
             return false;
         }
         // Glyph 3 is ignorable only as the expected color face's own
-        // variation-selector remnant — matching production exactly. Any
-        // other face's gid 3 takes the normal path below.
-        if glyph_id == 3 {
-            if !(expected && is_emoji_face) {
-                return false;
-            }
+        // remnant. A non-color face's own gid 3 is an ordinary valid
+        // glyph and counts normally below; any other face's gid 3 takes
+        // the normal path and fails the expected check.
+        if glyph_id == 3 && expected && is_emoji_face {
             continue;
         }
         if !expected {
@@ -2354,7 +2352,7 @@ mod tests {
     fn pick_cluster_slot_formation_breaks_full_coverage_ties() {
         let primary = fid(0);
         let fb = chain(&[1, 2]);
-        let covers_all = |_: FontId, _: char| true;
+        let covers_all = |id: FontId, _: char| id != fid(0);
         // First face forms: native-first order holds.
         let mut first_forms = |id: FontId, _: &str| id == fid(1);
         assert_eq!(
