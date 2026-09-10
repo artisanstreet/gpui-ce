@@ -446,7 +446,7 @@ impl CosmicTextSystemState {
                 chain.push((id, SharedString::from(family.0.clone())));
             }
         }
-        let chain = Arc::from(chain);
+        let chain: Arc<[(FontId, SharedString)]> = Arc::from(chain);
         self.emoji_chain_cache = Some(chain.clone());
         chain
     }
