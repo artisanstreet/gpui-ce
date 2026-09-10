@@ -1525,9 +1525,7 @@ mod tests {
         if !cfg!(target_os = "windows") {
             return Ok(());
         }
-        let Some(twemoji) = twemoji_bytes() else {
-            return Ok(());
-        };
+        let twemoji = require_twemoji_bytes();
         let text_system = CosmicTextSystem::new("Segoe UI");
         text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
         if !text_system
@@ -1577,9 +1575,10 @@ mod tests {
     /// resolves to one Twemoji run with the emoji flag and colored pixels.
     #[test]
     fn twemoji_serves_uncovered_flag_as_one_cluster() -> Result<()> {
-        let Some(twemoji) = twemoji_bytes() else {
+        if !cfg!(target_os = "windows") {
             return Ok(());
-        };
+        }
+        let twemoji = require_twemoji_bytes();
         let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
         text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
         text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
@@ -1617,19 +1616,91 @@ mod tests {
         assert_color_raster(&text_system, font_id, glyph_id, gpui::px(32.0))
     }
 
-    /// Live-routing invariant over representative clusters: every
-    /// emoji-flagged glyph comes from a color face with native preferred,
-    /// plain glyphs never come from Twemoji. U+1F389 anchors native-first
-    /// deterministically; a Twemoji win anywhere also proves its raster.
+    /// Loads the superproject Twemoji asset; the gate runs on Windows
+    /// with the asset present, so a missing file fails loudly instead of
+    /// silently skipping the proof. Other platforms skip (out of scope).
+    fn require_twemoji_bytes() -> Vec<u8> {
+        twemoji_bytes().expect(
+            "Twemoji asset required at modules/assets/fonts/twemoji-mozilla.ttf \
+             (see docs/reference-emoji-interface.md)",
+        )
+    }
+
+    /// Shapes `text` with an ordinary body-font request.
+    fn shape_body(
+        text_system: &CosmicTextSystem,
+        font_id: FontId,
+        text: &str,
+    ) -> LineLayout {
+        let runs = [FontRun {
+            len: text.len(),
+            font_id,
+            letter_spacing: None,
+        }];
+        text_system.layout_line(text, gpui::px(32.0), &runs)
+    }
+
+    /// Collects `(font, glyph, is_emoji)` for glyphs addressing
+    /// `start..end`, so whole-grapheme outcomes (ZWJ, VS16, modifiers,
+    /// regional and tag sequences) are asserted — never a first scalar.
+    fn cluster_glyphs(
+        layout: &LineLayout,
+        start: usize,
+        end: usize,
+    ) -> Vec<(FontId, GlyphId, bool)> {
+        let mut out = Vec::new();
+        for run in &layout.runs {
+            for glyph in &run.glyphs {
+                if glyph.index >= start && glyph.index < end {
+                    out.push((run.font_id, glyph.id, glyph.is_emoji));
+                }
+            }
+        }
+        out
+    }
+
+    /// Asserts every cluster glyph shares one face, names it, and proves
+    /// the color raster on its first glyph.
+    fn assert_single_color_cluster(
+        text_system: &CosmicTextSystem,
+        layout: &LineLayout,
+        start: usize,
+        end: usize,
+        expected_face: &str,
+        text: &str,
+    ) -> Result<()> {
+        let glyphs = cluster_glyphs(layout, start, end);
+        assert!(!glyphs.is_empty(), "{text:?} must shape glyphs");
+        let (font_id, _, _) = glyphs[0];
+        assert!(
+            glyphs.iter().all(|(id, _, _)| *id == font_id),
+            "{text:?} cluster must not fragment across faces"
+        );
+        assert!(
+            glyphs.iter().all(|(_, _, emoji)| *emoji),
+            "{text:?} cluster must take the color path"
+        );
+        assert_eq!(
+            face_postscript(text_system, font_id).as_deref(),
+            Some(expected_face),
+            "{text:?} cluster must resolve to {expected_face}"
+        );
+        let (_, glyph_id, _) = glyphs[0];
+        assert_color_raster(text_system, font_id, glyph_id, gpui::px(32.0))
+    }
+
+    /// Mandatory precedence proof with BOTH system fonts and Twemoji:
+    /// party popper stays native while the tag-sequence England flag —
+    /// whose tag scalars Segoe lacks, so coverage (not order) routes it —
+    /// resolves to Twemoji as one cluster with colored pixels.
     #[test]
-    fn emoji_clusters_resolve_to_single_color_face_native_first() -> Result<()> {
+    fn native_popper_and_twemoji_flag_share_one_layout() -> Result<()> {
         if !cfg!(target_os = "windows") {
             return Ok(());
         }
+        let twemoji = require_twemoji_bytes();
         let text_system = CosmicTextSystem::new("Segoe UI");
-        if let Some(twemoji) = twemoji_bytes() {
-            text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
-        }
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
         if !text_system
             .all_font_names()
             .iter()
@@ -1639,62 +1710,129 @@ mod tests {
         }
 
         let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
-        let mut anchored_native = false;
-        for text in [
-            "\u{1F389}",
-            "\u{1F1F3}\u{1F1F4}",
-            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
-            "#\u{FE0F}\u{20E3}",
-            "\u{1F44D}\u{1F3FD}",
-        ] {
-            let runs = [FontRun {
-                len: text.len(),
-                font_id,
-                letter_spacing: None,
-            }];
-            let layout = text_system.layout_line(text, gpui::px(32.0), &runs);
-            assert!(
-                layout.runs.iter().any(|run| !run.glyphs.is_empty()),
-                "{text:?} must shape glyphs"
+        let popper = "\u{1F389}";
+        let flag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E007F}";
+        let text = format!("{popper}{flag}");
+        let layout = shape_body(&text_system, font_id, &text);
+
+        let popper_glyphs = cluster_glyphs(&layout, 0, popper.len());
+        assert!(!popper_glyphs.is_empty());
+        for (id, _, emoji) in popper_glyphs {
+            assert!(emoji, "party popper must take the color path");
+            assert_eq!(
+                face_postscript(&text_system, id).as_deref(),
+                Some("SegoeUIEmoji"),
+                "party popper must stay native with Twemoji registered"
             );
-            for run in &layout.runs {
-                let face = face_postscript(&text_system, run.font_id);
-                for glyph in &run.glyphs {
-                    if glyph.is_emoji {
-                        assert!(
-                            matches!(
-                                face.as_deref(),
-                                Some("SegoeUIEmoji") | Some("TwemojiMozilla")
-                            ),
-                            "{text:?} emoji glyphs must come from a color face"
-                        );
-                        if text == "\u{1F389}" {
-                            assert_eq!(
-                                face.as_deref(),
-                                Some("SegoeUIEmoji"),
-                                "party popper must stay native with Twemoji registered"
-                            );
-                            anchored_native = true;
-                        }
-                        if face.as_deref() == Some("TwemojiMozilla") {
-                            assert_color_raster(
-                                &text_system,
-                                run.font_id,
-                                glyph.id,
-                                gpui::px(32.0),
-                            )?;
-                        }
-                    } else {
-                        assert_ne!(
-                            face.as_deref(),
-                            Some("TwemojiMozilla"),
-                            "{text:?} plain glyphs must stay off the emoji face"
-                        );
-                    }
-                }
-            }
         }
-        assert!(anchored_native, "party popper must prove native-first");
+        assert_single_color_cluster(
+            &text_system,
+            &layout,
+            popper.len(),
+            text.len(),
+            "TwemojiMozilla",
+            flag,
+        )
+    }
+
+    /// VS16 requests emoji presentation: whole cluster, native face, color.
+    #[test]
+    fn vs16_heart_shapes_native_color_cluster() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let twemoji = require_twemoji_bytes();
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let text = "\u{2764}\u{FE0F}";
+        let layout = shape_body(&text_system, font_id, text);
+        assert_single_color_cluster(
+            &text_system,
+            &layout,
+            0,
+            text.len(),
+            "SegoeUIEmoji",
+            text,
+        )
+    }
+
+    /// VS15 requests text presentation: Twemoji lacks U+FE0E, so it must
+    /// not serve any glyph of the cluster — native handling is preserved
+    /// as-is. Presentation policy itself is a separate packet.
+    #[test]
+    fn vs15_heart_never_routes_to_twemoji() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let twemoji = require_twemoji_bytes();
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let text = "\u{2764}\u{FE0E}";
+        let layout = shape_body(&text_system, font_id, text);
+        let glyphs = cluster_glyphs(&layout, 0, text.len());
+        assert!(!glyphs.is_empty(), "VS15 cluster must shape glyphs");
+        for (id, _, _) in &glyphs {
+            assert_ne!(
+                face_postscript(&text_system, *id).as_deref(),
+                Some("TwemojiMozilla"),
+                "VS15 text presentation must not route to the color fallback face"
+            );
+        }
+        Ok(())
+    }
+
+    /// ZWJ family, skin-tone, and keycap clusters: whole grapheme, native
+    /// face by the established order, color raster proven.
+    #[test]
+    fn zwj_skin_keycap_clusters_shape_native_color() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let twemoji = require_twemoji_bytes();
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        for text in [
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+            "\u{1F44D}\u{1F3FD}",
+            "#\u{FE0F}\u{20E3}",
+        ] {
+            let layout = shape_body(&text_system, font_id, text);
+            assert_single_color_cluster(
+                &text_system,
+                &layout,
+                0,
+                text.len(),
+                "SegoeUIEmoji",
+                text,
+            )?;
+        }
         Ok(())
     }
 
