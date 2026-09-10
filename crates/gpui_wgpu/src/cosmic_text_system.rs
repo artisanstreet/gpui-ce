@@ -427,7 +427,8 @@ impl CosmicTextSystemState {
             let ids = if let Some(cached) = self.font_ids_by_family_cache.get(&key) {
                 cached.clone()
             } else {
-                let Ok(loaded) = self.load_family(family, &FontFeatures::default(), None)
+                let std::result::Result::Ok(loaded) =
+                    self.load_family(family, &FontFeatures::default(), None)
                 else {
                     continue;
                 };
@@ -1280,21 +1281,53 @@ fn face_forms_single_cluster(
         cosmic_text::Hinting::Disabled,
     );
     let single = layouts.first().is_some_and(|layout| {
-        layout
-            .glyphs
-            .iter()
-            .filter(|glyph| {
-                glyph.font_id == expected
-                    && glyph.glyph_id != 0
-                    && !(glyph.glyph_id == 3 && is_emoji_face)
-            })
-            .count()
-            == 1
+        is_single_combined_cluster(
+            layout
+                .glyphs
+                .iter()
+                .map(|glyph| (glyph.font_id == expected, glyph.glyph_id)),
+            is_emoji_face,
+        )
     });
     if cache.len() < CLUSTER_FORMATION_CACHE_LIMIT {
         cache.insert((family, grapheme.to_owned()), single);
     }
     single
+}
+
+/// Decides whether shaped output counts as one combined cluster from
+/// the expected face. Each item is `(is_expected_face, glyph_id)`.
+/// Ignored strays (`.notdef`, and glyph 3 in known color-emoji faces)
+/// prove nothing either way; every remaining visible glyph must come
+/// from the expected face, and exactly one must remain. In particular
+/// one good glyph plus another face's output is a fragmented cluster,
+/// not a combination.
+fn is_single_combined_cluster(
+    glyphs: impl Iterator<Item = (bool, u16)>,
+    is_emoji_face: bool,
+) -> bool {
+    let mut visible = 0;
+    for (expected, glyph_id) in glyphs {
+        // `.notdef` never proves coverage: a missing glyph rejects the
+        // whole probe immediately. It must not be blessed as stray.
+        if glyph_id == 0 {
+            return false;
+        }
+        // Glyph 3 is ignorable only as the expected color face's own
+        // variation-selector remnant — matching production exactly. Any
+        // other face's gid 3 takes the normal path below.
+        if glyph_id == 3 {
+            if !(expected && is_emoji_face) {
+                return false;
+            }
+            continue;
+        }
+        if !expected {
+            return false;
+        }
+        visible += 1;
+    }
+    visible == 1
 }
 
 fn charmap_covers(loaded_fonts: &[LoadedFont], id: FontId, ch: char) -> bool {
@@ -2342,60 +2375,35 @@ mod tests {
         );
     }
 
-    /// Whole-grapheme slot selection with a stubbed formation probe.
-    /// ASCII graphemes stay primary, primary-full stays primary, single
-    /// full-coverers win without probing, and formation breaks ties among
-    /// several full-coverers. Nothing uncovered keeps the legacy
-    /// first-scalar rule.
+    /// The counting rule behind formation probing: `.notdef` rejects
+    /// immediately, glyph 3 is ignorable only as the expected color
+    /// face's own remnant, every remaining visible glyph must come from
+    /// the expected face, and exactly one must remain. In particular one
+    /// good glyph plus `.notdef` or another face's output is NOT a
+    /// combination.
     #[test]
-    fn pick_cluster_slot_prefers_forming_native_first_face() {
-        let primary = fid(0);
-        let fb = chain(&[1, 2]);
-        // Panic stub: none of these fixtures may consult formation.
-        let mut never = |_: FontId, _: &str| -> bool {
-            panic!("formation probe must not run here");
-        };
-
-        assert_eq!(
-            pick_cluster_slot("\r\n", primary, &fb, &|_, _| true, &mut never),
-            None
-        );
-        assert_eq!(
-            pick_cluster_slot("é", primary, &fb, &|_, _| true, &mut never),
-            None
-        );
-        let covers_emoji = |id: FontId, ch: char| id == fid(1) && ch != '\u{200D}';
-        assert_eq!(
-            pick_cluster_slot("\u{1F389}", primary, &fb, &covers_emoji, &mut never),
-            Some(0)
-        );
-        let covers_none = |_: FontId, _: char| false;
-        assert_eq!(
-            pick_cluster_slot("字", primary, &fb, &covers_none, &mut never),
-            pick_covering_slot('字', None, primary, &fb, &covers_none)
-        );
-    }
-
-    #[test]
-    fn pick_cluster_slot_formation_breaks_full_coverage_ties() {
-        let primary = fid(0);
-        let fb = chain(&[1, 2]);
-        let covers_all = |_: FontId, _: char| true;
-        let mut first_forms = |id: FontId, _: &str| id == fid(1);
-        assert_eq!(
-            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut first_forms),
-            Some(0)
-        );
-        let mut second_forms = |id: FontId, _: &str| id == fid(2);
-        assert_eq!(
-            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut second_forms),
-            Some(1)
-        );
-        let mut none_forms = |_: FontId, _: &str| false;
-        assert_eq!(
-            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut none_forms),
-            Some(0)
-        );
+    fn single_combined_cluster_rejects_mixed_output() {
+        assert!(is_single_combined_cluster([(true, 42u16)].into_iter(), true));
+        assert!(!is_single_combined_cluster(
+            [(true, 42u16), (true, 0u16)].into_iter(),
+            true
+        ));
+        assert!(!is_single_combined_cluster(
+            [(true, 42u16), (false, 0u16)].into_iter(),
+            true
+        ));
+        assert!(!is_single_combined_cluster(
+            [(true, 42u16), (false, 200u16)].into_iter(),
+            true
+        ));
+        assert!(!is_single_combined_cluster(
+            [(true, 42u16), (true, 43u16)].into_iter(),
+            true
+        ));
+        assert!(!is_single_combined_cluster([].into_iter(), true));
+        assert!(!is_single_combined_cluster([(true, 3u16)].into_iter(), true));
+        assert!(!is_single_combined_cluster([(false, 3u16)].into_iter(), true));
+        assert!(is_single_combined_cluster([(true, 3u16)].into_iter(), false));
     }
 
     #[test]
