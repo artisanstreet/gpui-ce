@@ -1433,14 +1433,29 @@ mod tests {
         let layout = text_system.layout_line(text, gpui::px(32.0), &runs);
 
         let emoji_start = text.len() - "\u{1F389}".len();
-        let routed = layout
+        let emoji_font_id = layout
             .runs
             .iter()
-            .flat_map(|run| &run.glyphs)
-            .any(|glyph| glyph.index == emoji_start && glyph.is_emoji);
-        assert!(
-            routed,
-            "emoji scalar under a body-font request must shape from a color face"
+            .find(|run| {
+                run.glyphs
+                    .iter()
+                    .any(|glyph| glyph.index == emoji_start && glyph.is_emoji)
+            })
+            .map(|run| run.font_id)
+            .expect("emoji scalar under a body-font request must shape from a color face");
+        let postscript = {
+            let state = text_system.0.read();
+            let db_id = state.loaded_fonts[emoji_font_id.0].font.id();
+            state
+                .font_system
+                .db()
+                .face(db_id)
+                .map(|face| face.post_script_name.clone())
+        };
+        assert_eq!(
+            postscript.as_deref(),
+            Some("SegoeUIEmoji"),
+            "native-first precedence: the platform color face must win the fallback"
         );
         Ok(())
     }
