@@ -51,6 +51,17 @@ struct CosmicTextSystemState {
     /// for every font face in a family.
     font_ids_by_family_cache: HashMap<FontKey, SmallVec<[FontId; 4]>>,
     system_font_fallback: String,
+    /// Caches whether shaping a grapheme with a family yields one
+    /// combined glyph. Keyed by family name and grapheme text; shaping
+    /// topology never depends on size, so one entry serves all frames.
+    /// Capped: model output can stream unbounded unique graphemes, so at
+    /// the cap new probes run uncached instead of growing memory.
+    cluster_formation_cache: HashMap<(SharedString, String), bool>,
+    /// Lazily built native-first emoji chain shared by every run in the
+    /// line (families are run-independent by construction). Mirrors the
+    /// staleness policy of `font_ids_by_family_cache`: built once, not
+    /// refreshed by later `add_fonts`.
+    emoji_chain_cache: Option<Arc<[(FontId, SharedString)]>>,
 }
 
 struct LoadedFont {
@@ -95,6 +106,8 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            cluster_formation_cache: HashMap::default(),
+            emoji_chain_cache: None,
         }))
     }
 
@@ -112,6 +125,8 @@ impl CosmicTextSystem {
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
+            cluster_formation_cache: HashMap::default(),
+            emoji_chain_cache: None,
         }))
     }
 }
@@ -231,6 +246,21 @@ impl PlatformTextSystem for CosmicTextSystem {
     }
 }
 
+/// Emoji fallback families in native-first order with the Twemoji
+/// fallback last. Families absent from the database are dropped by
+/// `load_family`, so every platform resolves its own subset; the order
+/// is what keeps platform faces ahead of Twemoji wherever they cover.
+const EMOJI_FALLBACK_FAMILIES: &[&str] = &[
+    "Segoe UI Emoji",
+    "Noto Color Emoji",
+    "AppleColorEmoji",
+    "Twemoji Mozilla",
+];
+
+/// Maximum `cluster_formation_cache` entries. Past this, probes run
+/// uncached rather than retaining unbounded model output.
+const CLUSTER_FORMATION_CACHE_LIMIT: usize = 512;
+
 impl CosmicTextSystemState {
     fn loaded_font(&self, font_id: FontId) -> &LoadedFont {
         &self.loaded_fonts[font_id.0]
@@ -344,9 +374,18 @@ impl CosmicTextSystemState {
                 .context("Could not load font")?;
 
             // HACK: To let the storybook run and render Windows caption icons. We should actually do better font fallback.
+            // Color emoji faces carry no Latin coverage by design; every
+            // known color-emoji face must survive loading so fallback
+            // resolution can reach it. The set mirrors
+            // `check_is_known_emoji_font`.
             let allowed_bad_font_names = [
                 "SegoeFluentIcons", // NOTE: Segoe fluent icons postscript name is inconsistent
                 "Segoe Fluent Icons",
+                "NotoColorEmoji",
+                "SegoeUIEmoji",
+                "AppleColorEmoji",
+                ".AppleColorEmojiUI",
+                "TwemojiMozilla",
             ];
 
             if font.as_swash().charmap().map('m') == 0
@@ -367,6 +406,48 @@ impl CosmicTextSystemState {
         }
 
         Ok(loaded_font_ids)
+    }
+
+    /// Resolves the shared native-first emoji fallback chain for runs
+    /// that carry no user chain. Emoji faces take default features:
+    /// stylistic sets must not leak into fallback glyphs, and shaping
+    /// topology (ligatures) never depends on them. Results ride the
+    /// existing per-family cache, so repeated layouts pay one lookup.
+    fn emoji_fallback_chain(&mut self) -> Arc<[(FontId, SharedString)]> {
+        if let Some(chain) = self.emoji_chain_cache.clone() {
+            return chain;
+        }
+        let mut chain: Vec<(FontId, SharedString)> = Vec::new();
+        for family in EMOJI_FALLBACK_FAMILIES {
+            let key = FontKey::new(
+                SharedString::from(*family),
+                FontFeatures::default(),
+                None,
+            );
+            let ids = if let Some(cached) = self.font_ids_by_family_cache.get(&key) {
+                cached.clone()
+            } else {
+                let Ok(loaded) = self.load_family(family, &FontFeatures::default(), None)
+                else {
+                    continue;
+                };
+                self.font_ids_by_family_cache
+                    .insert(key, loaded.clone());
+                loaded
+            };
+            let Some(&id) = ids.first() else {
+                continue;
+            };
+            let db_id = self.loaded_fonts[id.0].font.id();
+            if let Some(face) = self.font_system.db().face(db_id)
+                && let Some(family) = face.families.first()
+            {
+                chain.push((id, SharedString::from(family.0.clone())));
+            }
+        }
+        let chain = Arc::from(chain);
+        self.emoji_chain_cache = Some(chain.clone());
+        chain
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
@@ -633,6 +714,18 @@ impl CosmicTextSystemState {
                 .letter_spacing
                 .map(|spacing| spacing.as_f32() / font_size.as_f32());
 
+            // Resolve the effective chain: the run's explicit user chain
+            // when set, otherwise the synthesized native-first emoji
+            // chain. Span slots index into this chain, so all attribute
+            // and span building below uses it — never the raw user chain.
+            let emoji_chain;
+            let chain: &[(FontId, SharedString)] = if properties.fallback_chain.is_empty() {
+                emoji_chain = self.emoji_fallback_chain();
+                &emoji_chain
+            } else {
+                &properties.fallback_chain
+            };
+
             // build one `Attrs` per slot up front. each clone of span attrs
             // would otherwise re-allocate the `font_features` Vec.
             let mut primary_attrs =
@@ -640,8 +733,7 @@ impl CosmicTextSystemState {
             if let Some(letter_spacing) = letter_spacing {
                 primary_attrs = primary_attrs.letter_spacing(letter_spacing);
             }
-            let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = properties
-                .fallback_chain
+            let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = chain
                 .iter()
                 .map(|(font_id, family_name)| {
                     let mut attrs = properties.attributes(*font_id, family_name);
@@ -652,16 +744,7 @@ impl CosmicTextSystemState {
                 })
                 .collect();
 
-            let spans = if properties.fallback_chain.is_empty() {
-                let mut spans = SmallVec::<[RunSpan; 4]>::new();
-                spans.push(RunSpan {
-                    start: offs,
-                    end: run_end,
-                    slot: None,
-                    font_id: run.font_id,
-                });
-                spans
-            } else {
+            let spans = if chain.is_empty() {
                 let loaded_fonts = &self.loaded_fonts;
                 let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
                 compute_run_spans(
@@ -669,8 +752,38 @@ impl CosmicTextSystemState {
                     offs,
                     run.len,
                     run.font_id,
-                    &properties.fallback_chain,
+                    chain,
                     &covers,
+                )
+            } else {
+                let CosmicTextSystemState {
+                    loaded_fonts,
+                    font_system,
+                    scratch,
+                    cluster_formation_cache,
+                    ..
+                } = &mut *self;
+                let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
+                let probe_size = f32::from(font_size);
+                let mut forms_single = |id: FontId, grapheme: &str| {
+                    face_forms_single_cluster(
+                        loaded_fonts,
+                        font_system,
+                        scratch,
+                        cluster_formation_cache,
+                        id,
+                        probe_size,
+                        grapheme,
+                    )
+                };
+                compute_cluster_spans(
+                    text,
+                    offs,
+                    run.len,
+                    run.font_id,
+                    chain,
+                    &covers,
+                    &mut forms_single,
                 )
             };
 
@@ -896,6 +1009,74 @@ struct RunSpan {
     font_id: FontId,
 }
 
+/// Groups a run into whole-grapheme spans like [`compute_run_spans`],
+/// but selects each span's face by full-cluster coverage in native-first
+/// chain order, preferring the first face shaping the grapheme into one
+/// combined glyph. ASCII and primary-covered clusters never leave the
+/// primary face; clusters nothing covers keep the legacy first-scalar
+/// rule so cosmic resolves them exactly as today.
+fn compute_cluster_spans(
+    text: &str,
+    run_offset: usize,
+    run_len: usize,
+    primary: FontId,
+    fallback_chain: &[(FontId, SharedString)],
+    covers: &impl Fn(FontId, char) -> bool,
+    forms_single_cluster: &mut impl FnMut(FontId, &str) -> bool,
+) -> SmallVec<[RunSpan; 4]> {
+    let mut spans = SmallVec::new();
+    let run_end = run_offset + run_len;
+    if run_end <= run_offset {
+        return spans;
+    }
+    if fallback_chain.is_empty() {
+        spans.push(RunSpan {
+            start: run_offset,
+            end: run_end,
+            slot: None,
+            font_id: primary,
+        });
+        return spans;
+    }
+    let run_text = &text[run_offset..run_end];
+    let mut span_start = run_offset;
+    let mut span_slot: Option<usize> = None;
+    let mut span_font_id = primary;
+    for (grapheme_idx, grapheme) in run_text.grapheme_indices(true) {
+        let abs = run_offset + grapheme_idx;
+        let next_slot = pick_cluster_slot(
+            grapheme,
+            primary,
+            fallback_chain,
+            covers,
+            forms_single_cluster,
+        );
+        if next_slot == span_slot {
+            continue;
+        }
+        if abs > span_start {
+            spans.push(RunSpan {
+                start: span_start,
+                end: abs,
+                slot: span_slot,
+                font_id: span_font_id,
+            });
+        }
+        span_start = abs;
+        span_slot = next_slot;
+        span_font_id = slot_font_id(next_slot, primary, fallback_chain);
+    }
+    if span_start < run_end {
+        spans.push(RunSpan {
+            start: span_start,
+            end: run_end,
+            slot: span_slot,
+            font_id: span_font_id,
+        });
+    }
+    spans
+}
+
 /// walks `text[run_offset..run_offset + run_len]` and groups codepoints into
 /// spans. inheriting codepoints stay in the current span so shaping clusters
 /// like emoji zwj sequences and combining marks are not torn apart.
@@ -987,6 +1168,133 @@ fn pick_covering_slot(
     fallback_chain
         .iter()
         .position(|(fb_id, _)| covers(*fb_id, ch))
+}
+
+/// Selects the fallback slot for one whole grapheme cluster.
+///
+/// ASCII graphemes (including CRLF pairs) stay primary exactly as
+/// before. Otherwise the first face covering the FULL cluster wins in
+/// native-first chain order; a face covering only the first scalar never
+/// splits the cluster. Multi-scalar clusters with several full-covering
+/// faces go to the first face shaping them into one combined glyph
+/// (ligated flag/ZWJ/keycap/skin sequences); ties and single-scalar
+/// clusters keep chain order, and clusters nothing covers fall back to
+/// the legacy first-scalar rule so cosmic resolves them as today.
+fn pick_cluster_slot(
+    grapheme: &str,
+    primary: FontId,
+    fallback_chain: &[(FontId, SharedString)],
+    covers: &impl Fn(FontId, char) -> bool,
+    forms_single_cluster: &mut impl FnMut(FontId, &str) -> bool,
+) -> Option<usize> {
+    if grapheme.chars().all(|ch| (ch as u32) <= 0x7F) {
+        return None;
+    }
+    let covers_all = |id: FontId| grapheme.chars().all(|ch| covers(id, ch));
+    if covers_all(primary) {
+        return None;
+    }
+    let mut full = SmallVec::<[usize; 4]>::new();
+    for (ix, (fb_id, _)) in fallback_chain.iter().enumerate() {
+        if covers_all(*fb_id) {
+            full.push(ix);
+        }
+    }
+    let &[first, ..] = full.as_slice() else {
+        return pick_covering_slot(
+            grapheme.chars().next().unwrap_or('\0'),
+            None,
+            primary,
+            fallback_chain,
+            covers,
+        );
+    };
+    if grapheme.chars().count() == 1 {
+        return Some(first);
+    }
+    for ix in full {
+        if forms_single_cluster(fallback_chain[ix].0, grapheme) {
+            return Some(ix);
+        }
+    }
+    Some(first)
+}
+
+/// Probes whether shaping `grapheme` with the candidate face yields one
+/// combined glyph FROM THAT FACE. Results are cached per family+grapheme;
+/// shaping topology never depends on size, so one probe size serves all
+/// frames. Only glyphs the requested face itself shaped count: fallback
+/// substitution inside the probe would credit another face's work, and
+/// `.notdef` (glyph 0) never proves coverage. The glyph-3 skip mirrors
+/// production exactly — it applies only when the probed face is a known
+/// color-emoji face. Errors shape to `false` (no reroute).
+fn face_forms_single_cluster(
+    loaded_fonts: &[LoadedFont],
+    font_system: &mut FontSystem,
+    scratch: &mut ShapeBuffer,
+    cache: &mut HashMap<(SharedString, String), bool>,
+    font_id: FontId,
+    font_size: f32,
+    grapheme: &str,
+) -> bool {
+    if grapheme.chars().count() <= 1 {
+        return true;
+    }
+    let Some(loaded) = loaded_fonts.get(font_id.0) else {
+        return false;
+    };
+    let expected = loaded.font.id();
+    let is_emoji_face = loaded.is_known_emoji_font;
+    let Some(family) = font_system
+        .db()
+        .face(expected)
+        .and_then(|face| face.families.first())
+        .map(|(name, _)| SharedString::from(name.clone()))
+    else {
+        return false;
+    };
+    if let Some(hit) = cache.get(&(family.clone(), grapheme.to_owned())) {
+        return *hit;
+    }
+    let attrs = Attrs::new()
+        .metadata(0)
+        .family(Family::Name(family.as_ref()));
+    let attrs_list = AttrsList::new(&attrs);
+    let line = ShapeLine::new(
+        font_system,
+        grapheme,
+        &attrs_list,
+        cosmic_text::Shaping::Advanced,
+        4,
+    );
+    let mut layouts = Vec::with_capacity(1);
+    line.layout_to_buffer(
+        scratch,
+        font_size,
+        None, // We do our own wrapping
+        cosmic_text::Wrap::None,
+        Ellipsize::None,
+        None,
+        &mut layouts,
+        None,
+        cosmic_text::Hinting::Disabled,
+    );
+    let single = layouts.first().is_some_and(|layout| {
+        layout
+            .glyphs
+            .iter()
+            .filter(|glyph| {
+                glyph.font_id == expected
+                    && glyph.glyph_id != 0
+                    && !(glyph.glyph_id == 3 && is_emoji_face)
+            })
+            .count()
+            == 1
+    });
+    if cache.len() < CLUSTER_FORMATION_CACHE_LIMIT {
+        cache.insert((family, grapheme.to_owned()), single);
+    }
+    single
 }
 
 fn charmap_covers(loaded_fonts: &[LoadedFont], id: FontId, ch: char) -> bool {
@@ -1559,10 +1867,10 @@ mod tests {
                         "platform face must win over registered Twemoji"
                     );
                 } else {
-                    assert_ne!(
+                    assert_eq!(
                         face.as_deref(),
-                        Some("TwemojiMozilla"),
-                        "body text must stay off the emoji face"
+                        Some("SegoeUI"),
+                        "body text must stay on the requested body font"
                     );
                 }
             }
@@ -1606,6 +1914,7 @@ mod tests {
             }
         }
         assert!(glyphs > 0, "flag cluster must shape glyphs");
+        assert_eq!(glyphs, 1, "flag cluster must shape as one combined glyph");
         assert_eq!(faces.len(), 1, "flag cluster must resolve to one face");
         let (font_id, glyph_id) = first.expect("non-empty glyphs");
         assert_eq!(
@@ -1690,9 +1999,12 @@ mod tests {
     }
 
     /// Mandatory precedence proof with BOTH system fonts and Twemoji:
-    /// party popper stays native while the tag-sequence England flag —
-    /// whose tag scalars Segoe lacks, so coverage (not order) routes it —
-    /// resolves to Twemoji as one cluster with colored pixels.
+    /// party popper stays native while the Norway regional flag — whose
+    /// scalars Segoe covers but cannot combine (no RI composition in its
+    /// GSUB, measured) — resolves to Twemoji as one combined glyph with
+    /// colored pixels. First-scalar coverage alone would strand it on
+    /// Segoe uncombined; whole-grapheme selection with formation probing
+    /// is what routes it.
     #[test]
     fn native_popper_and_twemoji_flag_share_one_layout() -> Result<()> {
         if !cfg!(target_os = "windows") {
@@ -1711,7 +2023,7 @@ mod tests {
 
         let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
         let popper = "\u{1F389}";
-        let flag = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E007F}";
+        let flag = "\u{1F1F3}\u{1F1F4}";
         let text = format!("{popper}{flag}");
         let layout = shape_body(&text_system, font_id, &text);
 
@@ -1725,6 +2037,12 @@ mod tests {
                 "party popper must stay native with Twemoji registered"
             );
         }
+        let flag_glyphs = cluster_glyphs(&layout, popper.len(), text.len());
+        assert_eq!(
+            flag_glyphs.len(),
+            1,
+            "Norway flag must shape as one combined glyph"
+        );
         assert_single_color_cluster(
             &text_system,
             &layout,
@@ -1732,6 +2050,45 @@ mod tests {
             text.len(),
             "TwemojiMozilla",
             flag,
+        )
+    }
+
+    /// England tag sequence: Segoe covers only the black flag scalar, so
+    /// coverage alone routes the whole cluster to Twemoji, which ligates
+    /// it into one glyph with colored pixels. Uses the valid sequence
+    /// (black flag + g b e n g + cancel tag).
+    #[test]
+    fn england_tag_flag_routes_to_twemoji_by_coverage() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let twemoji = require_twemoji_bytes();
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let text = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
+        let layout = shape_body(&text_system, font_id, text);
+        let glyphs = cluster_glyphs(&layout, 0, text.len());
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "England flag must shape as one combined glyph"
+        );
+        assert_single_color_cluster(
+            &text_system,
+            &layout,
+            0,
+            text.len(),
+            "TwemojiMozilla",
+            text,
         )
     }
 
@@ -1799,10 +2156,11 @@ mod tests {
         Ok(())
     }
 
-    /// ZWJ family, skin-tone, and keycap clusters: whole grapheme, native
-    /// face by the established order, color raster proven.
+    /// ZWJ family: Segoe covers every scalar but cannot combine the full
+    /// sequence (no complete ligature in its GSUB); Twemoji ligates it
+    /// into one glyph. Formation probing routes the whole cluster there.
     #[test]
-    fn zwj_skin_keycap_clusters_shape_native_color() -> Result<()> {
+    fn zwj_family_routes_to_twemoji_single_glyph() -> Result<()> {
         if !cfg!(target_os = "windows") {
             return Ok(());
         }
@@ -1818,22 +2176,226 @@ mod tests {
         }
 
         let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
-        for text in [
-            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
-            "\u{1F44D}\u{1F3FD}",
-            "#\u{FE0F}\u{20E3}",
-        ] {
-            let layout = shape_body(&text_system, font_id, text);
-            assert_single_color_cluster(
-                &text_system,
-                &layout,
-                0,
-                text.len(),
-                "SegoeUIEmoji",
-                text,
-            )?;
+        let text = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+        let layout = shape_body(&text_system, font_id, text);
+        let glyphs = cluster_glyphs(&layout, 0, text.len());
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "ZWJ family must shape as one combined glyph"
+        );
+        assert_single_color_cluster(
+            &text_system,
+            &layout,
+            0,
+            text.len(),
+            "TwemojiMozilla",
+            text,
+        )
+    }
+
+    /// Skin tone: both faces ligate, so native-first order keeps Segoe
+    /// with one combined glyph and colored pixels.
+    #[test]
+    fn skin_tone_stays_native_single_glyph() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
         }
-        Ok(())
+        let twemoji = require_twemoji_bytes();
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let text = "\u{1F44D}\u{1F3FD}";
+        let layout = shape_body(&text_system, font_id, text);
+        let glyphs = cluster_glyphs(&layout, 0, text.len());
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "skin-tone cluster must shape as one combined glyph"
+        );
+        assert_single_color_cluster(
+            &text_system,
+            &layout,
+            0,
+            text.len(),
+            "SegoeUIEmoji",
+            text,
+        )
+    }
+
+    /// Keycap: whichever face forms the sequence wins it whole with
+    /// colored pixels; plain `#` alone always stays on the body font
+    /// (ASCII fast path), so ordinary text never changes faces.
+    #[test]
+    fn keycap_cluster_resolves_to_single_color_face() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let twemoji = require_twemoji_bytes();
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let text = "#\u{FE0F}\u{20E3}";
+        let layout = shape_body(&text_system, font_id, text);
+        let glyphs = cluster_glyphs(&layout, 0, text.len());
+        assert_eq!(
+            glyphs.len(),
+            1,
+            "keycap cluster must shape as one combined glyph"
+        );
+        assert!(!glyphs.is_empty(), "keycap must shape glyphs");
+        let (font_id, _, _) = glyphs[0];
+        assert!(
+            glyphs.iter().all(|(id, _, _)| *id == font_id),
+            "keycap cluster must not fragment across faces"
+        );
+        let face = face_postscript(&text_system, font_id);
+        assert!(
+            matches!(
+                face.as_deref(),
+                Some("SegoeUIEmoji") | Some("TwemojiMozilla")
+            ),
+            "keycap cluster must resolve to a color face"
+        );
+        assert!(
+            glyphs.iter().all(|(_, _, emoji)| *emoji),
+            "keycap cluster must take the color path"
+        );
+        let (_, glyph_id, _) = glyphs[0];
+        assert_color_raster(&text_system, font_id, glyph_id, gpui::px(32.0))
+    }
+
+    /// Whole-grapheme slot selection with a stubbed formation probe.
+    /// ASCII stays primary, primary-full stays primary, single
+    /// full-coverers win without probing, and formation breaks ties.
+    #[test]
+    fn pick_cluster_slot_prefers_forming_native_first_face() {
+        let primary = fid(0);
+        let fb = chain(&[1, 2]);
+        // Panic stub: none of these fixtures may consult formation.
+        let mut never = |_: FontId, _: &str| -> bool {
+            panic!("formation probe must not run here");
+        };
+
+        // ASCII (including multi-char CRLF) never leaves primary.
+        assert_eq!(
+            pick_cluster_slot("\r\n", primary, &fb, &|_, _| true, &mut never),
+            None
+        );
+        // Primary covering the whole cluster wins without probing.
+        assert_eq!(
+            pick_cluster_slot("é", primary, &fb, &|_, _| true, &mut never),
+            None
+        );
+        // Single full-coverer wins without probing.
+        let covers_emoji = |id: FontId, ch: char| id == fid(1) && ch != '\u{200D}';
+        assert_eq!(
+            pick_cluster_slot("\u{1F389}", primary, &fb, &covers_emoji, &mut never),
+            Some(0)
+        );
+        // Nothing covering falls back to the legacy first-scalar rule.
+        let covers_none = |_: FontId, _: char| false;
+        assert_eq!(
+            pick_cluster_slot("字", primary, &fb, &covers_none, &mut never),
+            pick_covering_slot('字', None, primary, &fb, &covers_none)
+        );
+    }
+
+    #[test]
+    fn pick_cluster_slot_formation_breaks_full_coverage_ties() {
+        let primary = fid(0);
+        let fb = chain(&[1, 2]);
+        let covers_all = |_: FontId, _: char| true;
+        // First face forms: native-first order holds.
+        let mut first_forms = |id: FontId, _: &str| id == fid(1);
+        assert_eq!(
+            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut first_forms),
+            Some(0)
+        );
+        // Only the fallback forms: whole cluster reroutes.
+        let mut second_forms = |id: FontId, _: &str| id == fid(2);
+        assert_eq!(
+            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut second_forms),
+            Some(1)
+        );
+        // Nothing forms: chain order, same as coverage-only selection.
+        let mut none_forms = |_: FontId, _: &str| false;
+        assert_eq!(
+            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut none_forms),
+            Some(0)
+        );
+    }
+
+    /// Whole-grapheme slot selection with a stubbed formation probe.
+    /// ASCII graphemes stay primary, primary-full stays primary, single
+    /// full-coverers win without probing, and formation breaks ties among
+    /// several full-coverers. Nothing uncovered keeps the legacy
+    /// first-scalar rule.
+    #[test]
+    fn pick_cluster_slot_prefers_forming_native_first_face() {
+        let primary = fid(0);
+        let fb = chain(&[1, 2]);
+        // Panic stub: none of these fixtures may consult formation.
+        let mut never = |_: FontId, _: &str| -> bool {
+            panic!("formation probe must not run here");
+        };
+
+        assert_eq!(
+            pick_cluster_slot("\r\n", primary, &fb, &|_, _| true, &mut never),
+            None
+        );
+        assert_eq!(
+            pick_cluster_slot("é", primary, &fb, &|_, _| true, &mut never),
+            None
+        );
+        let covers_emoji = |id: FontId, ch: char| id == fid(1) && ch != '\u{200D}';
+        assert_eq!(
+            pick_cluster_slot("\u{1F389}", primary, &fb, &covers_emoji, &mut never),
+            Some(0)
+        );
+        let covers_none = |_: FontId, _: char| false;
+        assert_eq!(
+            pick_cluster_slot("字", primary, &fb, &covers_none, &mut never),
+            pick_covering_slot('字', None, primary, &fb, &covers_none)
+        );
+    }
+
+    #[test]
+    fn pick_cluster_slot_formation_breaks_full_coverage_ties() {
+        let primary = fid(0);
+        let fb = chain(&[1, 2]);
+        let covers_all = |_: FontId, _: char| true;
+        let mut first_forms = |id: FontId, _: &str| id == fid(1);
+        assert_eq!(
+            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut first_forms),
+            Some(0)
+        );
+        let mut second_forms = |id: FontId, _: &str| id == fid(2);
+        assert_eq!(
+            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut second_forms),
+            Some(1)
+        );
+        let mut none_forms = |_: FontId, _: &str| false;
+        assert_eq!(
+            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut none_forms),
+            Some(0)
+        );
     }
 
     #[test]
