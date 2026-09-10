@@ -1053,10 +1053,12 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // Glyphs from these faces rasterize through the color sources
     // (`ColorOutline`/`ColorBitmap`); every other face stays on the
     // monochrome outline path so ordinary text and symbol fonts never
-    // change appearance.
+    // change appearance. `TwemojiMozilla` is fallback-only: it is never
+    // requested as a primary family, so platform faces keep precedence
+    // wherever they cover a cluster.
     matches!(
         postscript_name,
-        "NotoColorEmoji" | "SegoeUIEmoji" | "AppleColorEmoji" | ".AppleColorEmojiUI"
+        "NotoColorEmoji" | "SegoeUIEmoji" | "AppleColorEmoji" | ".AppleColorEmojiUI" | "TwemojiMozilla"
     )
 }
 
@@ -1318,6 +1320,7 @@ mod tests {
             "SegoeUIEmoji",
             "AppleColorEmoji",
             ".AppleColorEmojiUI",
+            "TwemojiMozilla",
         ] {
             assert!(
                 check_is_known_emoji_font(name),
@@ -1457,6 +1460,241 @@ mod tests {
             Some("SegoeUIEmoji"),
             "native-first precedence: the platform color face must win the fallback"
         );
+        Ok(())
+    }
+
+    /// Loads the superproject Twemoji asset when the vendor tree is
+    /// checked out as a submodule; `None` keeps the tree standalone-safe
+    /// by skipping Twemoji-dependent proofs.
+    fn twemoji_bytes() -> Option<Vec<u8>> {
+        let path = format!(
+            "{}/../../../../modules/assets/fonts/twemoji-mozilla.ttf",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read(path).ok()
+    }
+
+    /// Resolves the winning face's PostScript name for one shaped run.
+    fn face_postscript(text_system: &CosmicTextSystem, font_id: FontId) -> Option<String> {
+        let state = text_system.0.read();
+        let db_id = state.loaded_fonts[font_id.0].font.id();
+        state
+            .font_system
+            .db()
+            .face(db_id)
+            .map(|face| face.post_script_name.clone())
+    }
+
+    /// Rasterizes one emoji glyph and proves BGRA bytes with real color
+    /// variance — not a monochrome mask.
+    fn assert_color_raster(
+        text_system: &CosmicTextSystem,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        size: gpui::Pixels,
+    ) -> Result<()> {
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: size,
+            subpixel_variant: gpui::point(0u8, 0u8),
+            scale_factor: 1.0,
+            is_emoji: true,
+            subpixel_rendering: false,
+            dilation: 0,
+        };
+        let bounds = text_system.glyph_raster_bounds(&params)?;
+        assert!(!bounds.is_zero(), "emoji raster bounds must be non-empty");
+        let (_, data) = text_system.rasterize_glyph(&params, bounds)?;
+        assert!(
+            !data.is_empty() && data.len() % 4 == 0,
+            "emoji raster must be BGRA bytes, not a 1-byte mask"
+        );
+        assert!(
+            data.chunks_exact(4)
+                .any(|pixel| pixel[3] > 0 && (pixel[0] != pixel[1] || pixel[1] != pixel[2])),
+            "rasterized emoji must hold non-grayscale color pixels"
+        );
+        Ok(())
+    }
+
+    /// Platform-first with Twemoji registered: the native face must still
+    /// win covered clusters and body text must stay off the emoji face.
+    #[test]
+    fn platform_face_wins_over_registered_twemoji() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let Some(twemoji) = twemoji_bytes() else {
+            return Ok(());
+        };
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let text = "Whoopty \u{1F389}";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id,
+            letter_spacing: None,
+        }];
+        let layout = text_system.layout_line(text, gpui::px(32.0), &runs);
+
+        let emoji_start = text.len() - "\u{1F389}".len();
+        let mut saw_emoji = false;
+        for run in &layout.runs {
+            let face = face_postscript(&text_system, run.font_id);
+            for glyph in &run.glyphs {
+                if glyph.index >= emoji_start {
+                    saw_emoji = true;
+                    assert!(glyph.is_emoji, "emoji scalar must take the color path");
+                    assert_eq!(
+                        face.as_deref(),
+                        Some("SegoeUIEmoji"),
+                        "platform face must win over registered Twemoji"
+                    );
+                } else {
+                    assert_ne!(
+                        face.as_deref(),
+                        Some("TwemojiMozilla"),
+                        "body text must stay off the emoji face"
+                    );
+                }
+            }
+        }
+        assert!(saw_emoji, "party popper must shape at least one glyph");
+        Ok(())
+    }
+
+    /// Twemoji fallback without system fonts: an uncovered flag cluster
+    /// resolves to one Twemoji run with the emoji flag and colored pixels.
+    #[test]
+    fn twemoji_serves_uncovered_flag_as_one_cluster() -> Result<()> {
+        let Some(twemoji) = twemoji_bytes() else {
+            return Ok(());
+        };
+        let text_system = CosmicTextSystem::new_without_system_fonts("IBM Plex Sans");
+        text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
+        text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+
+        let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let text = "\u{1F1F3}\u{1F1F4}";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id,
+            letter_spacing: None,
+        }];
+        let layout = text_system.layout_line(text, gpui::px(32.0), &runs);
+
+        let mut faces = std::collections::HashSet::new();
+        let mut glyphs = 0;
+        let mut first: Option<(FontId, GlyphId)> = None;
+        for run in &layout.runs {
+            for glyph in &run.glyphs {
+                glyphs += 1;
+                assert!(glyph.is_emoji, "flag cluster must take the color path");
+                faces.insert(run.font_id.0);
+                if first.is_none() {
+                    first = Some((run.font_id, glyph.id));
+                }
+            }
+        }
+        assert!(glyphs > 0, "flag cluster must shape glyphs");
+        assert_eq!(faces.len(), 1, "flag cluster must resolve to one face");
+        let (font_id, glyph_id) = first.expect("non-empty glyphs");
+        assert_eq!(
+            face_postscript(&text_system, font_id).as_deref(),
+            Some("TwemojiMozilla"),
+            "uncovered flag must resolve to Twemoji"
+        );
+        assert_color_raster(&text_system, font_id, glyph_id, gpui::px(32.0))
+    }
+
+    /// Live-routing invariant over representative clusters: every
+    /// emoji-flagged glyph comes from a color face with native preferred,
+    /// plain glyphs never come from Twemoji. U+1F389 anchors native-first
+    /// deterministically; a Twemoji win anywhere also proves its raster.
+    #[test]
+    fn emoji_clusters_resolve_to_single_color_face_native_first() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        if let Some(twemoji) = twemoji_bytes() {
+            text_system.add_fonts(vec![Cow::Owned(twemoji)])?;
+        }
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
+        let mut anchored_native = false;
+        for text in [
+            "\u{1F389}",
+            "\u{1F1F3}\u{1F1F4}",
+            "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}",
+            "#\u{FE0F}\u{20E3}",
+            "\u{1F44D}\u{1F3FD}",
+        ] {
+            let runs = [FontRun {
+                len: text.len(),
+                font_id,
+                letter_spacing: None,
+            }];
+            let layout = text_system.layout_line(text, gpui::px(32.0), &runs);
+            assert!(
+                layout.runs.iter().any(|run| !run.glyphs.is_empty()),
+                "{text:?} must shape glyphs"
+            );
+            for run in &layout.runs {
+                let face = face_postscript(&text_system, run.font_id);
+                for glyph in &run.glyphs {
+                    if glyph.is_emoji {
+                        assert!(
+                            matches!(
+                                face.as_deref(),
+                                Some("SegoeUIEmoji") | Some("TwemojiMozilla")
+                            ),
+                            "{text:?} emoji glyphs must come from a color face"
+                        );
+                        if text == "\u{1F389}" {
+                            assert_eq!(
+                                face.as_deref(),
+                                Some("SegoeUIEmoji"),
+                                "party popper must stay native with Twemoji registered"
+                            );
+                            anchored_native = true;
+                        }
+                        if face.as_deref() == Some("TwemojiMozilla") {
+                            assert_color_raster(
+                                &text_system,
+                                run.font_id,
+                                glyph.id,
+                                gpui::px(32.0),
+                            )?;
+                        }
+                    } else {
+                        assert_ne!(
+                            face.as_deref(),
+                            Some("TwemojiMozilla"),
+                            "{text:?} plain glyphs must stay off the emoji face"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(anchored_native, "party popper must prove native-first");
         Ok(())
     }
 
