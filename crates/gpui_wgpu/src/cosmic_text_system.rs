@@ -1402,6 +1402,49 @@ mod tests {
         Ok(())
     }
 
+    /// Implicit routing: an ordinary body-font request with NO explicit
+    /// emoji family must still reach the platform color face through
+    /// cosmic fallback, with the emoji flag set. This distinguishes the
+    /// color-raster fix from font selection — the previous test requests
+    /// the emoji face directly and cannot prove routing. Skips (passes)
+    /// where the platform does not provide the face.
+    #[test]
+    fn implicit_fallback_routes_emoji_to_system_color_face() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        text_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let text = "Whoopty \u{1F389}";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id,
+            letter_spacing: None,
+        }];
+        let layout = text_system.layout_line(text, gpui::px(32.0), &runs);
+
+        let emoji_start = text.len() - "\u{1F389}".len();
+        let routed = layout
+            .runs
+            .iter()
+            .flat_map(|run| &run.glyphs)
+            .any(|glyph| glyph.index == emoji_start && glyph.is_emoji);
+        assert!(
+            routed,
+            "emoji scalar under a body-font request must shape from a color face"
+        );
+        Ok(())
+    }
+
     #[test]
     fn primary_wins_over_current_fallback_when_primary_covers() {
         let primary = fid(0);
