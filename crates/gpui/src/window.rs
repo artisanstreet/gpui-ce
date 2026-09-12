@@ -1158,6 +1158,7 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    text_color_map: Option<TextColorMap>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1860,6 +1861,7 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            text_color_map: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -1936,6 +1938,11 @@ pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
 }
+
+/// A horizontal text fill sampled at device-pixel centers during glyph painting.
+/// The callback receives the window-space x coordinate and the run's original color.
+/// Shaping, glyph rasterization, emoji, and text backgrounds are unaffected.
+pub type TextColorMap = Rc<dyn Fn(Pixels, Hsla) -> Hsla>;
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
@@ -3769,6 +3776,22 @@ impl Window {
         self.element_opacity
     }
 
+    /// Paint text through a horizontal color map, restoring the enclosing map afterward.
+    /// Passing `None` suspends a map, for example while painting selected text.
+    /// Sampling uses disjoint device-pixel columns and coalesces equal neighboring colors.
+    /// This does not reshape text or allocate a separate glyph atlas for the gradient.
+    pub fn with_text_color_map<R>(
+        &mut self,
+        map: Option<TextColorMap>,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let previous = std::mem::replace(&mut self.text_color_map, map);
+        let result = paint(self);
+        self.text_color_map = previous;
+        result
+    }
+
     /// Obtain the current content mask. This method should only be called during element drawing.
     pub fn content_mask(&self) -> ContentMask<Pixels> {
         self.invalidator.debug_assert_paint_or_prepaint();
@@ -4503,26 +4526,35 @@ impl Window {
             };
             let content_mask = self.snapped_content_mask();
 
-            if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity).into(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
-            } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity).into(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
+            let spans = glyph_color_spans(
+                bounds,
+                content_mask,
+                scale_factor,
+                color,
+                self.text_color_map.as_ref(),
+            );
+            for (content_mask, color) in spans {
+                if subpixel_rendering {
+                    self.next_frame.scene.insert_primitive(SubpixelSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds,
+                        content_mask,
+                        color: color.opacity(element_opacity).into(),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    });
+                } else {
+                    self.next_frame.scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds,
+                        content_mask,
+                        color: color.opacity(element_opacity).into(),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    });
+                }
             }
         }
         Ok(())
@@ -7335,6 +7367,46 @@ pub fn outline(
     }
 }
 
+/** Split only the visible raster, keeping the original atlas bounds/UVs. */
+fn glyph_color_spans(
+    bounds: Bounds<ScaledPixels>,
+    mask: ContentMask<ScaledPixels>,
+    scale: f32,
+    base: Hsla,
+    map: Option<&TextColorMap>,
+) -> SmallVec<[(ContentMask<ScaledPixels>, Hsla); 16]> {
+    let Some(map) = map else {
+        return smallvec::smallvec![(mask, base)];
+    };
+    let visible = bounds.intersect(&mask.bounds);
+    if visible.is_empty() {
+        return SmallVec::new();
+    }
+    let mut spans: SmallVec<[(ContentMask<ScaledPixels>, Hsla); 16]> = SmallVec::new();
+    let mut x = visible.left().0;
+    while x < visible.right().0 {
+        let end = (x + 1.0).min(visible.right().0);
+        let color = map(px((x + end) * 0.5 / scale), base);
+        if let Some((previous, previous_color)) = spans.last_mut()
+            && *previous_color == color
+        {
+            previous.bounds.size.width += ScaledPixels(end - x);
+        } else {
+            spans.push((
+                ContentMask {
+                    bounds: Bounds::new(
+                        point(ScaledPixels(x), visible.top()),
+                        size(ScaledPixels(end - x), visible.size.height),
+                    ),
+                },
+                color,
+            ));
+        }
+        x = end;
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7352,6 +7424,51 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+
+    #[test]
+    fn text_color_map_samples_device_pixels_and_coalesces_constant_fills() {
+        use super::{ContentMask, TextColorMap, glyph_color_spans};
+        use crate::{ScaledPixels, hsla, white};
+        let bounds = Bounds::new(
+            point(ScaledPixels(4.0), ScaledPixels(2.0)),
+            size(ScaledPixels(6.0), ScaledPixels(8.0)),
+        );
+        let mask = ContentMask { bounds };
+        let ramp: TextColorMap = Rc::new(|x, base| hsla(0.0, 0.0, f32::from(x) / 10.0, base.alpha));
+        let spans = glyph_color_spans(bounds, mask, 2.0, white(), Some(&ramp));
+        assert_eq!(spans.len(), 6);
+        for (index, (mask, color)) in spans.iter().enumerate() {
+            assert_eq!(mask.bounds.size.width, ScaledPixels(1.0));
+            assert_eq!(mask.bounds.left(), ScaledPixels(4.0 + index as f32));
+            assert_eq!(color.lightness, (4.5 + index as f32) / 20.0);
+        }
+        let constant: TextColorMap = Rc::new(|_, color| color);
+        assert_eq!(
+            glyph_color_spans(bounds, mask, 2.0, white(), Some(&constant)).len(),
+            1
+        );
+        assert_eq!(glyph_color_spans(bounds, mask, 2.0, white(), None).len(), 1);
+    }
+
+    #[test]
+    fn text_color_map_respects_existing_content_clip() {
+        use super::{ContentMask, TextColorMap, glyph_color_spans};
+        use crate::{ScaledPixels, white};
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(10.0), ScaledPixels(10.0)),
+        );
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(3.0), ScaledPixels(2.0)),
+                size(ScaledPixels(4.0), ScaledPixels(5.0)),
+            ),
+        };
+        let map: TextColorMap = Rc::new(|_, color| color);
+        let spans = glyph_color_spans(bounds, mask, 1.0, white(), Some(&map));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, mask);
+    }
 
     struct EmptyView;
 
