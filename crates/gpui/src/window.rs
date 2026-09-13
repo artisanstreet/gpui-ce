@@ -1215,6 +1215,7 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    frame_rate_limiter: Rc<RefCell<crate::frame_rate_limiter::FrameRateLimiter>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -1544,7 +1545,11 @@ impl Window {
                 });
             }
         }));
+        let frame_rate_limiter = Rc::new(RefCell::new(
+            crate::frame_rate_limiter::FrameRateLimiter::default(),
+        ));
         platform_window.on_request_frame(Box::new({
+            let frame_rate_limiter = frame_rate_limiter.clone();
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
             let active = active.clone();
@@ -1621,6 +1626,18 @@ impl Window {
                         invalidator.wake_platform();
                         return;
                     }
+                }
+                if !request_frame_options.require_presentation
+                    && !frame_rate_limiter.borrow_mut().admit(now)
+                {
+                    deferred_force_render |= force_render;
+                    invalidator.wake_platform();
+                    handle
+                        .update(&mut cx, |_, window, _| {
+                            window.platform_window.schedule_frame()
+                        })
+                        .log_err();
+                    return;
                 }
                 last_frame_time.set(Some(now));
 
@@ -1912,6 +1929,7 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            frame_rate_limiter,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -2044,6 +2062,19 @@ impl Window {
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle
+    }
+
+    /// Sets an optional redraw-rate limit over the platform's display clock.
+    /// `None` removes this limit; it does not disable display synchronization.
+    /// Mandatory platform presentations bypass the limit.
+    pub fn set_max_frame_rate(&mut self, rate: Option<std::num::NonZeroU32>) {
+        self.frame_rate_limiter.borrow_mut().set(rate);
+        self.refresh();
+    }
+
+    /// Returns the requested redraw-rate limit, independent of the monitor.
+    pub fn max_frame_rate(&self) -> Option<std::num::NonZeroU32> {
+        self.frame_rate_limiter.borrow().rate()
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.

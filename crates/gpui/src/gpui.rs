@@ -19,6 +19,7 @@ mod color;
 pub mod colors;
 #[cfg(feature = "profiler")]
 mod debug_overlay;
+mod frame_rate_limiter;
 mod element;
 mod elements;
 mod executor;
