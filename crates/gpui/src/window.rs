@@ -2962,6 +2962,8 @@ impl Window {
             {
                 let viewport_size = self.viewport_size;
                 let scale_factor = self.scale_factor();
+                self.debug_frame_overlay
+                    .set_frame_demand(!self.next_frame_callbacks.borrow().is_empty());
                 self.debug_frame_overlay.paint(
                     &mut self.next_frame.scene,
                     viewport_size,

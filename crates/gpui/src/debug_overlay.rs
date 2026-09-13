@@ -62,6 +62,7 @@ pub(crate) struct DebugFrameOverlay {
     draw_durations: VecDeque<Duration>,
     total_frame_count: u64,
     frame_times: VecDeque<Instant>,
+    frame_demand: bool,
 }
 
 impl DebugFrameOverlay {
@@ -71,6 +72,7 @@ impl DebugFrameOverlay {
             draw_durations: VecDeque::new(),
             total_frame_count: 0,
             frame_times: VecDeque::new(),
+            frame_demand: false,
         }
     }
 
@@ -97,14 +99,16 @@ impl DebugFrameOverlay {
         self.record_frame_at(draw_duration, Instant::now());
     }
 
-    fn record_frame_at(&mut self, draw_duration: Duration, now: Instant) {
-        if self
-            .frame_times
-            .back()
-            .is_some_and(|last| now.saturating_duration_since(*last) > Duration::from_secs(1))
-        {
+    /// Start a fresh cadence sample when an animation resumes after event-driven idle.
+    /// Use scheduled frame demand, never elapsed time: real stalls must remain measurable.
+    pub(crate) fn set_frame_demand(&mut self, demanded: bool) {
+        if !self.frame_demand || !demanded {
             self.frame_times.clear();
         }
+        self.frame_demand = demanded;
+    }
+
+    fn record_frame_at(&mut self, draw_duration: Duration, now: Instant) {
         while self.frame_times.len() >= MAX_SAMPLES
             || self
                 .frame_times
@@ -113,7 +117,9 @@ impl DebugFrameOverlay {
         {
             self.frame_times.pop_front();
         }
-        self.frame_times.push_back(now);
+        if self.frame_demand {
+            self.frame_times.push_back(now);
+        }
         self.total_frame_count += 1;
         if self.draw_durations.len() >= MAX_SAMPLES {
             self.draw_durations.pop_front();
@@ -212,10 +218,14 @@ impl DebugFrameOverlay {
             DebugFrameOverlayMode::Minimal => vec![format_ms(current)],
             DebugFrameOverlayMode::FrameRate => {
                 let interval = self.frame_interval();
-                let fps = interval.filter(|value| !value.is_zero()).map_or_else(
-                    || "   --".into(),
-                    |value| format!("{:>5.1}", 1.0 / value.as_secs_f64()),
-                );
+                let fps = if !self.frame_demand {
+                    " IDLE".into()
+                } else {
+                    interval.filter(|value| !value.is_zero()).map_or_else(
+                        || "   --".into(),
+                        |value| format!("{:>5.1}", 1.0 / value.as_secs_f64()),
+                    )
+                };
                 vec![
                     format!("FPS   {fps}"),
                     format!("FRAME {}", format_ms(interval)),
@@ -383,6 +393,7 @@ mod tests {
     fn fps_uses_frame_arrivals_not_cpu_draw_time() {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_mode(DebugFrameOverlayMode::FrameRate);
+        overlay.set_frame_demand(true);
         let start = Instant::now();
         for frame in 0..21 {
             overlay.record_frame_at(
@@ -403,13 +414,45 @@ mod tests {
     fn fps_resets_after_idle_and_requires_two_samples() {
         let mut overlay = DebugFrameOverlay::new();
         let start = Instant::now();
+        overlay.set_frame_demand(true);
         overlay.record_frame_at(Duration::ZERO, start);
         assert!(overlay.frame_interval().is_none());
         overlay.record_frame_at(Duration::ZERO, start + Duration::from_millis(5));
         assert_eq!(overlay.frame_interval(), Some(Duration::from_millis(5)));
+        overlay.set_frame_demand(false);
+        overlay.record_frame_at(Duration::ZERO, start + Duration::from_millis(100));
+        assert!(overlay.frame_interval().is_none());
+        overlay.set_frame_demand(true);
         overlay.record_frame_at(Duration::ZERO, start + Duration::from_secs(10));
         assert!(overlay.frame_interval().is_none());
         overlay.reset_stats();
+        assert!(overlay.frame_interval().is_none());
+    }
+
+    #[test]
+    fn slow_frames_are_retained_while_animation_is_pending() {
+        let mut overlay = DebugFrameOverlay::new();
+        overlay.set_frame_demand(true);
+        let start = Instant::now();
+        overlay.record_frame_at(Duration::ZERO, start);
+        overlay.set_frame_demand(true);
+        overlay.record_frame_at(Duration::ZERO, start + Duration::from_secs(2));
+        assert_eq!(overlay.frame_interval(), Some(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn sparse_event_redraws_show_idle_instead_of_declining_fps() {
+        let mut overlay = DebugFrameOverlay::new();
+        overlay.set_mode(DebugFrameOverlayMode::FrameRate);
+        let start = Instant::now();
+        for frame in 0..20 {
+            overlay.set_frame_demand(false);
+            overlay.record_frame_at(
+                Duration::from_millis(1),
+                start + Duration::from_millis(frame * 100),
+            );
+        }
+        assert_eq!(overlay.lines()[0], "FPS    IDLE");
         assert!(overlay.frame_interval().is_none());
     }
 
