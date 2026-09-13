@@ -22,6 +22,11 @@ impl FrameRateLimiter {
         self.rate
     }
 
+    pub(crate) fn delay(&self, now: Instant) -> Duration {
+        self.next
+            .map_or(Duration::ZERO, |next| next.saturating_duration_since(now))
+    }
+
     pub(crate) fn admit(&mut self, now: Instant) -> bool {
         let Some(rate) = self.rate else { return true };
         let interval = Duration::from_secs_f64(1.0 / f64::from(rate.get()));

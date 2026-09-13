@@ -1216,6 +1216,7 @@ pub struct Window {
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
     frame_rate_limiter: Rc<RefCell<crate::frame_rate_limiter::FrameRateLimiter>>,
+    frame_retry: Option<Task<()>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -1613,17 +1614,14 @@ impl Window {
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
-                        // Deferred by throttling: ask demand-driven platforms to retry.
                         handle
-                            .update(&mut cx, |_, window, _| {
-                                window.platform_window.schedule_frame();
+                            .update(&mut cx, |_, window, cx| {
+                                window.schedule_frame_after(
+                                    min_interval - now.duration_since(last_frame),
+                                    cx,
+                                );
                             })
                             .log_err();
-                        // The demand that entered this branch (a deferred forced
-                        // render or pending next-frame callbacks) is still
-                        // unserved; platforms that stop requesting frames for
-                        // idle windows need a wakeup to deliver the retry.
-                        invalidator.wake_platform();
                         return;
                     }
                 }
@@ -1631,10 +1629,10 @@ impl Window {
                     && !frame_rate_limiter.borrow_mut().admit(now)
                 {
                     deferred_force_render |= force_render;
-                    invalidator.wake_platform();
+                    let delay = frame_rate_limiter.borrow().delay(now);
                     handle
-                        .update(&mut cx, |_, window, _| {
-                            window.platform_window.schedule_frame()
+                        .update(&mut cx, |_, window, cx| {
+                            window.schedule_frame_after(delay, cx);
                         })
                         .log_err();
                     return;
@@ -1930,6 +1928,7 @@ impl Window {
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
             frame_rate_limiter,
+            frame_retry: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -2401,6 +2400,23 @@ impl Window {
         );
         activate();
         subscription
+    }
+
+    /// A deferred frame must sleep until its deadline rather than repeatedly
+    /// waking an uncapped platform while an inactive-window limit rejects it.
+    fn schedule_frame_after(&mut self, delay: Duration, cx: &App) {
+        if self.frame_retry.is_some() {
+            return;
+        }
+        self.frame_retry = Some(self.spawn(cx, async move |cx| {
+            cx.background_executor.timer(delay).await;
+            cx.update(|window, _| {
+                window.frame_retry.take();
+                window.platform_window.schedule_frame();
+                window.invalidator.wake_platform();
+            })
+            .log_err();
+        }));
     }
 
     /// Creates an [`AsyncWindowContext`], which has a static lifetime and can be held across
@@ -7649,16 +7665,38 @@ mod tests {
 
         let baseline = test_window.frame_wake_count();
         test_window.simulate_frame_request(RequestFrameOptions::default());
-        // The test window is inactive, so this request throttles to ~30fps
-        // when it lands within the throttle interval of the previous frame
-        // (the common case here, but timing-dependent): the callback is
-        // deferred and the waker must re-arm the frame source. On a slow run
-        // the request instead lands outside the interval and runs the
-        // callback directly.
+        // Throttled callbacks get one timed wake instead of polling an uncapped
+        // platform. A slow run may already have admitted the frame directly.
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.executor().run_until_parked();
         assert!(
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn delayed_frame_requests_sleep_and_coalesce(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, cx| {
+                window.schedule_frame_after(Duration::from_millis(10), cx);
+                window.schedule_frame_after(Duration::from_millis(20), cx);
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        let before = test_window.frame_wake_count();
+        cx.executor().advance_clock(Duration::from_millis(9));
+        cx.executor().run_until_parked();
+        assert_eq!(test_window.frame_wake_count(), before);
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.executor().run_until_parked();
+        assert!(test_window.frame_wake_count() > before);
+        window
+            .update(cx, |_, window, _| assert!(window.frame_retry.is_none()))
+            .unwrap();
     }
 
     #[gpui::test]
