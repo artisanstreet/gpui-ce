@@ -6,7 +6,10 @@ use crate::{
     BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene,
     Size, point, rgb_to_hsla, rgba, size, transparent_black,
 };
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 #[allow(missing_docs)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -15,13 +18,16 @@ pub enum DebugFrameOverlayMode {
     Hidden,
     Minimal,
     Full,
+    /// Actual redraw cadence and CPU draw duration.
+    FrameRate,
 }
 
 impl DebugFrameOverlayMode {
-    /// Returns the next mode in the Hidden → FrameTime → Detailed cycle.
+    /// Returns the next mode in the Hidden → FPS → Detailed cycle.
     pub fn next(self) -> Self {
         match self {
-            Self::Hidden => Self::Minimal,
+            Self::Hidden => Self::FrameRate,
+            Self::FrameRate => Self::Full,
             Self::Minimal => Self::Full,
             Self::Full => Self::Hidden,
         }
@@ -55,6 +61,7 @@ pub(crate) struct DebugFrameOverlay {
     mode: DebugFrameOverlayMode,
     draw_durations: VecDeque<Duration>,
     total_frame_count: u64,
+    frame_times: VecDeque<Instant>,
 }
 
 impl DebugFrameOverlay {
@@ -63,6 +70,7 @@ impl DebugFrameOverlay {
             mode: DebugFrameOverlayMode::default(),
             draw_durations: VecDeque::new(),
             total_frame_count: 0,
+            frame_times: VecDeque::new(),
         }
     }
 
@@ -78,6 +86,7 @@ impl DebugFrameOverlay {
     /// The total frame count is left untouched.
     pub(crate) fn reset_stats(&mut self) {
         self.draw_durations.clear();
+        self.frame_times.clear();
     }
 
     pub(crate) fn is_enabled(&self) -> bool {
@@ -85,6 +94,26 @@ impl DebugFrameOverlay {
     }
 
     pub(crate) fn record_frame(&mut self, draw_duration: Duration) {
+        self.record_frame_at(draw_duration, Instant::now());
+    }
+
+    fn record_frame_at(&mut self, draw_duration: Duration, now: Instant) {
+        if self
+            .frame_times
+            .back()
+            .is_some_and(|last| now.saturating_duration_since(*last) > Duration::from_secs(1))
+        {
+            self.frame_times.clear();
+        }
+        while self.frame_times.len() >= MAX_SAMPLES
+            || self
+                .frame_times
+                .get(1)
+                .is_some_and(|time| now.saturating_duration_since(*time) >= Duration::from_secs(1))
+        {
+            self.frame_times.pop_front();
+        }
+        self.frame_times.push_back(now);
         self.total_frame_count += 1;
         if self.draw_durations.len() >= MAX_SAMPLES {
             self.draw_durations.pop_front();
@@ -107,7 +136,12 @@ impl DebugFrameOverlay {
         let panel_height = cell * (lines.len() as f32 * LINE_ADVANCE + 2.0 * PANEL_PADDING);
         let viewport = viewport_size.scale(scale_factor);
         let panel_left = viewport.width.0 - panel_width - cell * PANEL_MARGIN;
-        let panel_top = cell * PANEL_MARGIN;
+        let panel_top = cell * PANEL_MARGIN
+            + if self.mode == DebugFrameOverlayMode::FrameRate {
+                40.0 * scale_factor
+            } else {
+                0.0
+            };
 
         let content_mask = ContentMask {
             bounds: Bounds {
@@ -160,11 +194,34 @@ impl DebugFrameOverlay {
         }
     }
 
+    fn frame_interval(&self) -> Option<Duration> {
+        let intervals = self.frame_times.len().checked_sub(1)?;
+        if intervals == 0 {
+            return None;
+        }
+        self.frame_times
+            .back()?
+            .checked_duration_since(*self.frame_times.front()?)?
+            .checked_div(intervals as u32)
+    }
+
     fn lines(&self) -> Vec<String> {
         let current = self.draw_durations.back().copied();
         match self.mode {
             DebugFrameOverlayMode::Hidden => Vec::new(),
             DebugFrameOverlayMode::Minimal => vec![format_ms(current)],
+            DebugFrameOverlayMode::FrameRate => {
+                let interval = self.frame_interval();
+                let fps = interval.filter(|value| !value.is_zero()).map_or_else(
+                    || "   --".into(),
+                    |value| format!("{:>5.1}", 1.0 / value.as_secs_f64()),
+                );
+                vec![
+                    format!("FPS   {fps}"),
+                    format!("FRAME {}", format_ms(interval)),
+                    format!("CPU   {}", format_ms(current)),
+                ]
+            }
             DebugFrameOverlayMode::Full => {
                 let mut sorted: Vec<Duration> = self.draw_durations.iter().copied().collect();
                 sorted.sort_unstable();
@@ -296,6 +353,9 @@ fn glyph(character: char) -> Option<[u8; GLYPH_HEIGHT]> {
         'O' => [
             0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
         ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
         'R' => [
             0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
         ],
@@ -318,6 +378,40 @@ fn glyph(character: char) -> Option<[u8; GLYPH_HEIGHT]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fps_uses_frame_arrivals_not_cpu_draw_time() {
+        let mut overlay = DebugFrameOverlay::new();
+        overlay.set_mode(DebugFrameOverlayMode::FrameRate);
+        let start = Instant::now();
+        for frame in 0..21 {
+            overlay.record_frame_at(
+                Duration::from_millis(1),
+                start + Duration::from_millis(frame * 50),
+            );
+        }
+        assert_eq!(
+            overlay.lines(),
+            ["FPS    20.0", "FRAME  50.0 MS", "CPU     1.0 MS"]
+        );
+        for line in overlay.lines() {
+            assert!(line.chars().all(|ch| ch == ' ' || glyph(ch).is_some()));
+        }
+    }
+
+    #[test]
+    fn fps_resets_after_idle_and_requires_two_samples() {
+        let mut overlay = DebugFrameOverlay::new();
+        let start = Instant::now();
+        overlay.record_frame_at(Duration::ZERO, start);
+        assert!(overlay.frame_interval().is_none());
+        overlay.record_frame_at(Duration::ZERO, start + Duration::from_millis(5));
+        assert_eq!(overlay.frame_interval(), Some(Duration::from_millis(5)));
+        overlay.record_frame_at(Duration::ZERO, start + Duration::from_secs(10));
+        assert!(overlay.frame_interval().is_none());
+        overlay.reset_stats();
+        assert!(overlay.frame_interval().is_none());
+    }
 
     /// Every character the readouts can produce must have a glyph, or it
     /// would silently render as blank space.
