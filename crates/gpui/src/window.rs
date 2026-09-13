@@ -3090,7 +3090,7 @@ impl Window {
             let draw_duration = self
                 .window_profiler
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
-            self.debug_frame_overlay.record_frame(draw_duration);
+            self.debug_frame_overlay.record_draw(draw_duration);
         }
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
@@ -3127,6 +3127,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        #[cfg(feature = "profiler")]
+        self.debug_frame_overlay.record_present();
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,

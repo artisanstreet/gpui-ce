@@ -95,8 +95,22 @@ impl DebugFrameOverlay {
         self.mode != DebugFrameOverlayMode::Hidden
     }
 
-    pub(crate) fn record_frame(&mut self, draw_duration: Duration) {
-        self.record_frame_at(draw_duration, Instant::now());
+    pub(crate) fn record_draw(&mut self, draw_duration: Duration) {
+        self.total_frame_count += 1;
+        if self.draw_durations.len() >= MAX_SAMPLES {
+            self.draw_durations.pop_front();
+        }
+        self.draw_durations.push_back(draw_duration);
+    }
+
+    pub(crate) fn record_present(&mut self) {
+        self.record_present_at(Instant::now());
+    }
+
+    #[cfg(test)]
+    fn record_draw_at(&mut self, duration: Duration, now: Instant) {
+        self.record_draw(duration);
+        self.record_present_at(now);
     }
 
     /// Start a fresh cadence sample when an animation resumes after event-driven idle.
@@ -108,7 +122,7 @@ impl DebugFrameOverlay {
         self.frame_demand = demanded;
     }
 
-    fn record_frame_at(&mut self, draw_duration: Duration, now: Instant) {
+    fn record_present_at(&mut self, now: Instant) {
         while self.frame_times.len() >= MAX_SAMPLES
             || self
                 .frame_times
@@ -120,11 +134,6 @@ impl DebugFrameOverlay {
         if self.frame_demand {
             self.frame_times.push_back(now);
         }
-        self.total_frame_count += 1;
-        if self.draw_durations.len() >= MAX_SAMPLES {
-            self.draw_durations.pop_front();
-        }
-        self.draw_durations.push_back(draw_duration);
     }
 
     pub(crate) fn paint(&self, scene: &mut Scene, viewport_size: Size<Pixels>, scale_factor: f32) {
@@ -396,13 +405,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unpresented_draws_do_not_inflate_fps() {
+        let mut overlay = DebugFrameOverlay::new();
+        overlay.set_frame_demand(true);
+        let start = Instant::now();
+        overlay.record_present_at(start);
+        for _ in 0..10 {
+            overlay.record_draw(Duration::from_millis(1));
+        }
+        assert!(overlay.frame_interval().is_none());
+        overlay.record_present_at(start + Duration::from_millis(10));
+        assert_eq!(overlay.frame_interval(), Some(Duration::from_millis(10)));
+    }
+
+    #[test]
     fn fps_uses_frame_arrivals_not_cpu_draw_time() {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_mode(DebugFrameOverlayMode::FrameRate);
         overlay.set_frame_demand(true);
         let start = Instant::now();
         for frame in 0..21 {
-            overlay.record_frame_at(
+            overlay.record_draw_at(
                 Duration::from_millis(1),
                 start + Duration::from_millis(frame * 50),
             );
@@ -421,15 +444,15 @@ mod tests {
         let mut overlay = DebugFrameOverlay::new();
         let start = Instant::now();
         overlay.set_frame_demand(true);
-        overlay.record_frame_at(Duration::ZERO, start);
+        overlay.record_draw_at(Duration::ZERO, start);
         assert!(overlay.frame_interval().is_none());
-        overlay.record_frame_at(Duration::ZERO, start + Duration::from_millis(5));
+        overlay.record_draw_at(Duration::ZERO, start + Duration::from_millis(5));
         assert_eq!(overlay.frame_interval(), Some(Duration::from_millis(5)));
         overlay.set_frame_demand(false);
-        overlay.record_frame_at(Duration::ZERO, start + Duration::from_millis(100));
+        overlay.record_draw_at(Duration::ZERO, start + Duration::from_millis(100));
         assert!(overlay.frame_interval().is_none());
         overlay.set_frame_demand(true);
-        overlay.record_frame_at(Duration::ZERO, start + Duration::from_secs(10));
+        overlay.record_draw_at(Duration::ZERO, start + Duration::from_secs(10));
         assert!(overlay.frame_interval().is_none());
         overlay.reset_stats();
         assert!(overlay.frame_interval().is_none());
@@ -440,9 +463,9 @@ mod tests {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_frame_demand(true);
         let start = Instant::now();
-        overlay.record_frame_at(Duration::ZERO, start);
+        overlay.record_draw_at(Duration::ZERO, start);
         overlay.set_frame_demand(true);
-        overlay.record_frame_at(Duration::ZERO, start + Duration::from_secs(2));
+        overlay.record_draw_at(Duration::ZERO, start + Duration::from_secs(2));
         assert_eq!(overlay.frame_interval(), Some(Duration::from_secs(2)));
     }
 
@@ -453,7 +476,7 @@ mod tests {
         let start = Instant::now();
         for frame in 0..20 {
             overlay.set_frame_demand(false);
-            overlay.record_frame_at(
+            overlay.record_draw_at(
                 Duration::from_millis(1),
                 start + Duration::from_millis(frame * 100),
             );
@@ -480,7 +503,7 @@ mod tests {
             Duration::from_millis(123),
             Duration::from_secs(2),
         ] {
-            overlay.record_frame(duration);
+            overlay.record_draw(duration);
             lines.extend(overlay.lines());
         }
         // Counts beyond five digits render as "LOTS".
@@ -507,7 +530,7 @@ mod tests {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_mode(DebugFrameOverlayMode::Full);
         for milliseconds in 1..=100 {
-            overlay.record_frame(Duration::from_millis(milliseconds));
+            overlay.record_draw(Duration::from_millis(milliseconds));
         }
         let lines = overlay.lines();
         assert_eq!(lines[0], "CUR 100.0 MS");
@@ -522,14 +545,14 @@ mod tests {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_mode(DebugFrameOverlayMode::Full);
         for _ in 0..10 {
-            overlay.record_frame(Duration::from_millis(10));
+            overlay.record_draw(Duration::from_millis(10));
         }
         overlay.reset_stats();
         let lines = overlay.lines();
         assert_eq!(lines[0], "CUR    -- MS");
         assert_eq!(lines[3], "MAX    -- MS");
         assert_eq!(lines[4], "FRAMES    10");
-        overlay.record_frame(Duration::from_millis(20));
+        overlay.record_draw(Duration::from_millis(20));
         let lines = overlay.lines();
         assert_eq!(lines[0], "CUR  20.0 MS");
         assert_eq!(lines[4], "FRAMES    11");
@@ -539,15 +562,15 @@ mod tests {
     fn frame_count_accumulates_across_mode_changes() {
         let mut overlay = DebugFrameOverlay::new();
         for _ in 0..3 {
-            overlay.record_frame(Duration::from_millis(10));
+            overlay.record_draw(Duration::from_millis(10));
         }
         overlay.set_mode(DebugFrameOverlayMode::Minimal);
         assert_eq!(overlay.lines(), vec![" 10.0 MS".to_string()]);
         overlay.set_mode(DebugFrameOverlayMode::Full);
-        overlay.record_frame(Duration::from_millis(10));
+        overlay.record_draw(Duration::from_millis(10));
         assert_eq!(overlay.lines()[4], "FRAMES     4");
         overlay.set_mode(DebugFrameOverlayMode::Hidden);
-        overlay.record_frame(Duration::from_millis(10));
+        overlay.record_draw(Duration::from_millis(10));
         overlay.set_mode(DebugFrameOverlayMode::Full);
         assert_eq!(overlay.lines()[4], "FRAMES     5");
     }
@@ -556,7 +579,7 @@ mod tests {
     fn frame_count_is_right_aligned_and_saturates() {
         let mut overlay = DebugFrameOverlay::new();
         overlay.set_mode(DebugFrameOverlayMode::Full);
-        overlay.record_frame(Duration::from_millis(10));
+        overlay.record_draw(Duration::from_millis(10));
         assert_eq!(overlay.lines()[4], "FRAMES     1");
         overlay.total_frame_count = 99_999;
         assert_eq!(overlay.lines()[4], "FRAMES 99999");
@@ -567,7 +590,7 @@ mod tests {
     #[test]
     fn toggling_on_shows_previous_frame_immediately() {
         let mut overlay = DebugFrameOverlay::new();
-        overlay.record_frame(Duration::from_millis(10));
+        overlay.record_draw(Duration::from_millis(10));
         overlay.set_mode(DebugFrameOverlayMode::Minimal);
         assert_eq!(overlay.lines(), vec![" 10.0 MS".to_string()]);
     }
