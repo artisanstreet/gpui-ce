@@ -77,6 +77,11 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    /// One render permit per monitor vblank; missed frames coalesce.
+    #[cfg(feature = "wgpu")]
+    pub(crate) frame_ready: Arc<AtomicBool>,
+    #[cfg(feature = "wgpu")]
+    pub(crate) frame_paced: Cell<bool>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -152,7 +157,7 @@ impl WindowsWindowState {
             WgpuSurfaceConfig {
                 size: physical_size,
                 transparent: false,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                preferred_present_mode: Some(wgpu::PresentMode::Fifo),
             },
             None,
             None,
@@ -194,6 +199,10 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            #[cfg(feature = "wgpu")]
+            frame_ready: Arc::new(AtomicBool::new(true)),
+            #[cfg(feature = "wgpu")]
+            frame_paced: Cell::new(false),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,

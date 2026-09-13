@@ -324,6 +324,7 @@ impl WindowsPlatform {
             .map(|hwnd| hwnd.as_raw())
     }
 
+    #[cfg(not(feature = "wgpu"))]
     fn begin_vsync_thread(&self) {
         #[cfg(not(feature = "wgpu"))]
         let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
@@ -471,6 +472,7 @@ impl Platform for WindowsPlatform {
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
         on_finish_launching();
+        #[cfg(not(feature = "wgpu"))]
         if !self.headless {
             self.begin_vsync_thread();
         }
@@ -608,6 +610,11 @@ impl Platform for WindowsPlatform {
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
+        #[cfg(feature = "wgpu")]
+        if !self.headless {
+            crate::monitor_vsync::start(handle.into(), &window.state.frame_ready)?;
+            window.state.frame_paced.set(true);
+        }
 
         Ok(Box::new(window))
     }

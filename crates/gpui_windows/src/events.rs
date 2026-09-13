@@ -1341,6 +1341,14 @@ impl WindowsWindowInner {
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
             return Some(0);
         };
+        #[cfg(feature = "wgpu")]
+        if self.state.frame_paced.get() && !self.state.frame_ready.swap(false, Ordering::AcqRel) {
+            if force_render {
+                self.state.force_render_pending.set(true);
+            }
+            unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            return Some(0);
+        }
         let mut request_frame = self.state.callbacks.request_frame.take()?;
         self.state.direct_manipulation.update();
 
