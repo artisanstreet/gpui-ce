@@ -6,7 +6,10 @@ use std::{
     path::PathBuf,
     rc::{Rc, Weak},
     str::FromStr,
-    sync::{Arc, Once, atomic::AtomicBool},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -82,6 +85,8 @@ pub struct WindowsWindowState {
     pub(crate) frame_ready: Arc<AtomicBool>,
     #[cfg(feature = "wgpu")]
     pub(crate) frame_paced: Cell<bool>,
+    #[cfg(feature = "wgpu")]
+    pub(crate) vsync_enabled: Arc<AtomicBool>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -203,6 +208,8 @@ impl WindowsWindowState {
             frame_ready: Arc::new(AtomicBool::new(true)),
             #[cfg(feature = "wgpu")]
             frame_paced: Cell::new(false),
+            #[cfg(feature = "wgpu")]
+            vsync_enabled: Arc::new(AtomicBool::new(true)),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -1106,6 +1113,36 @@ impl PlatformWindow for WindowsWindow {
         // Only loads an atomic flag - safe even mid-recovery, when
         // gpu_context would panic on the torn-down resources.
         Some(self.state.renderer.borrow().device_lost())
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let window = Rc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(window) = window.upgrade() {
+                unsafe {
+                    let _ = RedrawWindow(Some(window.hwnd), None, None, RDW_INVALIDATE);
+                }
+            }
+        }))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn schedule_frame(&self) {
+        unsafe {
+            let _ = RedrawWindow(Some(self.0.hwnd), None, None, RDW_INVALIDATE);
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn set_vsync(&self, enabled: bool) {
+        if self.state.renderer.borrow_mut().set_vsync(enabled) {
+            self.state.vsync_enabled.store(enabled, Ordering::Release);
+            self.state.frame_ready.store(true, Ordering::Release);
+            self.schedule_frame();
+        } else {
+            log::warn!("Adapter does not support presentation without VSync");
+        }
     }
 
     fn draw(&self, scene: &Scene) {

@@ -2072,6 +2072,12 @@ impl Window {
         self.refresh();
     }
 
+    /// Changes presentation synchronization on platforms supporting runtime control.
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.platform_window.set_vsync(enabled);
+        self.refresh();
+    }
+
     /// Returns the requested redraw-rate limit, independent of the monitor.
     pub fn max_frame_rate(&self) -> Option<std::num::NonZeroU32> {
         self.frame_rate_limiter.borrow().rate()

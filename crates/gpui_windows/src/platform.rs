@@ -612,7 +612,11 @@ impl Platform for WindowsPlatform {
         self.raw_window_handles.write().push(handle.into());
         #[cfg(feature = "wgpu")]
         if !self.headless {
-            crate::monitor_vsync::start(handle.into(), &window.state.frame_ready)?;
+            crate::monitor_vsync::start(
+                handle.into(),
+                &window.state.frame_ready,
+                Arc::clone(&window.state.vsync_enabled),
+            )?;
             window.state.frame_paced.set(true);
         }
 

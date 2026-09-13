@@ -339,6 +339,7 @@ pub struct WgpuRenderer {
     extra_requirements: Option<WgpuDeviceRequirements>,
     resources: Option<WgpuResources>,
     surface_config: wgpu::SurfaceConfiguration,
+    present_modes: Vec<wgpu::PresentMode>,
     atlas: Arc<WgpuAtlas>,
     path_globals_offset: u64,
     gamma_offset: u64,
@@ -768,6 +769,7 @@ impl WgpuRenderer {
             extra_requirements,
             resources: Some(resources),
             surface_config,
+            present_modes: surface_caps.present_modes.clone(),
             atlas,
             path_globals_offset,
             gamma_offset,
@@ -1524,6 +1526,23 @@ impl WgpuRenderer {
         self.is_bgr = is_bgr;
     }
 
+    /// Updates the surface without recreating the device or cached drawing resources.
+    /// Returns false when the adapter has no presentation mode without VSync.
+    pub fn set_vsync(&mut self, enabled: bool) -> bool {
+        let Some(mode) = presentation_mode(enabled, &self.present_modes) else {
+            return false;
+        };
+        if self.surface_config.present_mode != mode {
+            self.surface_config.present_mode = mode;
+            if let Some(resources) = &self.resources {
+                resources
+                    .surface
+                    .configure(&resources.device, &self.surface_config);
+            }
+        }
+        true
+    }
+
     pub fn update_transparency(&mut self, transparent: bool) {
         let new_alpha_mode = if transparent {
             self.transparent_alpha_mode
@@ -1674,9 +1693,8 @@ impl WgpuRenderer {
         // the frame for the pre-present staging copy below. `take` clears the flag, so a
         // draw that bails before presenting cannot arm a later production frame.
         let capture = self.capture_armed.take();
-        let use_offscreen = capture
-            || !scene.backdrop_filters.is_empty()
-            || !scene.filter_boundaries.is_empty();
+        let use_offscreen =
+            capture || !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
         if use_offscreen {
             self.ensure_blur_textures();
         }
@@ -2062,9 +2080,7 @@ impl WgpuRenderer {
     /// lost device, or a frame the compositor skipped (occluded/timeout).
     pub fn render_to_rgba_image(&mut self, scene: &Scene) -> Result<WgpuCapturedImage> {
         if self.uses_webgl_instance_data {
-            anyhow::bail!(
-                "fixture capture not supported on the WebGL instance-data path"
-            );
+            anyhow::bail!("fixture capture not supported on the WebGL instance-data path");
         }
         if self.resources.is_none() {
             anyhow::bail!("fixture capture unavailable: GPU resources not available");
@@ -2173,9 +2189,12 @@ impl WgpuRenderer {
         let staging = pending.staging;
         let resources = self.resources();
         let (sender, receiver) = std::sync::mpsc::channel();
-        staging.buffer.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
+        staging
+            .buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
         resources
             .device
             .poll(wgpu::PollType::Wait {
@@ -2192,7 +2211,9 @@ impl WgpuRenderer {
         let mut rgba = vec![0u8; unpadded * staging.height as usize];
         {
             let mapped = staging.buffer.slice(..).get_mapped_range();
-            for (dst_row, src_row) in rgba.chunks_exact_mut(unpadded).zip(mapped.chunks_exact(padded))
+            for (dst_row, src_row) in rgba
+                .chunks_exact_mut(unpadded)
+                .zip(mapped.chunks_exact(padded))
             {
                 dst_row.copy_from_slice(&src_row[..unpadded]);
             }
@@ -3698,10 +3719,31 @@ impl RenderingParameters {
     }
 }
 
+fn presentation_mode(vsync: bool, supported: &[wgpu::PresentMode]) -> Option<wgpu::PresentMode> {
+    if vsync {
+        return Some(wgpu::PresentMode::Fifo);
+    }
+    [wgpu::PresentMode::Immediate, wgpu::PresentMode::Mailbox]
+        .into_iter()
+        .find(|mode| supported.contains(mode))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use gpui::{MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline};
+
+    #[test]
+    fn presentation_mode_prefers_immediate_and_preserves_vsync_choice() {
+        use wgpu::PresentMode::{Fifo, Immediate, Mailbox};
+        assert_eq!(
+            presentation_mode(false, &[Fifo, Mailbox, Immediate]),
+            Some(Immediate)
+        );
+        assert_eq!(presentation_mode(false, &[Fifo, Mailbox]), Some(Mailbox));
+        assert_eq!(presentation_mode(false, &[Fifo]), None);
+        assert_eq!(presentation_mode(true, &[Fifo, Immediate]), Some(Fifo));
+    }
 
     #[test]
     fn webgl_shader_is_valid_wgsl_without_storage_buffers() {
