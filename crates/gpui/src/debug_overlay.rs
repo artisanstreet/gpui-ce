@@ -345,6 +345,12 @@ fn glyph(character: char) -> Option<[u8; GLYPH_HEIGHT]> {
         'C' => [
             0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
         ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
         'E' => [
             0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
         ],
@@ -453,6 +459,9 @@ mod tests {
             );
         }
         assert_eq!(overlay.lines()[0], "FPS    IDLE");
+        for line in overlay.lines() {
+            assert!(line.chars().all(|ch| ch == ' ' || glyph(ch).is_some()));
+        }
         assert!(overlay.frame_interval().is_none());
     }
 
