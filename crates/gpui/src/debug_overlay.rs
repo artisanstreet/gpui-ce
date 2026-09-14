@@ -76,6 +76,11 @@ impl DebugFrameOverlay {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn frame_sample_count(&self) -> usize {
+        self.frame_times.len()
+    }
+
     pub(crate) fn mode(&self) -> DebugFrameOverlayMode {
         self.mode
     }

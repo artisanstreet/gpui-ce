@@ -1190,9 +1190,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
-    /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
-    /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
-    pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    /// Keeps presentation responsive during a bounded period after visual input.
+    pub(crate) input_activity: Rc<RefCell<InputActivity>>,
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
@@ -1230,48 +1229,25 @@ struct ModifierState {
     saw_other_input: bool,
 }
 
-/// Tracks input event timestamps to determine if input is arriving at a high rate.
-/// Used for selective VRR (Variable Refresh Rate) optimization.
-#[derive(Clone, Debug)]
-pub(crate) struct InputRateTracker {
-    timestamps: Vec<Instant>,
-    window: Duration,
-    inputs_per_second: u32,
-    sustain_until: Instant,
-    sustain_duration: Duration,
+/// Keeps interactive presentation responsive from the first visual input event.
+/// The bounded grace period expires without scheduling work of its own, so
+/// event-driven platforms can still park as soon as frame demand stops.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InputActivity {
+    last_input: Option<Instant>,
 }
 
-impl Default for InputRateTracker {
-    fn default() -> Self {
-        Self {
-            timestamps: Vec::new(),
-            window: Duration::from_millis(100),
-            inputs_per_second: 60,
-            sustain_until: Instant::now(),
-            sustain_duration: Duration::from_secs(1),
-        }
-    }
-}
+impl InputActivity {
+    const SUSTAIN_DURATION: Duration = Duration::from_secs(1);
 
-impl InputRateTracker {
-    pub fn record_input(&mut self) {
-        let now = Instant::now();
-        self.timestamps.push(now);
-        self.prune_old_timestamps(now);
-
-        let min_events = self.inputs_per_second as u128 * self.window.as_millis() / 1000;
-        if self.timestamps.len() as u128 >= min_events {
-            self.sustain_until = now + self.sustain_duration;
-        }
+    fn record_input(&mut self, now: Instant) {
+        self.last_input = Some(now);
     }
 
-    pub fn is_high_rate(&self) -> bool {
-        Instant::now() < self.sustain_until
-    }
-
-    fn prune_old_timestamps(&mut self, now: Instant) {
-        self.timestamps
-            .retain(|&t| now.duration_since(t) <= self.window);
+    fn is_recent(&self, now: Instant) -> bool {
+        self.last_input.is_some_and(|last_input| {
+            now.saturating_duration_since(last_input) < Self::SUSTAIN_DURATION
+        })
     }
 }
 
@@ -1439,7 +1415,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
-        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let input_activity = Rc::new(RefCell::new(InputActivity::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
@@ -1556,7 +1532,7 @@ impl Window {
             let active = active.clone();
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
-            let input_rate_tracker = input_rate_tracker.clone();
+            let input_activity = input_activity.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
@@ -1599,7 +1575,7 @@ impl Window {
                         && next_frame_callbacks.borrow().is_empty())
                 {
                     None
-                } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
+                } else if !active.get() && !input_activity.borrow().is_recent(Instant::now()) {
                     inactive_frame_interval
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1650,12 +1626,12 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting if input was recently arriving at a high rate (>= 60fps).
-                // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // Respond from the first redraw-causing input, including sparse
+                // clicks and wheel events. Waiting for a high-rate burst lets the
+                // display remain underclocked at the start of interaction.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || input_activity.borrow().is_recent(Instant::now());
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -1680,6 +1656,13 @@ impl Window {
 
                 handle
                     .update(&mut cx, |_, window, _| {
+                        // A final animation callback can finish without drawing.
+                        // End its cadence sample here too, or the next animation
+                        // includes the intervening idle gap in its FPS readout.
+                        #[cfg(feature = "profiler")]
+                        window
+                            .debug_frame_overlay
+                            .set_frame_demand(!window.next_frame_callbacks.borrow().is_empty());
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                         {
@@ -1903,7 +1886,7 @@ impl Window {
             active,
             hovered,
             needs_present,
-            input_rate_tracker,
+            input_activity,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
@@ -5496,7 +5479,9 @@ impl Window {
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
-            self.input_rate_tracker.borrow_mut().record_input();
+            self.input_activity
+                .borrow_mut()
+                .record_input(Instant::now());
         }
         #[cfg(feature = "profiler")]
         self.window_profiler.end_input(caused_invalidation);
@@ -7481,6 +7466,166 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+
+    #[gpui::test]
+    #[cfg(feature = "profiler")]
+    fn callback_finishing_without_a_draw_ends_the_fps_sample(cx: &mut TestAppContext) {
+        struct Animation;
+        impl Render for Animation {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                window.on_next_frame(|_, _| {});
+                div()
+            }
+        }
+        let window = cx.add_window(|_, _| Animation);
+        let platform = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, _| {
+                window.active.set(true);
+                let overlay = &mut window.debug_frame_overlay;
+                overlay.record_present();
+                overlay.record_present();
+                assert_eq!(overlay.frame_sample_count(), 2);
+            })
+            .unwrap();
+        // Drain the last animation callback without invalidating the view.
+        // Previously, only draw() ended the sample, leaving the idle gap in it.
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(window.debug_frame_overlay.frame_sample_count(), 0);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let overlay = &mut window.debug_frame_overlay;
+            overlay.record_present();
+            assert_eq!(
+                overlay.frame_sample_count(),
+                1,
+                "resume starts a fresh sample"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn input_activity_starts_immediately_expires_and_restarts_after_idle() {
+        let mut activity = super::InputActivity::default();
+        let start = scheduler::Instant::now();
+        assert!(!activity.is_recent(start));
+        activity.record_input(start);
+        assert!(activity.is_recent(start));
+        assert!(activity.is_recent(start + Duration::from_millis(999)));
+        assert!(!activity.is_recent(start + Duration::from_secs(1)));
+        let resumed = start + Duration::from_secs(10);
+        activity.record_input(resumed);
+        assert!(activity.is_recent(resumed));
+        // Sparse interaction renews the bounded grace period without a burst.
+        activity.record_input(resumed + Duration::from_millis(500));
+        assert!(activity.is_recent(resumed + Duration::from_millis(1499)));
+        assert!(!activity.is_recent(resumed + Duration::from_millis(1500)));
+    }
+
+    struct InputResumeView;
+
+    impl Render for InputResumeView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                    window.refresh();
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn first_input_resumes_unfocused_animation_without_waiting_for_a_burst(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| InputResumeView);
+        let mut platform = cx.test_window(window.into());
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        window
+            .update(cx, |_, window, _| {
+                assert!(!window.is_window_active());
+                assert!(
+                    !window
+                        .input_activity
+                        .borrow()
+                        .is_recent(scheduler::Instant::now())
+                );
+            })
+            .unwrap();
+
+        platform.simulate_input(
+            MouseDownEvent {
+                position: point(px(10.), px(10.)),
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+        );
+        let callback_ran = Rc::new(Cell::new(false));
+        window
+            .update(cx, |_, window, _| {
+                assert!(
+                    window
+                        .input_activity
+                        .borrow()
+                        .is_recent(scheduler::Instant::now())
+                );
+                let callback_ran = callback_ran.clone();
+                window.on_next_frame(move |_, _| callback_ran.set(true));
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            callback_ran.get(),
+            "the very first input must bypass background pacing"
+        );
+        window
+            .update(cx, |_, window, _| {
+                assert!(window.frame_retry.is_none());
+                // Expire the input grace period deterministically, then drain the
+                // outstanding platform callback. No input-only loop should remain.
+                window.input_activity.borrow_mut().last_input =
+                    Some(scheduler::Instant::now() - Duration::from_secs(2));
+            })
+            .unwrap();
+        platform.simulate_scheduled_frame();
+        assert!(!platform.frame_scheduled());
+    }
+
+    #[gpui::test]
+    fn recent_input_preserves_the_explicit_frame_rate_limit(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, _| {
+                window.set_max_frame_rate(std::num::NonZeroU32::new(1));
+                window
+                    .input_activity
+                    .borrow_mut()
+                    .record_input(scheduler::Instant::now());
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        let callback_ran = Rc::new(Cell::new(false));
+        window
+            .update(cx, |_, window, _| {
+                let callback_ran = callback_ran.clone();
+                window.on_next_frame(move |_, _| callback_ran.set(true));
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            !callback_ran.get(),
+            "recent input must not bypass the user's FPS limit"
+        );
+        window
+            .update(cx, |_, window, _| assert!(window.frame_retry.is_some()))
+            .unwrap();
+    }
 
     #[test]
     fn text_color_map_samples_device_pixels_and_coalesces_constant_fills() {
