@@ -62,6 +62,11 @@ struct CosmicTextSystemState {
     /// staleness policy of `font_ids_by_family_cache`: built once, not
     /// refreshed by later `add_fonts`.
     emoji_chain_cache: Option<Arc<[(FontId, SharedString)]>>,
+    /// Whether a glyph of a known emoji font carries color data, keyed by
+    /// font and glyph. Emoji faces also hold plain monochrome glyphs
+    /// (Segoe UI Emoji covers arrows, check marks and math symbols);
+    /// those must paint as text, not as color sprites.
+    color_glyph_cache: HashMap<(FontId, u16), bool>,
 }
 
 struct LoadedFont {
@@ -108,6 +113,7 @@ impl CosmicTextSystem {
             system_font_fallback: system_font_fallback.to_string(),
             cluster_formation_cache: HashMap::default(),
             emoji_chain_cache: None,
+            color_glyph_cache: HashMap::default(),
         }))
     }
 
@@ -127,6 +133,7 @@ impl CosmicTextSystem {
             system_font_fallback: system_font_fallback.to_string(),
             cluster_formation_cache: HashMap::default(),
             emoji_chain_cache: None,
+            color_glyph_cache: HashMap::default(),
         }))
     }
 }
@@ -449,6 +456,23 @@ impl CosmicTextSystemState {
         let chain: Arc<[(FontId, SharedString)]> = Arc::from(chain);
         self.emoji_chain_cache = Some(chain.clone());
         chain
+    }
+
+    /// Whether `glyph_id` of `font_id` has color data: a bitmap strike or
+    /// COLR layers. A monochrome glyph flagged as emoji rasterizes to a
+    /// one-byte mask that the color sprite path cannot paint, leaving a
+    /// blank gap the width of the glyph.
+    fn is_color_glyph(&mut self, font_id: FontId, glyph_id: u16) -> bool {
+        if let Some(&is_color) = self.color_glyph_cache.get(&(font_id, glyph_id)) {
+            return is_color;
+        }
+        let font_ref = self.loaded_fonts[font_id.0].font.as_swash();
+        let mut scaler = self.swash_scale_context.builder(font_ref).build();
+        let is_color = scaler.has_color_bitmaps()
+            || scaler
+                .scale_color_outline_into(glyph_id, &mut swash::scale::outline::Outline::new());
+        self.color_glyph_cache.insert((font_id, glyph_id), is_color);
+        is_color
     }
 
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
@@ -848,12 +872,14 @@ impl CosmicTextSystemState {
                     }
                 }
             }
-            let is_emoji = loaded_font.is_known_emoji_font;
+            let is_known_emoji_font = loaded_font.is_known_emoji_font;
 
             // HACK: Prevent crash caused by variation selectors.
-            if glyph.glyph_id == 3 && is_emoji {
+            if glyph.glyph_id == 3 && is_known_emoji_font {
                 continue;
             }
+
+            let is_emoji = is_known_emoji_font && self.is_color_glyph(font_id, glyph.glyph_id);
 
             let shaped_glyph = ShapedGlyph {
                 id: GlyphId(glyph.glyph_id as u32),
@@ -1684,6 +1710,64 @@ mod tests {
     /// U+1F389 with the emoji flag set and rasterizes BGRA bytes holding
     /// real color variance — not a monochrome mask. Skips (passes) where
     /// the platform does not provide the face.
+    #[test]
+    fn monochrome_glyphs_of_emoji_fonts_paint_as_text() -> Result<()> {
+        if !cfg!(target_os = "windows") {
+            return Ok(());
+        }
+        let text_system = CosmicTextSystem::new("Segoe UI");
+        if !text_system
+            .all_font_names()
+            .iter()
+            .any(|name| name == "Segoe UI Emoji")
+        {
+            return Ok(());
+        }
+
+        // Segoe UI Emoji draws these as plain outlines; flagged as emoji
+        // they rasterized to a mask the color path dropped, leaving gaps.
+        let font_id = text_system.font_id(&gpui::font("Segoe UI Emoji"))?;
+        let size = gpui::px(16.0);
+        for (text, expect_emoji) in [
+            ("\u{2192}", false),
+            ("\u{21D2}", false),
+            ("\u{2713}", false),
+            ("\u{1F389}", true),
+        ] {
+            let runs = [FontRun {
+                len: text.len(),
+                font_id,
+                letter_spacing: None,
+            }];
+            let layout = text_system.layout_line(text, size, &runs);
+            let (run_font_id, glyph) = layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| (run.font_id, glyph)))
+                .next()
+                .expect("text shapes to a glyph");
+            assert_eq!(glyph.is_emoji, expect_emoji, "{text:?}");
+
+            let params = RenderGlyphParams {
+                font_id: run_font_id,
+                glyph_id: glyph.id,
+                font_size: size,
+                subpixel_variant: gpui::point(0u8, 0u8),
+                scale_factor: 1.0,
+                is_emoji: glyph.is_emoji,
+                subpixel_rendering: false,
+                dilation: 0,
+            };
+            let bounds = text_system.glyph_raster_bounds(&params)?;
+            assert!(!bounds.is_zero(), "{text:?} must have ink");
+            let (_, data) = text_system.rasterize_glyph(&params, bounds)?;
+            let channels = if expect_emoji { 4 } else { 1 };
+            let pixels = bounds.size.width.0 as usize * bounds.size.height.0 as usize;
+            assert_eq!(data.len(), pixels * channels, "{text:?} raster layout");
+        }
+        Ok(())
+    }
+
     #[test]
     fn system_emoji_rasterizes_color_where_platform_provides_it() -> Result<()> {
         if !cfg!(target_os = "windows") {
