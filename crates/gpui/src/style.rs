@@ -1780,6 +1780,21 @@ mod tests {
             );
         });
     }
+
+    #[test]
+    fn blur_filter_identity_covers_zero_and_negative_radii() {
+        assert!(Filter::Blur(px(0.)).is_identity());
+        assert!(Filter::Blur(px(-2.)).is_identity());
+        assert!(!Filter::Blur(px(0.5)).is_identity());
+    }
+
+    #[test]
+    fn blur_filter_scales_radius_into_scene_space() {
+        assert_eq!(
+            Filter::Blur(px(8.)).scale(2.),
+            ScaledFilter::Blur(ScaledPixels(16.))
+        );
+    }
 }
 
 /// A paint-time transform of an element and its descendants, like CSS
