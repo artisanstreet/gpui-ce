@@ -350,6 +350,11 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// A paint-time transform of this element and its descendants, like CSS
+    /// `transform`: it moves and scales what is painted and where the pointer
+    /// hits, never the layout.
+    pub transform: Option<ElementTransform>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -958,6 +963,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            transform: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
@@ -1767,7 +1773,86 @@ mod tests {
                 orders.windows(2).all(|orders| orders[0] < orders[1]),
                 "style paint order changed: {orders:?}"
             );
-            assert!(scene.quads[2..].iter().all(|border| border.order > scene.quads[1].order));
+            assert!(
+                scene.quads[2..]
+                    .iter()
+                    .all(|border| border.order > scene.quads[1].order)
+            );
         });
+    }
+}
+
+/// A paint-time transform of an element and its descendants, like CSS
+/// `transform: translate(..) scale(..)` with a `transform-origin`.
+///
+/// Layout is untouched: the element keeps its laid-out bounds, and painting
+/// and pointer hit testing map each point `p` to
+/// `origin + translate + (p - origin) * scale`, where `origin` is the
+/// [`Self::origin`] fraction of the element's bounds. Scaling is uniform, so
+/// every primitive stays axis-aligned and every renderer draws it unchanged.
+/// Text and icons keep the rasters of their untransformed size and are
+/// stretched to the scaled bounds, so animating a scale does not rasterize
+/// a new glyph size on every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElementTransform {
+    /// The uniform scale factor; `1.0` leaves the size unchanged.
+    pub scale: f32,
+    /// The offset applied after scaling, in logical pixels.
+    pub translate: Point<Pixels>,
+    /// The fixed point of the scale as a fraction of the element's bounds:
+    /// `(0, 0)` is the top-left corner, `(0.5, 0.5)` the centre.
+    pub origin: Point<f32>,
+}
+
+impl Default for ElementTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl ElementTransform {
+    /// The transform that changes nothing.
+    pub const IDENTITY: Self = Self {
+        scale: 1.0,
+        translate: Point {
+            x: Pixels(0.0),
+            y: Pixels(0.0),
+        },
+        origin: Point { x: 0.5, y: 0.5 },
+    };
+
+    /// A uniform scale about the element's centre.
+    pub fn scale(scale: f32) -> Self {
+        Self {
+            scale,
+            ..Self::IDENTITY
+        }
+    }
+
+    /// A translation by `offset`.
+    pub fn translate(offset: Point<Pixels>) -> Self {
+        Self {
+            translate: offset,
+            ..Self::IDENTITY
+        }
+    }
+
+    /// Returns this transform scaling about `origin`, a fraction of the
+    /// element's bounds.
+    pub fn with_origin(self, origin: Point<f32>) -> Self {
+        Self { origin, ..self }
+    }
+
+    /// Returns this transform with `offset` as its translation.
+    pub fn with_translate(self, offset: Point<Pixels>) -> Self {
+        Self {
+            translate: offset,
+            ..self
+        }
+    }
+
+    /// Whether this transform leaves every point where it is.
+    pub fn is_identity(&self) -> bool {
+        self.scale == 1.0 && self.translate.x == Pixels(0.0) && self.translate.y == Pixels(0.0)
     }
 }
