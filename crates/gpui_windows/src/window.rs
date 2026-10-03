@@ -6,7 +6,10 @@ use std::{
     path::PathBuf,
     rc::{Rc, Weak},
     str::FromStr,
-    sync::{Arc, Once, atomic::AtomicBool},
+    sync::{
+        Arc, Once,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -77,6 +80,13 @@ pub struct WindowsWindowState {
     /// and when a forced render was requested while another draw was in
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
+    /// One render permit per monitor vblank; missed frames coalesce.
+    #[cfg(feature = "wgpu")]
+    pub(crate) frame_ready: Arc<AtomicBool>,
+    #[cfg(feature = "wgpu")]
+    pub(crate) frame_paced: Cell<bool>,
+    #[cfg(feature = "wgpu")]
+    pub(crate) vsync_enabled: Arc<AtomicBool>,
 
     pub click_state: ClickState,
     pub current_cursor: Cell<Option<HCURSOR>>,
@@ -152,7 +162,7 @@ impl WindowsWindowState {
             WgpuSurfaceConfig {
                 size: physical_size,
                 transparent: false,
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                preferred_present_mode: Some(wgpu::PresentMode::Fifo),
             },
             None,
             None,
@@ -194,6 +204,12 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
+            #[cfg(feature = "wgpu")]
+            frame_ready: Arc::new(AtomicBool::new(true)),
+            #[cfg(feature = "wgpu")]
+            frame_paced: Cell::new(false),
+            #[cfg(feature = "wgpu")]
+            vsync_enabled: Arc::new(AtomicBool::new(true)),
             click_state,
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
@@ -1099,6 +1115,36 @@ impl PlatformWindow for WindowsWindow {
         Some(self.state.renderer.borrow().device_lost())
     }
 
+    #[cfg(feature = "wgpu")]
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let window = Rc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            if let Some(window) = window.upgrade() {
+                unsafe {
+                    let _ = RedrawWindow(Some(window.hwnd), None, None, RDW_INVALIDATE);
+                }
+            }
+        }))
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn schedule_frame(&self) {
+        unsafe {
+            let _ = RedrawWindow(Some(self.0.hwnd), None, None, RDW_INVALIDATE);
+        }
+    }
+
+    #[cfg(feature = "wgpu")]
+    fn set_vsync(&self, enabled: bool) {
+        if self.state.renderer.borrow_mut().set_vsync(enabled) {
+            self.state.vsync_enabled.store(enabled, Ordering::Release);
+            self.state.frame_ready.store(true, Ordering::Release);
+            self.schedule_frame();
+        } else {
+            log::warn!("Adapter does not support presentation without VSync");
+        }
+    }
+
     fn draw(&self, scene: &Scene) {
         #[cfg(not(feature = "wgpu"))]
         {
@@ -1137,10 +1183,23 @@ impl PlatformWindow for WindowsWindow {
 
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
-        self.state
-            .renderer
-            .borrow_mut()
-            .render_to_image(scene, self.state.background_appearance.get())
+        #[cfg(feature = "wgpu")]
+        {
+            let captured = self
+                .state
+                .renderer
+                .borrow_mut()
+                .render_to_rgba_image(scene)?;
+            image::RgbaImage::from_raw(captured.width, captured.height, captured.rgba)
+                .context("Failed to build RgbaImage from wgpu fixture readback")
+        }
+        #[cfg(not(feature = "wgpu"))]
+        {
+            self.state
+                .renderer
+                .borrow_mut()
+                .render_to_image(scene, self.state.background_appearance.get())
+        }
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
