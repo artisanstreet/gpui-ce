@@ -350,6 +350,11 @@ pub struct Style {
     /// The opacity of this element
     pub opacity: Option<f32>,
 
+    /// A paint-time transform of this element and its descendants, like CSS
+    /// `transform`: it moves and scales what is painted and where the pointer
+    /// hits, never the layout.
+    pub transform: Option<ElementTransform>,
+
     /// The grid columns of this element
     /// Roughly equivalent to the Tailwind `grid-cols-<number>`
     pub grid_cols: Option<GridTemplate>,
@@ -827,15 +832,17 @@ impl Style {
 
         let current_color = self.text.color.unwrap_or_else(|| window.text_style().color);
 
+        // Blur the content behind this element before its (typically translucent) background
+        // and its own shadows are painted on top, so the background tints the frosted backdrop
+        // without the element's shadows becoming part of the sampled content (CSS
+        // `backdrop-filter`).
+        if !self.backdrop_filter.is_empty() {
+            window.paint_backdrop_filter(bounds, corner_radii, &self.backdrop_filter);
+        }
+
         window.paint_drop_shadows(bounds, corner_radii, &self.box_shadow);
         if let Some(ring) = self.ring.shadow(current_color, false) {
             window.paint_drop_shadows(bounds, corner_radii, std::slice::from_ref(&ring));
-        }
-
-        // Blur the content behind this element before its (typically translucent) background
-        // is painted on top, so the background tints the frosted backdrop (CSS `backdrop-filter`).
-        if !self.backdrop_filter.is_empty() {
-            window.paint_backdrop_filter(bounds, corner_radii, &self.backdrop_filter);
         }
 
         // The element's own box — background, inset shadows, children, and border — painted as a
@@ -956,6 +963,7 @@ impl Default for Style {
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            transform: None,
             grid_rows: None,
             grid_cols: None,
             grid_location: None,
@@ -1701,5 +1709,165 @@ mod tests {
         assert_eq!(inset.color, explicit_color);
         assert!(inset.inset);
         assert_eq!(style.ring, RingStyle::default());
+    }
+
+    #[crate::test]
+    fn style_paint_orders_backdrop_before_outer_shadows_and_element_contents(
+        cx: &mut crate::TestAppContext,
+    ) {
+        let cx = cx.add_empty_window();
+        cx.update(|window, app| {
+            let bounds = Bounds {
+                origin: point(px(10.), px(10.)),
+                size: size(px(80.), px(80.)),
+            };
+            let mut style = Style::default();
+            style.background = Some(Fill::from(red().with_alpha(0.2)));
+            style.border_color = Some(green());
+            style.border_widths = Edges::all(px(1.).into());
+            style.backdrop_filter = vec![Filter::Blur(px(8.))];
+            style.box_shadow = vec![
+                BoxShadow::new(px(0.), px(0.), blue()).blur_radius(px(4.)),
+                BoxShadow::new(px(0.), px(0.), yellow()).inset(),
+            ];
+            style.ring = RingStyle {
+                width: px(2.),
+                color: RingColor::Color(red()),
+            };
+            style.inset_ring = RingStyle {
+                width: px(1.),
+                color: RingColor::Color(blue()),
+            };
+
+            window.next_frame.scene.clear();
+            window.invalidator.set_phase(crate::DrawPhase::Paint);
+            style.paint(bounds, window, app, |window, _| {
+                window.paint_quad(quad(
+                    bounds,
+                    Corners::default(),
+                    blue(),
+                    Edges::default(),
+                    black().with_alpha(0.0),
+                    BorderStyle::default(),
+                ));
+            });
+            window.invalidator.set_phase(crate::DrawPhase::None);
+
+            window.next_frame.scene.finish();
+            let scene = &window.next_frame.scene;
+            assert_eq!(scene.backdrop_filters.len(), 1);
+            assert_eq!(scene.shadows.len(), 4);
+            // The border may be split into disjoint quads by the overdraw optimizer.
+            assert!(scene.quads.len() >= 3);
+
+            let orders = [
+                scene.backdrop_filters[0].order,
+                scene.shadows[0].order,
+                scene.shadows[1].order,
+                scene.quads[0].order,
+                scene.shadows[2].order,
+                scene.shadows[3].order,
+                scene.quads[1].order,
+            ];
+            assert!(
+                orders.windows(2).all(|orders| orders[0] < orders[1]),
+                "style paint order changed: {orders:?}"
+            );
+            assert!(
+                scene.quads[2..]
+                    .iter()
+                    .all(|border| border.order > scene.quads[1].order)
+            );
+        });
+    }
+
+    #[test]
+    fn blur_filter_identity_covers_zero_and_negative_radii() {
+        assert!(Filter::Blur(px(0.)).is_identity());
+        assert!(Filter::Blur(px(-2.)).is_identity());
+        assert!(!Filter::Blur(px(0.5)).is_identity());
+    }
+
+    #[test]
+    fn blur_filter_scales_radius_into_scene_space() {
+        assert_eq!(
+            Filter::Blur(px(8.)).scale(2.),
+            ScaledFilter::Blur(ScaledPixels(16.))
+        );
+    }
+}
+
+/// A paint-time transform of an element and its descendants, like CSS
+/// `transform: translate(..) scale(..)` with a `transform-origin`.
+///
+/// Layout is untouched: the element keeps its laid-out bounds, and painting
+/// and pointer hit testing map each point `p` to
+/// `origin + translate + (p - origin) * scale`, where `origin` is the
+/// [`Self::origin`] fraction of the element's bounds. Scaling is uniform, so
+/// every primitive stays axis-aligned and every renderer draws it unchanged.
+/// Text and icons keep the rasters of their untransformed size and are
+/// stretched to the scaled bounds, so animating a scale does not rasterize
+/// a new glyph size on every frame.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ElementTransform {
+    /// The uniform scale factor; `1.0` leaves the size unchanged.
+    pub scale: f32,
+    /// The offset applied after scaling, in logical pixels.
+    pub translate: Point<Pixels>,
+    /// The fixed point of the scale as a fraction of the element's bounds:
+    /// `(0, 0)` is the top-left corner, `(0.5, 0.5)` the centre.
+    pub origin: Point<f32>,
+}
+
+impl Default for ElementTransform {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+impl ElementTransform {
+    /// The transform that changes nothing.
+    pub const IDENTITY: Self = Self {
+        scale: 1.0,
+        translate: Point {
+            x: Pixels(0.0),
+            y: Pixels(0.0),
+        },
+        origin: Point { x: 0.5, y: 0.5 },
+    };
+
+    /// A uniform scale about the element's centre.
+    pub fn scale(scale: f32) -> Self {
+        Self {
+            scale,
+            ..Self::IDENTITY
+        }
+    }
+
+    /// A translation by `offset`.
+    pub fn translate(offset: Point<Pixels>) -> Self {
+        Self {
+            translate: offset,
+            ..Self::IDENTITY
+        }
+    }
+
+    /// Returns this transform scaling about `origin`, a fraction of the
+    /// element's bounds.
+    pub fn with_origin(self, origin: Point<f32>) -> Self {
+        Self { origin, ..self }
+    }
+
+    /// Returns this transform with `offset` as its translation.
+    pub fn with_translate(self, offset: Point<Pixels>) -> Self {
+        Self {
+            translate: offset,
+            ..self
+        }
+    }
+
+    /// Whether this transform leaves every point where it is.
+    pub fn is_identity(&self) -> bool {
+        self.scale == 1.0 && self.translate.x == Pixels(0.0) && self.translate.y == Pixels(0.0)
     }
 }

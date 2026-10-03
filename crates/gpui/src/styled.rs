@@ -1,9 +1,10 @@
 use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
-    DefiniteLength, Display, Fill, Filter, FlexDirection, FlexWrap, Font, FontFeatures, FontStyle,
-    FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize, JustifyContent, Length, Pixels,
-    SharedString, StrikethroughStyle, StyleRefinement, TextAlign, TextOverflow,
-    TextStyleRefinement, TextTransform, UnderlineStyle, WhiteSpace, px, relative, rems,
+    DefiniteLength, Display, ElementTransform, Fill, Filter, FlexDirection, FlexWrap, Font,
+    FontFeatures, FontStyle, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize,
+    JustifyContent, Length, Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
+    TextOverflow, TextStyleRefinement, TextTransform, UnderlineStyle, WhiteSpace, px, relative,
+    rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -815,6 +816,13 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Transforms how this element and its children paint and receive the
+    /// pointer, without changing layout. See [`ElementTransform`].
+    fn transform(mut self, transform: ElementTransform) -> Self {
+        self.style().transform = Some(transform);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
@@ -967,5 +975,35 @@ pub trait Styled: Sized {
     fn debug_below(mut self) -> Self {
         self.style().debug_below = Some(true);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Filter, div, px};
+
+    #[test]
+    fn backdrop_blur_appends_to_the_backdrop_filter_chain() {
+        let mut element = div().backdrop_blur(px(8.)).backdrop_blur(px(4.));
+        assert_eq!(
+            element.style().backdrop_filter,
+            Some(vec![Filter::Blur(px(8.)), Filter::Blur(px(4.))])
+        );
+        // The content-filter chain is untouched by backdrop setters.
+        assert_eq!(element.style().filter, None);
+    }
+
+    #[test]
+    fn backdrop_filter_replaces_the_chain_while_blur_targets_content() {
+        let mut element = div()
+            .backdrop_blur(px(8.))
+            .backdrop_filter(vec![Filter::Blur(px(2.))])
+            .blur(px(5.));
+        assert_eq!(
+            element.style().backdrop_filter,
+            Some(vec![Filter::Blur(px(2.))])
+        );
+        assert_eq!(element.style().filter, Some(vec![Filter::Blur(px(5.))]));
     }
 }

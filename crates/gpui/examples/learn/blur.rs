@@ -8,6 +8,9 @@
 //! 2. `blur` — content blur: blurs the element and its own children as a group.
 //!    Shown with text and again with a row of colored chips.
 //!
+//! A band of bright tiles animates behind the frosted panel (`live_ticker_band`), so the
+//! frost is visibly re-snapshotting live content every frame.
+//!
 //! It also stresses two content-blur edge cases:
 //!
 //! 3. Nested content blur — a `blur()` element inside another `blur()` element, so the inner
@@ -18,9 +21,11 @@
 //!    on each sibling) versus `blur` on the parent (one group covering all blocks, so the blur is
 //!    continuous and the seams are clean — the CSS "blur the wrapper" idiom).
 
+use std::time::Duration;
+
 use gpui::{
-    App, Bounds, Context, Render, Window, WindowBounds, WindowOptions, deferred, div, point,
-    prelude::*, px, rgb, rgba, size,
+    Animation, AnimationExt as _, App, Bounds, Context, Render, Window, WindowBounds,
+    WindowOptions, deferred, div, linear, point, prelude::*, px, rgb, rgba, size,
 };
 
 struct BlurExample;
@@ -56,6 +61,64 @@ fn busy_background() -> impl IntoElement {
                     .collect::<Vec<_>>(),
             )
         }))
+}
+
+/// A band of bright tiles sliding back and forth *behind* the frosted panel, clipped to
+/// a small region around it so the motion doesn't occlude the other demos. Because the
+/// tiles keep moving, the frosted panel is visibly re-snapshotting live content every
+/// frame — a stale one-shot backdrop copy would show frozen tiles behind the frost.
+fn live_ticker_band() -> impl IntoElement {
+    const TILE_W: f32 = 100.;
+    const TILE_COUNT: usize = 14;
+    /// How far the strip travels between its extremes, in logical pixels.
+    const TRAVEL: f32 = 340.;
+    /// Left edge of the strip at the start of the loop. The 1400px strip always covers
+    /// the 400px band for every position in `[LEFT_MIN, LEFT_MIN + TRAVEL]`.
+    const LEFT_MIN: f32 = -660.;
+    let palette = [
+        0xef4444, 0xf97316, 0xeab308, 0x22c55e, 0x06b6d4, 0x3b82f6, 0x8b5cf6,
+    ];
+    div()
+        .absolute()
+        .left(px(40.))
+        .top(px(100.))
+        .w(px(400.))
+        .h(px(240.))
+        .overflow_hidden()
+        .rounded_xl()
+        .child(
+            div()
+                .absolute()
+                .top(px(0.))
+                .h_full()
+                .w(px(TILE_W * TILE_COUNT as f32))
+                .flex()
+                .flex_row()
+                .children((0..TILE_COUNT).map(|i| {
+                    div()
+                        .w(px(TILE_W))
+                        .h_full()
+                        .flex_shrink_0()
+                        .bg(rgb(palette[i % palette.len()]))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_color(rgb(0x111111))
+                        .text_3xl()
+                        .child(format!("{}", i + 1))
+                }))
+                .with_animation(
+                    "backdrop_ticker",
+                    Animation::new(Duration::from_secs(6))
+                        .repeat()
+                        .with_easing(linear),
+                    |strip, delta: f32| {
+                        // Ping-pong 0 -> 1 -> 0 so the loop has no visible jump.
+                        let t = 1.0 - (delta * 2.0 - 1.0).abs();
+                        strip.left(px(LEFT_MIN + TRAVEL * t))
+                    },
+                ),
+        )
 }
 
 /// A translucent rounded panel that frosts the content behind it.
@@ -268,6 +331,7 @@ impl Render for BlurExample {
             .size_full()
             .bg(rgb(0x000000))
             .child(busy_background())
+            .child(live_ticker_band())
             .child(frosted_panel())
             .child(content_blurred())
             .child(content_blurred_rich())
@@ -275,6 +339,7 @@ impl Render for BlurExample {
             .child(adjacent_per_block_blur())
             .child(adjacent_group_blur())
             .child(caption("nested content blur", 740., 50.))
+            .child(caption("live: tiles slide behind the frost", 40., 72.))
             .child(caption(
                 "adjacent — blur each block (seams, = CSS)",
                 740.,
@@ -290,6 +355,10 @@ impl Render for BlurExample {
 }
 
 fn main() {
+    // Log adapter/backend selection (`RUST_LOG=gpui_wgpu=info`): the `wgpu` cargo
+    // feature selects the wgpu renderer at compile time, and the adapter log below
+    // is the runtime proof of which renderer path is actually drawing.
+    let _ = env_logger::try_init();
     gpui_platform::application().run(|cx: &mut App| {
         cx.activate(true);
         cx.on_window_closed(|cx, _| {

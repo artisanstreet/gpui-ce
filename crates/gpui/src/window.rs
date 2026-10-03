@@ -9,11 +9,11 @@ use crate::{
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
     BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode, CursorStyle, Decorations,
     DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
-    Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
-    GlobalElementId, GlyphId, GpuSpecs, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent,
-    KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, Modifiers,
-    ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent, MouseMoveEvent,
-    MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    ElementTransform, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary,
+    FontId, Global, GlobalElementId, GlyphId, GpuSpecs, InputHandler, IsZero, KeyBinding,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex,
+    Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
     PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
     Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
@@ -832,6 +832,10 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
+    /// Where the pointer hits: `bounds` under the element transform in
+    /// effect when inserted, clipped by the content mask. Equal to
+    /// `bounds ∩ content_mask` unless an [`ElementTransform`] applies.
+    pub(crate) hit_area: Bounds<Pixels>,
 }
 
 impl Hitbox {
@@ -1086,8 +1090,7 @@ impl Frame {
         let mut set_hover_hitbox_count = false;
         let mut hit_test = HitTest::default();
         for hitbox in self.hitboxes.iter().rev() {
-            let bounds = hitbox.bounds.intersect(&hitbox.content_mask.bounds);
-            if bounds.contains(&position) {
+            if hitbox.hit_area.contains(&position) {
                 hit_test.ids.push(hitbox.id);
                 if !set_hover_hitbox_count
                     && hitbox.behavior == HitboxBehavior::BlockMouseExceptScroll
@@ -1158,6 +1161,9 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    /// The composed paint transform of the element being drawn.
+    element_transform: ScreenTransform,
+    text_color_map: Option<TextColorMap>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1189,9 +1195,8 @@ pub struct Window {
     active: Rc<Cell<bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
-    /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
-    /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
-    pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
+    /// Keeps presentation responsive during a bounded period after visual input.
+    pub(crate) input_activity: Rc<RefCell<InputActivity>>,
     #[cfg(feature = "profiler")]
     window_profiler: profiler::WindowProfiler,
     last_input_modality: InputModality,
@@ -1214,6 +1219,8 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    frame_rate_limiter: Rc<RefCell<crate::frame_rate_limiter::FrameRateLimiter>>,
+    frame_retry: Option<Task<()>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -1227,48 +1234,25 @@ struct ModifierState {
     saw_other_input: bool,
 }
 
-/// Tracks input event timestamps to determine if input is arriving at a high rate.
-/// Used for selective VRR (Variable Refresh Rate) optimization.
-#[derive(Clone, Debug)]
-pub(crate) struct InputRateTracker {
-    timestamps: Vec<Instant>,
-    window: Duration,
-    inputs_per_second: u32,
-    sustain_until: Instant,
-    sustain_duration: Duration,
+/// Keeps interactive presentation responsive from the first visual input event.
+/// The bounded grace period expires without scheduling work of its own, so
+/// event-driven platforms can still park as soon as frame demand stops.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InputActivity {
+    last_input: Option<Instant>,
 }
 
-impl Default for InputRateTracker {
-    fn default() -> Self {
-        Self {
-            timestamps: Vec::new(),
-            window: Duration::from_millis(100),
-            inputs_per_second: 60,
-            sustain_until: Instant::now(),
-            sustain_duration: Duration::from_secs(1),
-        }
-    }
-}
+impl InputActivity {
+    const SUSTAIN_DURATION: Duration = Duration::from_secs(1);
 
-impl InputRateTracker {
-    pub fn record_input(&mut self) {
-        let now = Instant::now();
-        self.timestamps.push(now);
-        self.prune_old_timestamps(now);
-
-        let min_events = self.inputs_per_second as u128 * self.window.as_millis() / 1000;
-        if self.timestamps.len() as u128 >= min_events {
-            self.sustain_until = now + self.sustain_duration;
-        }
+    fn record_input(&mut self, now: Instant) {
+        self.last_input = Some(now);
     }
 
-    pub fn is_high_rate(&self) -> bool {
-        Instant::now() < self.sustain_until
-    }
-
-    fn prune_old_timestamps(&mut self, now: Instant) {
-        self.timestamps
-            .retain(|&t| now.duration_since(t) <= self.window);
+    fn is_recent(&self, now: Instant) -> bool {
+        self.last_input.is_some_and(|last_input| {
+            now.saturating_duration_since(last_input) < Self::SUSTAIN_DURATION
+        })
     }
 }
 
@@ -1436,7 +1420,7 @@ impl Window {
         let hovered = Rc::new(Cell::new(platform_window.is_hovered()));
         let needs_present = Rc::new(Cell::new(false));
         let next_frame_callbacks: Rc<RefCell<Vec<FrameCallback>>> = Default::default();
-        let input_rate_tracker = Rc::new(RefCell::new(InputRateTracker::default()));
+        let input_activity = Rc::new(RefCell::new(InputActivity::default()));
         let last_frame_time = Rc::new(Cell::new(None));
 
         platform_window
@@ -1543,13 +1527,17 @@ impl Window {
                 });
             }
         }));
+        let frame_rate_limiter = Rc::new(RefCell::new(
+            crate::frame_rate_limiter::FrameRateLimiter::default(),
+        ));
         platform_window.on_request_frame(Box::new({
+            let frame_rate_limiter = frame_rate_limiter.clone();
             let mut cx = cx.to_async();
             let invalidator = invalidator.clone();
             let active = active.clone();
             let needs_present = needs_present.clone();
             let next_frame_callbacks = next_frame_callbacks.clone();
-            let input_rate_tracker = input_rate_tracker.clone();
+            let input_activity = input_activity.clone();
             let mut deferred_force_render = false;
             move |request_frame_options| {
                 #[cfg(feature = "profiler")]
@@ -1592,7 +1580,7 @@ impl Window {
                         && next_frame_callbacks.borrow().is_empty())
                 {
                     None
-                } else if !active.get() && !input_rate_tracker.borrow_mut().is_high_rate() {
+                } else if !active.get() && !input_activity.borrow().is_recent(Instant::now()) {
                     inactive_frame_interval
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
@@ -1607,19 +1595,28 @@ impl Window {
                     {
                         // Don't lose a pending forced render to throttling.
                         deferred_force_render |= force_render;
-                        // Deferred by throttling: ask demand-driven platforms to retry.
                         handle
-                            .update(&mut cx, |_, window, _| {
-                                window.platform_window.schedule_frame();
+                            .update(&mut cx, |_, window, cx| {
+                                window.schedule_frame_after(
+                                    min_interval - now.duration_since(last_frame),
+                                    cx,
+                                );
                             })
                             .log_err();
-                        // The demand that entered this branch (a deferred forced
-                        // render or pending next-frame callbacks) is still
-                        // unserved; platforms that stop requesting frames for
-                        // idle windows need a wakeup to deliver the retry.
-                        invalidator.wake_platform();
                         return;
                     }
+                }
+                if !request_frame_options.require_presentation
+                    && !frame_rate_limiter.borrow_mut().admit(now)
+                {
+                    deferred_force_render |= force_render;
+                    let delay = frame_rate_limiter.borrow().delay(now);
+                    handle
+                        .update(&mut cx, |_, window, cx| {
+                            window.schedule_frame_after(delay, cx);
+                        })
+                        .log_err();
+                    return;
                 }
                 last_frame_time.set(Some(now));
 
@@ -1634,12 +1631,12 @@ impl Window {
                         .log_err();
                 }
 
-                // Keep presenting if input was recently arriving at a high rate (>= 60fps).
-                // Once high-rate input is detected, we sustain presentation for 1 second
-                // to prevent display underclocking during active input.
+                // Respond from the first redraw-causing input, including sparse
+                // clicks and wheel events. Waiting for a high-rate burst lets the
+                // display remain underclocked at the start of interaction.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
-                    || input_rate_tracker.borrow_mut().is_high_rate();
+                    || input_activity.borrow().is_recent(Instant::now());
 
                 if invalidator.is_dirty() || force_render {
                     measure("frame duration", || {
@@ -1664,6 +1661,13 @@ impl Window {
 
                 handle
                     .update(&mut cx, |_, window, _| {
+                        // A final animation callback can finish without drawing.
+                        // End its cadence sample here too, or the next animation
+                        // includes the intervening idle gap in its FPS readout.
+                        #[cfg(feature = "profiler")]
+                        window
+                            .debug_frame_overlay
+                            .set_frame_demand(!window.next_frame_callbacks.borrow().is_empty());
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                         {
@@ -1860,6 +1864,8 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_transform: ScreenTransform::IDENTITY,
+            text_color_map: None,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -1886,7 +1892,7 @@ impl Window {
             active,
             hovered,
             needs_present,
-            input_rate_tracker,
+            input_activity,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
             last_input_modality: InputModality::Mouse,
@@ -1910,6 +1916,8 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            frame_rate_limiter,
+            frame_retry: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -1936,6 +1944,11 @@ pub struct DispatchEventResult {
     pub propagate: bool,
     pub default_prevented: bool,
 }
+
+/// A horizontal text fill sampled at device-pixel centers during glyph painting.
+/// The callback receives the window-space x coordinate and the run's original color.
+/// Shaping, glyph rasterization, emoji, and text backgrounds are unaffected.
+pub type TextColorMap = Rc<dyn Fn(Pixels, Hsla) -> Hsla>;
 
 /// Indicates which region of the window is visible. Content falling outside of this mask will not be
 /// rendered. Currently, only rectangular content masks are supported, but we give the mask its own type
@@ -2037,6 +2050,25 @@ impl Window {
     /// Obtain a handle to the window that belongs to this context.
     pub fn window_handle(&self) -> AnyWindowHandle {
         self.handle
+    }
+
+    /// Sets an optional redraw-rate limit over the platform's display clock.
+    /// `None` removes this limit; it does not disable display synchronization.
+    /// Mandatory platform presentations bypass the limit.
+    pub fn set_max_frame_rate(&mut self, rate: Option<std::num::NonZeroU32>) {
+        self.frame_rate_limiter.borrow_mut().set(rate);
+        self.refresh();
+    }
+
+    /// Changes presentation synchronization on platforms supporting runtime control.
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.platform_window.set_vsync(enabled);
+        self.refresh();
+    }
+
+    /// Returns the requested redraw-rate limit, independent of the monitor.
+    pub fn max_frame_rate(&self) -> Option<std::num::NonZeroU32> {
+        self.frame_rate_limiter.borrow().rate()
     }
 
     /// Mark the window as dirty, scheduling it to be redrawn on the next frame.
@@ -2357,6 +2389,23 @@ impl Window {
         );
         activate();
         subscription
+    }
+
+    /// A deferred frame must sleep until its deadline rather than repeatedly
+    /// waking an uncapped platform while an inactive-window limit rejects it.
+    fn schedule_frame_after(&mut self, delay: Duration, cx: &App) {
+        if self.frame_retry.is_some() {
+            return;
+        }
+        self.frame_retry = Some(self.spawn(cx, async move |cx| {
+            cx.background_executor.timer(delay).await;
+            cx.update(|window, _| {
+                window.frame_retry.take();
+                window.platform_window.schedule_frame();
+                window.invalidator.wake_platform();
+            })
+            .log_err();
+        }));
     }
 
     /// Creates an [`AsyncWindowContext`], which has a static lifetime and can be held across
@@ -2748,8 +2797,22 @@ impl Window {
         position.map(|c| self.pixel_snap(c))
     }
 
+    /// Maps layout-space bounds through the current element transform.
+    #[inline]
+    fn to_screen_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        self.element_transform.apply_bounds(bounds)
+    }
+
+    /// The device scale of a layout-space length: the display scale times
+    /// the current element transform's scale.
+    #[inline]
+    fn length_scale(&self) -> f32 {
+        self.scale_factor() * self.element_transform.scale
+    }
+
     #[inline]
     fn snap_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+        let bounds = self.to_screen_bounds(bounds);
         let scale_factor = self.scale_factor();
         let left = round_to_device_pixel(bounds.left().0, scale_factor);
         let top = round_to_device_pixel(bounds.top().0, scale_factor);
@@ -2764,7 +2827,7 @@ impl Window {
     /// Rounds half-to-zero but clamps any non-zero input up to 1 dp so thin strokes do not disappear.
     #[inline]
     fn snap_stroke(&self, value: Pixels) -> ScaledPixels {
-        ScaledPixels(round_stroke_to_device_pixel(value.0, self.scale_factor()))
+        ScaledPixels(round_stroke_to_device_pixel(value.0, self.length_scale()))
     }
 
     #[inline]
@@ -2775,6 +2838,12 @@ impl Window {
     /// Floors the near edge and ceils the far edge, producing a strict superset of the raw region.
     #[inline]
     fn cover_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
+        self.cover_screen_bounds(self.to_screen_bounds(bounds))
+    }
+
+    /// [`Self::cover_bounds`] for bounds already in screen space.
+    #[inline]
+    fn cover_screen_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
         let left = floor_to_device_pixel(bounds.left().0, scale_factor);
         let top = floor_to_device_pixel(bounds.top().0, scale_factor);
@@ -2789,7 +2858,7 @@ impl Window {
     #[inline]
     fn snapped_content_mask(&self) -> ContentMask<ScaledPixels> {
         ContentMask {
-            bounds: self.cover_bounds(self.content_mask().bounds),
+            bounds: self.cover_screen_bounds(self.content_mask().bounds),
         }
     }
 
@@ -2924,6 +2993,8 @@ impl Window {
             {
                 let viewport_size = self.viewport_size;
                 let scale_factor = self.scale_factor();
+                self.debug_frame_overlay
+                    .set_frame_demand(!self.next_frame_callbacks.borrow().is_empty());
                 self.debug_frame_overlay.paint(
                     &mut self.next_frame.scene,
                     viewport_size,
@@ -3028,7 +3099,7 @@ impl Window {
             let draw_duration = self
                 .window_profiler
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
-            self.debug_frame_overlay.record_frame(draw_duration);
+            self.debug_frame_overlay.record_draw(draw_duration);
         }
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
@@ -3065,6 +3136,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
+        #[cfg(feature = "profiler")]
+        self.debug_frame_overlay.record_present();
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
             present_start,
@@ -3610,7 +3683,12 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint_or_prepaint();
         if let Some(mask) = mask {
-            let mask = mask.intersect(&self.content_mask());
+            // The stack holds screen-space masks, so a clip pushed inside a
+            // transform moves and scales with what it clips.
+            let mask = ContentMask {
+                bounds: self.to_screen_bounds(mask.bounds),
+            }
+            .intersect(&self.content_mask());
             self.content_mask_stack.push(mask);
             let result = f(self);
             self.content_mask_stack.pop();
@@ -3649,6 +3727,29 @@ impl Window {
         self.element_offset_stack.push(offset);
         let result = f(self);
         self.element_offset_stack.pop();
+        result
+    }
+
+    /// Paints (and hit-tests) everything `f` draws through `transform`,
+    /// resolved against `bounds` and composed with any enclosing transform.
+    /// Layout is unaffected. Call it around both prepaint, where hitboxes
+    /// are inserted, and paint.
+    pub fn with_element_transform<R>(
+        &mut self,
+        transform: Option<ElementTransform>,
+        bounds: Bounds<Pixels>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+
+        let Some(transform) = transform.filter(|transform| !transform.is_identity()) else {
+            return f(self);
+        };
+
+        let previous = self.element_transform;
+        self.element_transform = previous.then(ScreenTransform::resolve(&transform, bounds));
+        let result = f(self);
+        self.element_transform = previous;
         result
     }
 
@@ -3767,6 +3868,22 @@ impl Window {
     pub(crate) fn element_opacity(&self) -> f32 {
         self.invalidator.debug_assert_paint_or_prepaint();
         self.element_opacity
+    }
+
+    /// Paint text through a horizontal color map, restoring the enclosing map afterward.
+    /// Passing `None` suspends a map, for example while painting selected text.
+    /// Sampling uses disjoint device-pixel columns and coalesces equal neighboring colors.
+    /// This does not reshape text or allocate a separate glyph atlas for the gradient.
+    pub fn with_text_color_map<R>(
+        &mut self,
+        map: Option<TextColorMap>,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+        let previous = std::mem::replace(&mut self.text_color_map, map);
+        let result = paint(self);
+        self.text_color_map = previous;
+        result
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -4049,11 +4166,13 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let content_mask = self.content_mask();
-        let clipped_bounds = bounds.intersect(&content_mask.bounds);
+        let clipped_bounds = self
+            .to_screen_bounds(bounds)
+            .intersect(&content_mask.bounds);
         if !clipped_bounds.is_empty() {
             self.next_frame
                 .scene
-                .push_layer(self.cover_bounds(clipped_bounds));
+                .push_layer(self.cover_screen_bounds(clipped_bounds));
         }
 
         let result = f(self);
@@ -4078,7 +4197,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.length_scale();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
@@ -4114,7 +4233,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.length_scale();
         let content_mask = self.snapped_content_mask();
         let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
@@ -4165,7 +4284,7 @@ impl Window {
     ) {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.length_scale();
         let filters: SmallVec<[ScaledFilter; 4]> = filters
             .iter()
             .filter(|filter| !filter.is_identity())
@@ -4203,7 +4322,7 @@ impl Window {
     ) -> R {
         self.invalidator.debug_assert_paint();
 
-        let scale_factor = self.scale_factor();
+        let scale_factor = self.length_scale();
         let filters: SmallVec<[ScaledFilter; 4]> = filters
             .iter()
             .filter(|filter| !filter.is_identity())
@@ -4300,7 +4419,7 @@ impl Window {
             content_mask: self.snapped_content_mask(),
             background: quad.background.opacity(opacity),
             border_color: quad.border_color.opacity(opacity).into(),
-            corner_radii: quad.corner_radii.scale(self.scale_factor()),
+            corner_radii: quad.corner_radii.scale(self.length_scale()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
         };
@@ -4365,6 +4484,7 @@ impl Window {
         let scale_factor = self.scale_factor();
         let content_mask = self.content_mask();
         let opacity = self.element_opacity();
+        self.element_transform.apply_path(&mut path);
         path.content_mask = content_mask;
         let color: Background = color.into();
         path.color = color.opacity(opacity);
@@ -4391,6 +4511,7 @@ impl Window {
         } else {
             thickness
         };
+        let origin = self.element_transform.apply_point(origin);
         let bounds = Bounds {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), height),
@@ -4425,6 +4546,7 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let height = style.thickness;
+        let origin = self.element_transform.apply_point(origin);
         let bounds = Bounds {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), self.snap_stroke(height)),
@@ -4462,7 +4584,11 @@ impl Window {
 
         let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let glyph_scale = self.element_transform.scale;
+        let glyph_origin = self
+            .element_transform
+            .apply_point(origin)
+            .scale(scale_factor);
 
         let quantized_origin = Point::new(
             round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
@@ -4497,32 +4623,46 @@ impl Window {
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
                 .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
+            // A transformed glyph keeps its untransformed raster and is
+            // stretched to the scaled box, so animating a scale never
+            // rasterizes a new size per frame.
+            let bounds = scaled_sprite_bounds(
+                integer_origin,
+                raster_bounds.origin.map(Into::into),
+                tile.bounds.size.map(Into::into),
+                glyph_scale,
+            );
             let content_mask = self.snapped_content_mask();
 
-            if subpixel_rendering {
-                self.next_frame.scene.insert_primitive(SubpixelSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity).into(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
-            } else {
-                self.next_frame.scene.insert_primitive(MonochromeSprite {
-                    order: 0,
-                    pad: 0,
-                    bounds,
-                    content_mask,
-                    color: color.opacity(element_opacity).into(),
-                    tile,
-                    transformation: TransformationMatrix::unit(),
-                });
+            let spans = glyph_color_spans(
+                bounds,
+                content_mask,
+                scale_factor,
+                color,
+                self.text_color_map.as_ref(),
+            );
+            for (content_mask, color) in spans {
+                if subpixel_rendering {
+                    self.next_frame.scene.insert_primitive(SubpixelSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds,
+                        content_mask,
+                        color: color.opacity(element_opacity).into(),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    });
+                } else {
+                    self.next_frame.scene.insert_primitive(MonochromeSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds,
+                        content_mask,
+                        color: color.opacity(element_opacity).into(),
+                        tile,
+                        transformation: TransformationMatrix::unit(),
+                    });
+                }
             }
         }
         Ok(())
@@ -4565,7 +4705,11 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
+        let glyph_scale = self.element_transform.scale;
+        let glyph_origin = self
+            .element_transform
+            .apply_point(origin)
+            .scale(scale_factor);
         let integer_origin = glyph_origin.map(|c| ScaledPixels(round_half_toward_zero(c.0)));
         let params = RenderGlyphParams {
             font_id,
@@ -4588,10 +4732,12 @@ impl Window {
                 })?
                 .expect("Callback above only errors or returns Some");
 
-            let bounds = Bounds {
-                origin: integer_origin + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
+            let bounds = scaled_sprite_bounds(
+                integer_origin,
+                raster_bounds.origin.map(Into::into),
+                tile.bounds.size.map(Into::into),
+                glyph_scale,
+            );
             let content_mask = self.snapped_content_mask();
             let opacity = self.element_opacity();
 
@@ -4624,7 +4770,17 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let element_opacity = self.element_opacity();
-        let bounds = self.snap_bounds(bounds);
+        // The raster keeps the untransformed size (one atlas entry however
+        // the element is scaled); the sprite is placed and sized on screen.
+        let svg_scale = self.element_transform.scale;
+        let screen_center = self.snap_bounds(bounds).center();
+        let bounds = {
+            let transform = self.element_transform;
+            self.element_transform = ScreenTransform::IDENTITY;
+            let untransformed = self.snap_bounds(bounds);
+            self.element_transform = transform;
+            untransformed
+        };
 
         let params = RenderSvgParams {
             path,
@@ -4646,16 +4802,13 @@ impl Window {
             return Ok(());
         };
         let content_mask = self.snapped_content_mask();
+        let svg_size = tile
+            .bounds
+            .size
+            .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR * svg_scale));
         let svg_bounds = Bounds {
-            origin: bounds.center()
-                - Point::new(
-                    ScaledPixels(tile.bounds.size.width.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
-                    ScaledPixels(tile.bounds.size.height.0 as f32 / SMOOTH_SVG_SCALE_FACTOR / 2.),
-                ),
-            size: tile
-                .bounds
-                .size
-                .map(|value| ScaledPixels(value.0 as f32 / SMOOTH_SVG_SCALE_FACTOR)),
+            origin: screen_center - Point::new(svg_size.width / 2., svg_size.height / 2.),
+            size: svg_size,
         };
         let final_bounds = svg_bounds
             .map_origin(|value| ScaledPixels(round_half_toward_zero(value.0)))
@@ -4764,7 +4917,7 @@ impl Window {
         let content_mask = self.snapped_content_mask();
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
-            .scale(self.scale_factor());
+            .scale(self.length_scale());
         let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
@@ -4818,7 +4971,7 @@ impl Window {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
-        let bounds = bounds.scale(scale_factor);
+        let bounds = self.to_screen_bounds(bounds).scale(scale_factor);
         let content_mask = self.content_mask().scale(scale_factor);
         self.next_frame.scene.insert_primitive(PaintSurface {
             order: 0,
@@ -4956,11 +5109,15 @@ impl Window {
         let content_mask = self.content_mask();
         let mut id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
+        let hit_area = self
+            .to_screen_bounds(bounds)
+            .intersect(&content_mask.bounds);
         let hitbox = Hitbox {
             id,
             bounds,
             content_mask,
             behavior,
+            hit_area,
         };
         self.next_frame.hitboxes.push(hitbox.clone());
         hitbox
@@ -5407,7 +5564,9 @@ impl Window {
 
         let caused_invalidation = self.invalidator.update_count() > update_count_before;
         if caused_invalidation {
-            self.input_rate_tracker.borrow_mut().record_input();
+            self.input_activity
+                .borrow_mut()
+                .record_input(Instant::now());
         }
         #[cfg(feature = "profiler")]
         self.window_profiler.end_input(caused_invalidation);
@@ -7335,6 +7494,46 @@ pub fn outline(
     }
 }
 
+/** Split only the visible raster, keeping the original atlas bounds/UVs. */
+fn glyph_color_spans(
+    bounds: Bounds<ScaledPixels>,
+    mask: ContentMask<ScaledPixels>,
+    scale: f32,
+    base: Hsla,
+    map: Option<&TextColorMap>,
+) -> SmallVec<[(ContentMask<ScaledPixels>, Hsla); 16]> {
+    let Some(map) = map else {
+        return smallvec::smallvec![(mask, base)];
+    };
+    let visible = bounds.intersect(&mask.bounds);
+    if visible.is_empty() {
+        return SmallVec::new();
+    }
+    let mut spans: SmallVec<[(ContentMask<ScaledPixels>, Hsla); 16]> = SmallVec::new();
+    let mut x = visible.left().0;
+    while x < visible.right().0 {
+        let end = (x + 1.0).min(visible.right().0);
+        let color = map(px((x + end) * 0.5 / scale), base);
+        if let Some((previous, previous_color)) = spans.last_mut()
+            && *previous_color == color
+        {
+            previous.bounds.size.width += ScaledPixels(end - x);
+        } else {
+            spans.push((
+                ContentMask {
+                    bounds: Bounds::new(
+                        point(ScaledPixels(x), visible.top()),
+                        size(ScaledPixels(end - x), visible.size.height),
+                    ),
+                },
+                color,
+            ));
+        }
+        x = end;
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7352,6 +7551,293 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+
+    #[gpui::test]
+    #[cfg(feature = "profiler")]
+    fn callback_finishing_without_a_draw_ends_the_fps_sample(cx: &mut TestAppContext) {
+        struct Animation;
+        impl Render for Animation {
+            fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                window.on_next_frame(|_, _| {});
+                div()
+            }
+        }
+        let window = cx.add_window(|_, _| Animation);
+        let platform = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, _| {
+                window.active.set(true);
+                let overlay = &mut window.debug_frame_overlay;
+                overlay.record_present();
+                overlay.record_present();
+                assert_eq!(overlay.frame_sample_count(), 2);
+            })
+            .unwrap();
+        // Drain the last animation callback without invalidating the view.
+        // Previously, only draw() ended the sample, leaving the idle gap in it.
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        cx.update_window(window.into(), |_, window, cx| {
+            assert_eq!(window.debug_frame_overlay.frame_sample_count(), 0);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let overlay = &mut window.debug_frame_overlay;
+            overlay.record_present();
+            assert_eq!(
+                overlay.frame_sample_count(),
+                1,
+                "resume starts a fresh sample"
+            );
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn input_activity_starts_immediately_expires_and_restarts_after_idle() {
+        let mut activity = super::InputActivity::default();
+        let start = scheduler::Instant::now();
+        assert!(!activity.is_recent(start));
+        activity.record_input(start);
+        assert!(activity.is_recent(start));
+        assert!(activity.is_recent(start + Duration::from_millis(999)));
+        assert!(!activity.is_recent(start + Duration::from_secs(1)));
+        let resumed = start + Duration::from_secs(10);
+        activity.record_input(resumed);
+        assert!(activity.is_recent(resumed));
+        // Sparse interaction renews the bounded grace period without a burst.
+        activity.record_input(resumed + Duration::from_millis(500));
+        assert!(activity.is_recent(resumed + Duration::from_millis(1499)));
+        assert!(!activity.is_recent(resumed + Duration::from_millis(1500)));
+    }
+
+    struct InputResumeView;
+
+    impl Render for InputResumeView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                    window.refresh();
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn first_input_resumes_unfocused_animation_without_waiting_for_a_burst(
+        cx: &mut TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| InputResumeView);
+        let mut platform = cx.test_window(window.into());
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        window
+            .update(cx, |_, window, _| {
+                assert!(!window.is_window_active());
+                assert!(
+                    !window
+                        .input_activity
+                        .borrow()
+                        .is_recent(scheduler::Instant::now())
+                );
+            })
+            .unwrap();
+
+        platform.simulate_input(
+            MouseDownEvent {
+                position: point(px(10.), px(10.)),
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+        );
+        let callback_ran = Rc::new(Cell::new(false));
+        window
+            .update(cx, |_, window, _| {
+                assert!(
+                    window
+                        .input_activity
+                        .borrow()
+                        .is_recent(scheduler::Instant::now())
+                );
+                let callback_ran = callback_ran.clone();
+                window.on_next_frame(move |_, _| callback_ran.set(true));
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            callback_ran.get(),
+            "the very first input must bypass background pacing"
+        );
+        window
+            .update(cx, |_, window, _| {
+                assert!(window.frame_retry.is_none());
+                // Expire the input grace period deterministically, then drain the
+                // outstanding platform callback. No input-only loop should remain.
+                window.input_activity.borrow_mut().last_input =
+                    Some(scheduler::Instant::now() - Duration::from_secs(2));
+            })
+            .unwrap();
+        platform.simulate_scheduled_frame();
+        assert!(!platform.frame_scheduled());
+    }
+
+    #[gpui::test]
+    fn recent_input_preserves_the_explicit_frame_rate_limit(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let platform = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, _| {
+                window.set_max_frame_rate(std::num::NonZeroU32::new(1));
+                window
+                    .input_activity
+                    .borrow_mut()
+                    .record_input(scheduler::Instant::now());
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        let callback_ran = Rc::new(Cell::new(false));
+        window
+            .update(cx, |_, window, _| {
+                let callback_ran = callback_ran.clone();
+                window.on_next_frame(move |_, _| callback_ran.set(true));
+            })
+            .unwrap();
+        platform.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            !callback_ran.get(),
+            "recent input must not bypass the user's FPS limit"
+        );
+        window
+            .update(cx, |_, window, _| assert!(window.frame_retry.is_some()))
+            .unwrap();
+    }
+
+    #[test]
+    fn text_color_map_samples_device_pixels_and_coalesces_constant_fills() {
+        use super::{ContentMask, TextColorMap, glyph_color_spans};
+        use crate::{ScaledPixels, hsla, white};
+        let bounds = Bounds::new(
+            point(ScaledPixels(4.0), ScaledPixels(2.0)),
+            size(ScaledPixels(6.0), ScaledPixels(8.0)),
+        );
+        let mask = ContentMask { bounds };
+        let ramp: TextColorMap = Rc::new(|x, base| hsla(0.0, 0.0, f32::from(x) / 10.0, base.alpha));
+        let spans = glyph_color_spans(bounds, mask, 2.0, white(), Some(&ramp));
+        assert_eq!(spans.len(), 6);
+        for (index, (mask, color)) in spans.iter().enumerate() {
+            assert_eq!(mask.bounds.size.width, ScaledPixels(1.0));
+            assert_eq!(mask.bounds.left(), ScaledPixels(4.0 + index as f32));
+            assert_eq!(color.lightness, (4.5 + index as f32) / 20.0);
+        }
+        let constant: TextColorMap = Rc::new(|_, color| color);
+        assert_eq!(
+            glyph_color_spans(bounds, mask, 2.0, white(), Some(&constant)).len(),
+            1
+        );
+        assert_eq!(glyph_color_spans(bounds, mask, 2.0, white(), None).len(), 1);
+    }
+
+    #[test]
+    fn text_color_map_respects_existing_content_clip() {
+        use super::{ContentMask, TextColorMap, glyph_color_spans};
+        use crate::{ScaledPixels, white};
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(10.0), ScaledPixels(10.0)),
+        );
+        let mask = ContentMask {
+            bounds: Bounds::new(
+                point(ScaledPixels(3.0), ScaledPixels(2.0)),
+                size(ScaledPixels(4.0), ScaledPixels(5.0)),
+            ),
+        };
+        let map: TextColorMap = Rc::new(|_, color| color);
+        let spans = glyph_color_spans(bounds, mask, 1.0, white(), Some(&map));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].0, mask);
+    }
+
+    #[test]
+    fn element_transform_composes_like_nested_css_transforms() {
+        use super::ScreenTransform;
+        use crate::ElementTransform;
+        let bounds = Bounds::new(point(px(10.0), px(10.0)), size(px(100.0), px(100.0)));
+        // Half scale about the top-left corner: the far corner moves halfway in.
+        let half = ScreenTransform::resolve(
+            &ElementTransform::scale(0.5).with_origin(point(0.0, 0.0)),
+            bounds,
+        );
+        assert_eq!(
+            half.apply_point(point(px(110.0), px(110.0))),
+            point(px(60.0), px(60.0))
+        );
+        assert_eq!(half.apply_point(bounds.origin), bounds.origin);
+        // A child translated by 20 px inside it moves 10 px on screen.
+        let shift = ScreenTransform::resolve(
+            &ElementTransform::translate(point(px(20.0), px(0.0))),
+            bounds,
+        );
+        let nested = half.then(shift);
+        assert_eq!(
+            nested.apply_point(point(px(10.0), px(10.0))),
+            point(px(20.0), px(10.0))
+        );
+        assert_eq!(
+            nested.apply_bounds(bounds).size,
+            size(px(50.0), px(50.0)),
+            "nested scales multiply"
+        );
+        assert!(
+            ScreenTransform::IDENTITY
+                .then(ScreenTransform::IDENTITY)
+                .is_identity()
+        );
+    }
+
+    struct ScaledTarget {
+        hovered: Rc<Cell<bool>>,
+    }
+
+    impl Render for ScaledTarget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let hovered = self.hovered.clone();
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size(px(200.0))
+                    .transform(crate::ElementTransform::scale(0.5).with_origin(point(0.0, 0.0)))
+                    .child(
+                        div()
+                            .id("scaled-target")
+                            .size_full()
+                            .on_hover(move |is_hovered, _, _| hovered.set(*is_hovered)),
+                    ),
+            )
+        }
+    }
+
+    /// The pointer hits a transformed element where it paints, not where it
+    /// is laid out: a 200 px box scaled to half about its top-left corner
+    /// covers only the first 100 px.
+    #[gpui::test]
+    fn transformed_elements_hit_test_where_they_paint(cx: &mut TestAppContext) {
+        let hovered = Rc::new(Cell::new(false));
+        let target_hovered = hovered.clone();
+        let (_, cx) = cx.add_window_view(|_, _| ScaledTarget {
+            hovered: target_hovered,
+        });
+        cx.simulate_mouse_move(point(px(150.0), px(150.0)), None, Default::default());
+        cx.run_until_parked();
+        assert!(
+            !hovered.get(),
+            "outside the painted half, inside the layout box"
+        );
+        cx.simulate_mouse_move(point(px(50.0), px(50.0)), None, Default::default());
+        cx.run_until_parked();
+        assert!(hovered.get(), "inside the painted half");
+    }
 
     struct EmptyView;
 
@@ -7493,16 +7979,38 @@ mod tests {
 
         let baseline = test_window.frame_wake_count();
         test_window.simulate_frame_request(RequestFrameOptions::default());
-        // The test window is inactive, so this request throttles to ~30fps
-        // when it lands within the throttle interval of the previous frame
-        // (the common case here, but timing-dependent): the callback is
-        // deferred and the waker must re-arm the frame source. On a slow run
-        // the request instead lands outside the interval and runs the
-        // callback directly.
+        // Throttled callbacks get one timed wake instead of polling an uncapped
+        // platform. A slow run may already have admitted the frame directly.
+        cx.executor().run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(40));
+        cx.executor().run_until_parked();
         assert!(
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
         );
+    }
+
+    #[gpui::test]
+    fn delayed_frame_requests_sleep_and_coalesce(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        window
+            .update(cx, |_, window, cx| {
+                window.schedule_frame_after(Duration::from_millis(10), cx);
+                window.schedule_frame_after(Duration::from_millis(20), cx);
+            })
+            .unwrap();
+        cx.executor().run_until_parked();
+        let before = test_window.frame_wake_count();
+        cx.executor().advance_clock(Duration::from_millis(9));
+        cx.executor().run_until_parked();
+        assert_eq!(test_window.frame_wake_count(), before);
+        cx.executor().advance_clock(Duration::from_millis(1));
+        cx.executor().run_until_parked();
+        assert!(test_window.frame_wake_count() > before);
+        window
+            .update(cx, |_, window, _| assert!(window.frame_retry.is_none()))
+            .unwrap();
     }
 
     #[gpui::test]
@@ -8277,5 +8785,109 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+}
+
+/// The composed element transform in effect while drawing: a layout-space
+/// point `p` paints at `p * scale + offset`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenTransform {
+    scale: f32,
+    offset: Point<Pixels>,
+}
+
+impl ScreenTransform {
+    const IDENTITY: Self = Self {
+        scale: 1.0,
+        offset: Point {
+            x: Pixels(0.0),
+            y: Pixels(0.0),
+        },
+    };
+
+    /// The transform of `transform` with its origin resolved against
+    /// `bounds`: `origin + translate + (p - origin) * scale`.
+    fn resolve(transform: &ElementTransform, bounds: Bounds<Pixels>) -> Self {
+        let origin = point(
+            bounds.origin.x + bounds.size.width * transform.origin.x,
+            bounds.origin.y + bounds.size.height * transform.origin.y,
+        );
+        Self {
+            scale: transform.scale,
+            offset: point(
+                origin.x * (1.0 - transform.scale) + transform.translate.x,
+                origin.y * (1.0 - transform.scale) + transform.translate.y,
+            ),
+        }
+    }
+
+    /// `self` applied after `inner`: the transform of a child element
+    /// drawn inside this one.
+    fn then(self, inner: Self) -> Self {
+        Self {
+            scale: self.scale * inner.scale,
+            offset: point(
+                inner.offset.x * self.scale + self.offset.x,
+                inner.offset.y * self.scale + self.offset.y,
+            ),
+        }
+    }
+
+    fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    #[inline]
+    fn apply_point(&self, p: Point<Pixels>) -> Point<Pixels> {
+        if self.is_identity() {
+            return p;
+        }
+        point(
+            p.x * self.scale + self.offset.x,
+            p.y * self.scale + self.offset.y,
+        )
+    }
+
+    #[inline]
+    fn apply_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+        if self.is_identity() {
+            return bounds;
+        }
+        Bounds {
+            origin: self.apply_point(bounds.origin),
+            size: bounds.size.map(|length| length * self.scale),
+        }
+    }
+
+    fn apply_path(&self, path: &mut Path<Pixels>) {
+        if self.is_identity() {
+            return;
+        }
+        for vertex in &mut path.vertices {
+            vertex.xy_position = self.apply_point(vertex.xy_position);
+        }
+        path.bounds = self.apply_bounds(path.bounds);
+    }
+}
+
+/// A sprite's device bounds: its raster tile placed at `origin` plus the
+/// raster offset, both stretched by `scale` when an element transform
+/// scales it. Unscaled sprites keep the exact tile geometry.
+#[inline]
+fn scaled_sprite_bounds(
+    origin: Point<ScaledPixels>,
+    raster_offset: Point<ScaledPixels>,
+    tile_size: Size<ScaledPixels>,
+    scale: f32,
+) -> Bounds<ScaledPixels> {
+    if scale == 1.0 {
+        return Bounds {
+            origin: origin + raster_offset,
+            size: tile_size,
+        };
+    }
+    Bounds {
+        origin: origin + raster_offset.map(|value| value * scale),
+        size: tile_size.map(|value| value * scale),
     }
 }

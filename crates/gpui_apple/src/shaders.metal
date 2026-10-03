@@ -549,6 +549,13 @@ fragment float4 shadow_fragment(ShadowFragmentInput input [[stage_in]],
     float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
                                       shadow.element_corner_radii);
     alpha *= saturate(0.5 - element_distance);
+  } else {
+    // A drop shadow is only outside the element's original rounded border-box. The shadow
+    // bounds may be offset or spread, so use the original element SDF for this clip.
+    // `saturate(0.5 + d)` preserves a 1-pixel antialiased edge around the element.
+    float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                      shadow.element_corner_radii);
+    alpha *= saturate(0.5 + element_distance);
   }
 
   return input.color * float4(1., 1., 1., alpha);

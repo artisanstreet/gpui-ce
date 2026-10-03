@@ -15,10 +15,13 @@ mod dispatcher;
 mod display;
 mod events;
 mod keyboard;
+#[cfg(feature = "wgpu")]
+mod monitor_vsync;
 mod platform;
 mod system_notifications;
 mod system_settings;
 mod util;
+#[cfg(not(feature = "wgpu"))]
 mod vsync;
 mod window;
 mod wrapper;
@@ -41,6 +44,7 @@ pub(crate) use platform::*;
 pub(crate) use system_notifications::*;
 pub(crate) use system_settings::*;
 pub(crate) use util::*;
+#[cfg(not(feature = "wgpu"))]
 pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
