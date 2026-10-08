@@ -534,6 +534,9 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                // Meshes are drawn by the wgpu renderer only; `Window::supports_meshes`
+                // is false here, so callers paint a fallback instead.
+                PrimitiveBatch::Meshes(_) => Ok(()),
                 PrimitiveBatch::BackdropFilters(range) => {
                     let result = (|| {
                         for filter in &scene.backdrop_filters[range] {

@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Pixels, Point,
-    Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Mesh, MeshStyle,
+    Pixels, Point, Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
@@ -14,6 +14,7 @@ use std::{
     iter::Peekable,
     ops::{Add, Range, Sub},
     slice,
+    sync::Arc,
 };
 
 #[allow(non_camel_case_types, unused)]
@@ -51,6 +52,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub meshes: Vec<PaintMesh>,
     pub backdrop_filters: Vec<BackdropFilter>,
     pub filter_boundaries: Vec<FilterBoundary>,
 }
@@ -69,6 +71,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.meshes.clear();
         self.backdrop_filters.clear();
         self.filter_boundaries.clear();
     }
@@ -167,6 +170,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::Mesh(mesh) => {
+                mesh.order = order;
+                self.meshes.push(mesh.clone());
+            }
             Primitive::BackdropFilter(filter) => {
                 filter.order = order;
                 self.backdrop_filters.push(filter.clone());
@@ -210,6 +217,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.meshes.sort_by_key(|mesh| mesh.order);
         self.backdrop_filters.sort_by_key(|filter| filter.order);
         // Markers normally get distinct, monotonically-increasing orders (children overlap
         // their group bounds and so sort strictly between the start and end). The `!is_start`
@@ -244,6 +252,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            meshes_start: 0,
+            meshes_iter: self.meshes.iter().peekable(),
             backdrop_filters_start: 0,
             backdrop_filters_iter: self.backdrop_filters.iter().peekable(),
             filter_boundaries_start: 0,
@@ -302,6 +312,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    Mesh,
     BackdropFilter,
     // Highest discriminant: at an equal order, a group-end is emitted after the group's content
     // so the renderer composites the filtered group only once every child has been drawn.
@@ -325,6 +336,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    Mesh(PaintMesh),
     BackdropFilter(BackdropFilter),
     FilterBoundary(FilterBoundary),
 }
@@ -341,6 +353,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::Mesh(mesh) => &mesh.bounds,
             Primitive::BackdropFilter(filter) => &filter.bounds,
             Primitive::FilterBoundary(boundary) => &boundary.bounds,
         }
@@ -356,6 +369,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::Mesh(mesh) => &mesh.content_mask,
             Primitive::BackdropFilter(filter) => &filter.content_mask,
             Primitive::FilterBoundary(boundary) => &boundary.content_mask,
         }
@@ -386,6 +400,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    meshes_start: usize,
+    meshes_iter: Peekable<slice::Iter<'a, PaintMesh>>,
     backdrop_filters_start: usize,
     backdrop_filters_iter: Peekable<slice::Iter<'a, BackdropFilter>>,
     filter_boundaries_start: usize,
@@ -422,6 +438,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.meshes_iter.peek().map(|m| m.order),
+                PrimitiveKind::Mesh,
             ),
             (
                 self.backdrop_filters_iter.peek().map(|f| f.order),
@@ -582,6 +602,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::Mesh => {
+                let meshes_start = self.meshes_start;
+                let mut meshes_end = meshes_start + 1;
+                self.meshes_iter.next();
+                while self
+                    .meshes_iter
+                    .next_if(|mesh| (mesh.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    meshes_end += 1;
+                }
+                self.meshes_start = meshes_end;
+                Some(PrimitiveBatch::Meshes(meshes_start..meshes_end))
+            }
             PrimitiveKind::BackdropFilter => {
                 let backdrop_filters_start = self.backdrop_filters_start;
                 let mut backdrop_filters_end = backdrop_filters_start + 1;
@@ -638,6 +672,8 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    /// Indices into [`Scene::meshes`].
+    Meshes(Range<usize>),
     BackdropFilters(Range<usize>),
     /// A single content-filter group boundary; index into [`Scene::filter_boundaries`]. Read
     /// `is_start` to tell whether this opens the group (switch render target) or closes it
@@ -675,6 +711,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::Meshes(range) => format!("meshes ({})", range.len()),
             Self::BackdropFilters(range) => format!("backdrop filters ({})", range.len()),
             Self::FilterBoundary(ix) => format!("filter boundary ({ix})"),
         }
@@ -993,6 +1030,31 @@ pub struct PaintSurface {
 impl From<PaintSurface> for Primitive {
     fn from(surface: PaintSurface) -> Self {
         Primitive::Surface(surface)
+    }
+}
+
+/// A [`Mesh`] drawn into `bounds`; emitted by [`crate::Window::paint_mesh`].
+#[derive(Clone, Debug)]
+pub struct PaintMesh {
+    /// Draw order, assigned when the primitive is inserted.
+    pub order: DrawOrder,
+    /// Where the mesh's viewport lies, in device pixels.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The clip in effect when the mesh was painted.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// Corners the composited viewport is rounded to.
+    pub corner_radii: Corners<ScaledPixels>,
+    /// Element opacity multiplied into the composite.
+    pub opacity: f32,
+    /// The geometry, cached on the GPU by its id.
+    pub mesh: Arc<Mesh>,
+    /// Camera, projection, and colors for this paint.
+    pub style: MeshStyle,
+}
+
+impl From<PaintMesh> for Primitive {
+    fn from(mesh: PaintMesh) -> Self {
+        Primitive::Mesh(mesh)
     }
 }
 

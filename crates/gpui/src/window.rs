@@ -4982,6 +4982,53 @@ impl Window {
         });
     }
 
+    /// Whether this window's renderer draws [`crate::Mesh`]es. Only the wgpu
+    /// renderer does; elsewhere [`Self::paint_mesh`] paints nothing, so draw a
+    /// fallback instead.
+    pub fn supports_meshes(&self) -> bool {
+        cfg!(any(
+            target_os = "linux",
+            target_os = "freebsd",
+            all(target_os = "windows", feature = "wgpu-surfaces")
+        ))
+    }
+
+    /// Paint `mesh` into `bounds` as `style` describes, with a transparent
+    /// background, clipped like an image to the content mask and
+    /// `corner_radii`. The renderer keeps the geometry on the GPU while
+    /// frames keep painting it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_mesh(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        mesh: Arc<crate::Mesh>,
+        style: crate::MeshStyle,
+    ) {
+        self.invalidator.debug_assert_paint();
+
+        if bounds.size.width <= Pixels::ZERO
+            || bounds.size.height <= Pixels::ZERO
+            || mesh.vertices().is_empty()
+        {
+            return;
+        }
+        let corner_radii = corner_radii
+            .clamp_radii_for_quad_size(bounds.size)
+            .scale(self.length_scale());
+        let paint = crate::PaintMesh {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            corner_radii,
+            opacity: self.element_opacity(),
+            mesh,
+            style,
+        };
+        self.next_frame.scene.insert_primitive(paint);
+    }
+
     /// Removes an image from the sprite atlas.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
         for frame_index in 0..data.frame_count() {

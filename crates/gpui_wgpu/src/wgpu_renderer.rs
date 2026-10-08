@@ -1,9 +1,10 @@
+use crate::wgpu_mesh::MeshRenderer;
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext, WgpuDeviceRequirements};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, BackdropFilter, Background, Bounds, DevicePixels, FilterBoundary, GpuSpecs,
-    MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
+    MonochromeSprite, PaintMesh, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledFilter, ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline,
     get_gamma_correction_ratios,
 };
@@ -271,6 +272,9 @@ struct WgpuResources {
     /// content blurs isolate correctly, up to [`MAX_FILTER_DEPTH`]; deeper nests render inline.
     group_textures: Vec<wgpu::Texture>,
     group_views: Vec<wgpu::TextureView>,
+    /// Mesh pipelines, geometry, and targets; built on the first frame that
+    /// paints a mesh.
+    meshes: Option<MeshRenderer>,
 }
 
 impl WgpuResources {
@@ -761,6 +765,7 @@ impl WgpuRenderer {
             blur_pong_view: None,
             group_textures: Vec::new(),
             group_views: Vec::new(),
+            meshes: None,
         };
 
         Ok(Self {
@@ -1777,6 +1782,12 @@ impl WgpuRenderer {
                         label: Some("main_encoder"),
                     });
 
+            // Meshes render offscreen before the main pass; their batches
+            // composite the results below.
+            if !scene.meshes.is_empty() {
+                self.prepare_meshes(&mut encoder, &scene.meshes);
+            }
+
             // When the scene contains blur filters, render into the offscreen scene texture (so
             // filters can sample already-painted content mid-frame) and blit to the swapchain at
             // the end; otherwise render straight to the swapchain. `use_offscreen` and the blur
@@ -1900,6 +1911,13 @@ impl WgpuRenderer {
                             ),
                         PrimitiveBatch::Surfaces(range) => {
                             self.draw_surfaces(&scene.surfaces[range], &mut pass)
+                        }
+                        PrimitiveBatch::Meshes(range) => {
+                            let resources = self.resources();
+                            if let Some(meshes) = &resources.meshes {
+                                meshes.composite(range, &resources.globals_bind_group, &mut pass);
+                            }
+                            true
                         }
                         PrimitiveBatch::BackdropFilters(range) => {
                             // Interrupt the current pass, blur the content painted so far behind
@@ -2358,6 +2376,8 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    // Meshes need the storage-buffer shaders; the WebGL2 path skips them.
+                    PrimitiveBatch::Meshes(_) => {}
                     // Blur filters are only implemented by the storage-buffer
                     // render loop below; the WebGL2 path renders the scene
                     // without them.
@@ -2525,6 +2545,32 @@ impl WgpuRenderer {
             instance_offset,
             pass,
         )
+    }
+
+    /// Renders the scene's meshes into their offscreen targets, building the
+    /// mesh pipelines on first use (or when the surface format changes).
+    fn prepare_meshes(&mut self, encoder: &mut wgpu::CommandEncoder, meshes: &[PaintMesh]) {
+        let format = self.surface_config.format;
+        let WgpuResources {
+            device,
+            queue,
+            bind_group_layouts,
+            meshes: renderer,
+            ..
+        } = self.resources_mut();
+        if renderer
+            .as_ref()
+            .is_none_or(|renderer| renderer.scene_format() != format)
+        {
+            *renderer = Some(MeshRenderer::new(
+                device,
+                &bind_group_layouts.globals,
+                format,
+            ));
+        }
+        if let Some(renderer) = renderer {
+            renderer.prepare(device, queue, encoder, meshes);
+        }
     }
 
     #[cfg(any(
@@ -3791,3 +3837,7 @@ mod shadow_tests;
 #[cfg(all(test, not(target_family = "wasm")))]
 #[path = "gradient_tests.rs"]
 mod gradient_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "mesh_tests.rs"]
+mod mesh_tests;

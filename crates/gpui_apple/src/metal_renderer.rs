@@ -1082,6 +1082,9 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                // Meshes are drawn by the wgpu renderer only; `Window::supports_meshes`
+                // is false here, so callers paint a fallback instead.
+                PrimitiveBatch::Meshes(_) => true,
                 PrimitiveBatch::BackdropFilters(range) => {
                     command_encoder.end_encoding();
                     if let (Some(ping), Some(pong)) =
