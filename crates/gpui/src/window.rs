@@ -11,17 +11,17 @@ use crate::{
     DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
     ElementTransform, Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary,
     FontId, Global, GlobalElementId, GlyphId, GpuSpecs, InputHandler, IsZero, KeyBinding,
-    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
-    Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y,
-    ScaledFilter, ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style,
-    SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController,
-    TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration, TextInputStateChange,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
+    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LetterSpacing,
+    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
+    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
+    SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow, SharedString, Size,
+    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
     WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
     WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
 };
@@ -2167,6 +2167,13 @@ impl Window {
         let mut style = TextStyle::default();
         for refinement in &self.text_style_stack {
             style.refine(refinement);
+        }
+        // Em tracking resolves against the final font size, so a size set
+        // below the tracking still scales it.
+        if let Some(LetterSpacing::Em(_)) = style.letter_spacing {
+            style.letter_spacing = style
+                .letter_spacing_in_pixels(self.rem_size())
+                .map(LetterSpacing::Pixels);
         }
         style
     }
@@ -7598,6 +7605,57 @@ mod tests {
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchDragEvent, TouchEvent,
         TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
+
+    /// Em tracking set high in the tree resolves against each descendant's
+    /// own font size; a fixed or zero spacing set below it wins.
+    #[gpui::test]
+    fn em_tracking_resolves_against_the_innermost_font_size(cx: &mut TestAppContext) {
+        use crate::{AbsoluteLength, LetterSpacing, TextStyleRefinement};
+        struct Empty;
+        impl Render for Empty {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+        let window = cx.add_window(|_, _| Empty);
+        window
+            .update(cx, |_, window, _| {
+                let refine = |spacing: Option<LetterSpacing>, size: Option<f32>| {
+                    Some(TextStyleRefinement {
+                        letter_spacing: spacing,
+                        font_size: size.map(|size| AbsoluteLength::Pixels(px(size))),
+                        ..TextStyleRefinement::default()
+                    })
+                };
+                // The stack `with_text_style` pushes during layout and paint.
+                let at = |window: &mut Window, stack: &[Option<TextStyleRefinement>]| {
+                    window.text_style_stack = stack.iter().flatten().cloned().collect();
+                    window.text_style().letter_spacing
+                };
+                let root = refine(Some(LetterSpacing::Em(-0.04)), Some(16.0));
+                let label = refine(None, Some(12.0));
+                assert_eq!(
+                    at(window, &[root.clone()]),
+                    Some(LetterSpacing::Pixels(px(-0.64)))
+                );
+                assert_eq!(
+                    at(window, &[root.clone(), label.clone()]),
+                    Some(LetterSpacing::Pixels(px(-0.48)))
+                );
+                let code = refine(Some(LetterSpacing::Em(0.0)), None);
+                assert_eq!(
+                    at(window, &[root.clone(), label.clone(), code]),
+                    Some(LetterSpacing::Pixels(px(0.0)))
+                );
+                let fixed = refine(Some(LetterSpacing::Pixels(px(1.0))), Some(20.0));
+                assert_eq!(
+                    at(window, &[root, label, fixed]),
+                    Some(LetterSpacing::Pixels(px(1.0)))
+                );
+                window.text_style_stack.clear();
+            })
+            .unwrap();
+    }
 
     #[gpui::test]
     #[cfg(feature = "profiler")]

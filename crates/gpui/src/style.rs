@@ -606,10 +606,12 @@ pub struct TextStyle {
     /// The number of lines to display before truncating the text
     pub line_clamp: Option<usize>,
 
-    /// Letter spacing added between characters, in pixels (positive widens, negative tightens).
+    /// Letter spacing added between characters (positive widens, negative
+    /// tightens): fixed pixels, or a fraction of the font size that each
+    /// descendant resolves against its own size, like CSS `em` tracking.
     ///
     /// The platform text stack may clamp values outside the range it supports.
-    pub letter_spacing: Option<Pixels>,
+    pub letter_spacing: Option<LetterSpacing>,
 
     /// Case transformation applied at layout time.
     pub text_transform: Option<TextTransform>,
@@ -690,7 +692,18 @@ impl TextStyle {
         self.line_height.to_pixels(self.font_size, rem_size).round()
     }
 
+    /// The letter spacing in pixels at this style's font size.
+    pub fn letter_spacing_in_pixels(&self, rem_size: Pixels) -> Option<Pixels> {
+        let font_size = self.font_size.to_pixels(rem_size);
+        self.letter_spacing
+            .map(|spacing| spacing.to_pixels(font_size))
+    }
+
     /// Convert this text style into a [`TextRun`], for the given length of the text.
+    ///
+    /// Em letter spacing resolves against the font size here; styles from
+    /// [`Window::text_style`] already carry it in pixels. A rem font size
+    /// that never passed through the window resolves at the default 16 px rem.
     pub fn to_run(&self, len: usize) -> TextRun {
         TextRun {
             len,
@@ -705,8 +718,41 @@ impl TextStyle {
             background_color: self.background_color,
             underline: self.underline,
             strikethrough: self.strikethrough,
-            letter_spacing: self.letter_spacing,
+            letter_spacing: self.letter_spacing_in_pixels(px(16.)),
         }
+    }
+}
+
+/// Space added between characters: fixed, or relative to the font size.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub enum LetterSpacing {
+    /// A fixed amount, whatever the font size.
+    Pixels(Pixels),
+    /// A fraction of the font size (`-0.04` is CSS `letter-spacing: -0.04em`),
+    /// so text of every size keeps the same proportion.
+    Em(f32),
+}
+
+impl LetterSpacing {
+    /// The spacing in pixels for text at `font_size`.
+    pub fn to_pixels(self, font_size: Pixels) -> Pixels {
+        match self {
+            Self::Pixels(pixels) => pixels,
+            Self::Em(em) => font_size * em,
+        }
+    }
+}
+
+/// No extra spacing.
+impl Default for LetterSpacing {
+    fn default() -> Self {
+        Self::Pixels(Pixels::ZERO)
+    }
+}
+
+impl From<Pixels> for LetterSpacing {
+    fn from(pixels: Pixels) -> Self {
+        Self::Pixels(pixels)
     }
 }
 
