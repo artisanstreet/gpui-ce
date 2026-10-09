@@ -1,7 +1,7 @@
 //! Lerp trait defines behaviour for interpolating between two values of the same type.
 use crate::{
     AbsoluteLength, Background, Bounds, Corners, DefiniteLength, DevicePixels, Edges, Fill, Length,
-    Percentage, Pixels, Point, Radians, Rems, Size, colors::Colors,
+    LetterSpacing, Percentage, Pixels, Point, Radians, Rems, Size, colors::Colors,
 };
 use palette::{
     Hsla, IntoColor, Oklab, Oklaba,
@@ -168,6 +168,17 @@ impl Lerp for AbsoluteLength {
             (Self::Rems(from), to) if to.is_zero() => {
                 Self::Rems(from.lerp(&Rems::default(), delta))
             }
+            _ if delta >= 1.0 => *to,
+            _ => *self,
+        }
+    }
+}
+
+impl Lerp for LetterSpacing {
+    fn lerp(&self, to: &Self, delta: f32) -> Self {
+        match (*self, *to) {
+            (Self::Pixels(from), Self::Pixels(to)) => Self::Pixels(from.lerp(&to, delta)),
+            (Self::Em(from), Self::Em(to)) => Self::Em(from.lerp(&to, delta)),
             _ if delta >= 1.0 => *to,
             _ => *self,
         }

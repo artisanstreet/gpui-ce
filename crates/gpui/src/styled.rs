@@ -2,9 +2,9 @@ use crate::{
     self as gpui, AbsoluteLength, AlignContent, AlignItems, AlignSelf, BorderStyle, CursorStyle,
     DefiniteLength, Display, ElementTransform, Fill, Filter, FlexDirection, FlexWrap, Font,
     FontFeatures, FontStyle, FontWeight, GridPlacement, GridTemplate, GridTemplateMinSize,
-    JustifyContent, Length, Pixels, SharedString, StrikethroughStyle, StyleRefinement, TextAlign,
-    TextOverflow, TextStyleRefinement, TextTransform, UnderlineStyle, WhiteSpace, px, relative,
-    rems,
+    JustifyContent, Length, LetterSpacing, Pixels, SharedString, StrikethroughStyle,
+    StyleRefinement, TextAlign, TextOverflow, TextStyleRefinement, TextTransform, UnderlineStyle,
+    WhiteSpace, px, relative, rems,
 };
 pub use gpui_macros::{
     border_style_methods, box_shadow_style_methods, cursor_style_methods, margin_style_methods,
@@ -183,9 +183,19 @@ pub trait Styled: Sized {
         self.text_align(TextAlign::Right)
     }
 
-    /// Sets the letter spacing for text in this element and its children.
+    /// Sets a fixed letter spacing for text in this element and its children.
     fn letter_spacing(mut self, spacing: impl Into<Pixels>) -> Self {
-        self.text_style().letter_spacing = Some(spacing.into());
+        self.text_style().letter_spacing = Some(LetterSpacing::Pixels(spacing.into()));
+        self
+    }
+
+    /// Sets the letter spacing as a fraction of the font size (`-0.04` is CSS
+    /// `letter-spacing: -0.04em`) for text in this element and its children.
+    /// Each descendant resolves it against its own font size, so one call
+    /// near the root tracks text of every size alike; `tracking(0.0)` turns
+    /// it off for a subtree, such as monospaced code.
+    fn tracking(mut self, em: f32) -> Self {
+        self.text_style().letter_spacing = Some(LetterSpacing::Em(em));
         self
     }
 

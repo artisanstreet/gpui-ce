@@ -1,7 +1,8 @@
 use scheduler::Instant;
 
 use crate::{
-    AbsoluteLength, Animated, Bounds, DefiniteLength, Fill, Hsla, Length, Lerp, Motion, Pixels,
+    AbsoluteLength, Animated, Bounds, DefiniteLength, Fill, Hsla, Length, Lerp, LetterSpacing,
+    Motion, Pixels,
 };
 
 #[derive(Clone, Copy)]
@@ -96,7 +97,7 @@ struct TextStyleTransitionState {
     background_color: Option<StyleTransitionPropertyState<Hsla>>,
     font_size: Option<StyleTransitionPropertyState<AbsoluteLength>>,
     line_height: Option<StyleTransitionPropertyState<DefiniteLength>>,
-    letter_spacing: Option<StyleTransitionPropertyState<Pixels>>,
+    letter_spacing: Option<StyleTransitionPropertyState<LetterSpacing>>,
     line_clamp: Option<StyleTransitionPropertyState<usize>>,
 }
 
