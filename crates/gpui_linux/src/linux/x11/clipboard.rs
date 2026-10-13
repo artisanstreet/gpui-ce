@@ -184,13 +184,64 @@ impl XContext {
 
 #[derive(Default)]
 struct Selection {
-    data: RwLock<Option<Vec<ClipboardData>>>,
+    data: RwLock<Option<SelectionPayload>>,
     /// Mutex around nothing to use with the below condvar.
     mutex: Mutex<()>,
     /// A condvar that is notified when the contents of this clipboard are changed.
     ///
     /// This is associated with `Self::mutex`.
     data_changed: Condvar,
+}
+
+struct SelectionPayload {
+    formats: Vec<ClipboardData>,
+    // Keep metadata and wire data under the same ownership lock, so losing the
+    // selection releases both without a second cache in X11Client.
+    item: Option<ClipboardItem>,
+}
+
+impl Selection {
+    fn write(
+        &self,
+        payload: SelectionPayload,
+        acquire_ownership: impl FnOnce() -> Result<()>,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        // Serialize the X ownership request with SelectionClear's owner query.
+        // Taking this lock after the request would let a delayed clear erase a
+        // freshly acquired selection.
+        let mut data = self.data.write();
+        acquire_ownership()?;
+        *data = Some(payload);
+
+        // Keep both locks while notifying, so a waiter cannot miss the change
+        // between releasing the payload lock and waiting on the condition.
+        let mut guard = self.mutex.lock();
+        self.data_changed.notify_all();
+        match wait {
+            WaitConfig::None => {}
+            WaitConfig::Forever => {
+                drop(data);
+                self.data_changed.wait(&mut guard);
+            }
+            WaitConfig::Until(deadline) => {
+                drop(data);
+                self.data_changed.wait_until(&mut guard, deadline);
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_if_not_owner(&self, is_owner: impl FnOnce() -> Result<bool>) -> Result<bool> {
+        let mut data = self.data.write();
+        if data.is_none() || is_owner()? {
+            return Ok(false);
+        }
+        *data = None;
+        let _guard = self.mutex.lock();
+        self.data_changed.notify_all();
+        Ok(true)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -229,7 +280,7 @@ impl Inner {
 
     fn write(
         &self,
-        data: Vec<ClipboardData>,
+        payload: SelectionPayload,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
@@ -239,44 +290,22 @@ impl Inner {
             ));
         }
 
-        let server_win = self.server.win_id;
-
-        // ICCCM version 2, section 2.6.1.3 states that we should re-assert ownership whenever data
-        // changes.
-        self.server
-            .conn
-            .set_selection_owner(server_win, self.atom_of(selection), Time::CURRENT_TIME)
-            .map_err(|_| Error::ClipboardOccupied)?;
-
-        self.server.conn.flush().map_err(into_unknown)?;
-
-        // Just setting the data, and the `serve_requests` will take care of the rest.
-        let selection = self.selection_of(selection);
-        let mut data_guard = selection.data.write();
-        *data_guard = Some(data);
-
-        // Lock the mutex to both ensure that no wakers of `data_changed` can wake us between
-        // dropping the `data_guard` and calling `wait[_for]` and that we don't we wake other
-        // threads in that position.
-        let mut guard = selection.mutex.lock();
-
-        // Notify any existing waiting threads that we have changed the data in the selection.
-        // It is important that the mutex is locked to prevent this notification getting lost.
-        selection.data_changed.notify_all();
-
-        match wait {
-            WaitConfig::None => {}
-            WaitConfig::Forever => {
-                drop(data_guard);
-                selection.data_changed.wait(&mut guard);
-            }
-            WaitConfig::Until(deadline) => {
-                drop(data_guard);
-                selection.data_changed.wait_until(&mut guard, deadline);
-            }
-        }
-
-        Ok(())
+        self.selection_of(selection).write(
+            payload,
+            || {
+                // ICCCM 2.6.1.3 requires reasserting ownership when data changes.
+                self.server
+                    .conn
+                    .set_selection_owner(
+                        self.server.win_id,
+                        self.atom_of(selection),
+                        Time::CURRENT_TIME,
+                    )
+                    .map_err(|_| Error::ClipboardOccupied)?;
+                self.server.conn.flush().map_err(into_unknown)
+            },
+            wait,
+        )
     }
 
     /// `formats` must be a slice of atoms, where each atom represents a target format.
@@ -287,7 +316,7 @@ impl Inner {
         if self.is_owner(selection)? {
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                for data in data_list {
+                for data in &data_list.formats {
                     for format in formats {
                         if *format == data.format {
                             return Ok(data.clone());
@@ -688,7 +717,7 @@ impl Inner {
             targets.push(self.atoms.SAVE_TARGETS);
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                for data in data_list {
+                for data in &data_list.formats {
                     targets.push(data.format);
                     if data.format == self.atoms.UTF8_STRING {
                         // When we are storing a UTF8 string,
@@ -715,7 +744,7 @@ impl Inner {
             log::trace!("Handling request for (probably) the clipboard contents.");
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                success = match data_list.iter().find(|d| d.format == event.target) {
+                success = match data_list.formats.iter().find(|d| d.format == event.target) {
                     Some(data) => {
                         self.server
                             .conn
@@ -859,23 +888,17 @@ fn serve_requests(context: Arc<Inner>) -> Result<(), Box<dyn std::error::Error>>
                 return Ok(());
             }
             Event::SelectionClear(event) => {
-                // TODO: check if this works
-                // Someone else has new content in the clipboard, so it is
-                // notifying us that we should delete our data now.
-                log::trace!("Somebody else owns the clipboard now");
-
-                if let Some(selection) = context.kind_of(event.selection) {
-                    let selection = context.selection_of(selection);
-                    let mut data_guard = selection.data.write();
-                    *data_guard = None;
-
-                    // It is important that this mutex is locked at the time of calling
-                    // `notify_all` to prevent notifications getting lost in case the sleeping
-                    // thread has unlocked its `data_guard` and is just about to sleep.
-                    // It is also important that the RwLock is kept write-locked for the same
-                    // reason.
-                    let _guard = selection.mutex.lock();
-                    selection.data_changed.notify_all();
+                if let Some(kind) = context.kind_of(event.selection) {
+                    // A queued loss can arrive after we have copied again. Query
+                    // the server under the same lock used to acquire ownership.
+                    // On a query error, retain the payload rather than treating
+                    // uncertain ownership as a confirmed loss.
+                    if let Err(error) = context
+                        .selection_of(kind)
+                        .clear_if_not_owner(|| context.is_owner(kind))
+                    {
+                        log::debug!("Could not check selection ownership: {error}");
+                    }
                 }
             }
             Event::SelectionRequest(event) => {
@@ -987,7 +1010,29 @@ impl Clipboard {
             bytes: message.into_owned().into_bytes(),
             format: self.inner.atoms.UTF8_STRING,
         }];
-        self.inner.write(data, selection, wait)
+        self.inner.write(
+            SelectionPayload {
+                formats: data,
+                item: None,
+            },
+            selection,
+            wait,
+        )
+    }
+
+    pub(crate) fn set_item(&self, item: ClipboardItem) -> Result<()> {
+        let formats = vec![ClipboardData {
+            bytes: item.text().unwrap_or_default().into_bytes(),
+            format: self.inner.atoms.UTF8_STRING,
+        }];
+        self.inner.write(
+            SelectionPayload {
+                formats,
+                item: Some(item),
+            },
+            ClipboardKind::Clipboard,
+            WaitConfig::None,
+        )
     }
 
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
@@ -1016,10 +1061,26 @@ impl Clipboard {
             bytes: image.bytes,
             format: self.inner.atoms.PNG__MIME,
         }];
-        self.inner.write(data, selection, wait)
+        self.inner.write(
+            SelectionPayload {
+                formats: data,
+                item: None,
+            },
+            selection,
+            wait,
+        )
     }
 
     pub(crate) fn get_any(&self, selection: ClipboardKind) -> Result<ClipboardItem> {
+        if matches!(selection, ClipboardKind::Clipboard) {
+            let data = self.inner.selection_of(selection).data.read();
+            if self.inner.is_owner(selection)?
+                && let Some(item) = data.as_ref().and_then(|data| data.item.as_ref())
+            {
+                return Ok(item.clone());
+            }
+        }
+
         let image_entries = ImageFormat::iter()
             .map(|format| (self.image_format_atom(format), format))
             .collect::<Vec<_>>();
@@ -1066,10 +1127,6 @@ impl Clipboard {
             String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)?
         };
         Ok(ClipboardItem::new_string(text))
-    }
-
-    pub fn is_owner(&self, selection: ClipboardKind) -> bool {
-        self.inner.is_owner(selection).unwrap_or(false)
     }
 }
 
@@ -1251,5 +1308,121 @@ impl Error {
         Error::Unknown {
             description: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn payload(text: &str, metadata: Option<&str>) -> SelectionPayload {
+        SelectionPayload {
+            formats: vec![ClipboardData {
+                bytes: text.as_bytes().to_vec(),
+                format: 1,
+            }],
+            item: metadata.map(|metadata| {
+                ClipboardItem::new_string_with_metadata(text.into(), metadata.into())
+            }),
+        }
+    }
+
+    fn assert_contents(selection: &Selection, text: &str, metadata: Option<&str>) {
+        let data = selection.data.read();
+        let data = data.as_ref().expect("selection payload missing");
+        assert_eq!(data.formats[0].bytes, text.as_bytes());
+        assert_eq!(
+            data.item
+                .as_ref()
+                .and_then(ClipboardItem::metadata)
+                .map(String::as_str),
+            metadata,
+        );
+    }
+
+    #[test]
+    fn stale_selection_clear_preserves_reacquired_text_and_metadata() {
+        let selection = Selection::default();
+        selection
+            .write(
+                payload("old", Some("old metadata")),
+                || Ok(()),
+                WaitConfig::None,
+            )
+            .unwrap();
+        selection
+            .write(
+                payload("new", Some("new metadata")),
+                || {
+                    // Ownership is requested before releasing the payload lock.
+                    assert!(selection.data.try_write().is_none());
+                    Ok(())
+                },
+                WaitConfig::None,
+            )
+            .unwrap();
+        assert!(
+            !selection
+                .clear_if_not_owner(|| {
+                    // The queued old loss observes our newly acquired ownership.
+                    assert!(selection.data.try_write().is_none());
+                    Ok(true)
+                })
+                .unwrap()
+        );
+        assert_contents(&selection, "new", Some("new metadata"));
+
+        assert!(selection.clear_if_not_owner(|| Ok(false)).unwrap());
+        assert!(selection.data.read().is_none());
+        assert!(!selection.clear_if_not_owner(|| Ok(false)).unwrap());
+    }
+
+    #[test]
+    fn ownership_errors_keep_the_previous_payload() {
+        let selection = Selection::default();
+        selection
+            .write(
+                payload("kept", Some("metadata")),
+                || Ok(()),
+                WaitConfig::None,
+            )
+            .unwrap();
+        assert!(
+            selection
+                .write(
+                    payload("failed copy", Some("wrong metadata")),
+                    || Err(Error::ClipboardOccupied),
+                    WaitConfig::None,
+                )
+                .is_err()
+        );
+        assert_contents(&selection, "kept", Some("metadata"));
+
+        assert!(
+            selection
+                .clear_if_not_owner(|| Err(Error::unknown("owner query failed")))
+                .is_err()
+        );
+        assert_contents(&selection, "kept", Some("metadata"));
+    }
+
+    #[test]
+    fn primary_selection_loss_does_not_release_clipboard_metadata() {
+        let clipboard = Selection::default();
+        let primary = Selection::default();
+        clipboard
+            .write(
+                payload("clipboard", Some("metadata")),
+                || Ok(()),
+                WaitConfig::None,
+            )
+            .unwrap();
+        primary
+            .write(payload("primary", None), || Ok(()), WaitConfig::None)
+            .unwrap();
+
+        assert!(primary.clear_if_not_owner(|| Ok(false)).unwrap());
+        assert!(primary.data.read().is_none());
+        assert_contents(&clipboard, "clipboard", Some("metadata"));
     }
 }

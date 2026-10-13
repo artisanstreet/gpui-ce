@@ -7648,7 +7648,7 @@ mod tests {
                 let root = refine(Some(LetterSpacing::Em(-0.04)), Some(16.0));
                 let label = refine(None, Some(12.0));
                 assert_eq!(
-                    at(window, &[root.clone()]),
+                    at(window, std::slice::from_ref(&root)),
                     Some(LetterSpacing::Pixels(px(-0.64)))
                 );
                 assert_eq!(

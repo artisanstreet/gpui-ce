@@ -61,8 +61,8 @@ use crate::linux::{
 use crate::linux::{LinuxCommon, LinuxKeyboardLayout, X11Window, modifiers_from_xinput_info};
 
 use gpui::{
-    AnyWindowHandle, Bounds, ClipboardItem, CursorStyle, DisplayId, FileDropEvent, Keystroke,
-    Modifiers, ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
+    AnyWindowHandle, Bounds, CursorStyle, DisplayId, FileDropEvent, Keystroke, Modifiers,
+    ModifiersChangedEvent, MouseButton, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, RequestFrameOptions, ScrollDelta, Size,
     TouchPhase, WindowButtonLayout, WindowParams, point, px,
 };
@@ -218,7 +218,6 @@ pub struct X11ClientState {
 
     pub(crate) common: LinuxCommon,
     pub(crate) clipboard: Clipboard,
-    pub(crate) clipboard_item: Option<ClipboardItem>,
     pub(crate) xdnd_state: Xdnd,
 }
 
@@ -575,7 +574,6 @@ impl X11Client {
             supports_xinput_gestures,
 
             clipboard,
-            clipboard_item: None,
             xdnd_state: Xdnd::default(),
         }))))
     }
@@ -1783,17 +1781,12 @@ impl LinuxClient for X11Client {
     }
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
-        let mut state = self.0.borrow_mut();
+        let state = self.0.borrow();
         state
             .clipboard
-            .set_text(
-                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
-                clipboard::ClipboardKind::Clipboard,
-                clipboard::WaitConfig::None,
-            )
+            .set_item(item)
             .context("X11: Failed to write to clipboard (clipboard)")
             .log_with_level(log::Level::Debug);
-        state.clipboard_item.replace(item);
     }
 
     fn read_from_primary(&self) -> Option<gpui::ClipboardItem> {
@@ -1807,14 +1800,6 @@ impl LinuxClient for X11Client {
 
     fn read_from_clipboard(&self) -> Option<gpui::ClipboardItem> {
         let state = self.0.borrow_mut();
-        // if the last copy was from this app, return our cached item
-        // which has metadata attached.
-        if state
-            .clipboard
-            .is_owner(clipboard::ClipboardKind::Clipboard)
-        {
-            return state.clipboard_item.clone();
-        }
         state
             .clipboard
             .get_any(clipboard::ClipboardKind::Clipboard)
