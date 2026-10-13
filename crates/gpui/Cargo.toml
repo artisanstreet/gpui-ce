@@ -37,7 +37,9 @@ wayland = []
 x11 = ["scap?/x11"]
 screen-capture = ["scap"]
 windows-manifest = ["dep:embed-resource"]
-profiler = ["dep:hdrhistogram"]
+# Frame overlay without task tracing, frame histograms, or the flight recorder.
+frame-rate = []
+profiler = ["frame-rate", "dep:hdrhistogram"]
 stacker = ["dep:stacksafe"]
 
 [lib]

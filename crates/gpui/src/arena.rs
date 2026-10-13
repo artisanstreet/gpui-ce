@@ -83,6 +83,7 @@ pub struct Arena {
     elements: Vec<ArenaElement>,
     valid: Rc<Cell<bool>>,
     current_chunk_index: usize,
+    initial_chunk_size: NonZeroUsize,
     chunk_size: NonZeroUsize,
     scope_depth: usize,
 }
@@ -95,19 +96,32 @@ impl Drop for Arena {
 
 impl Arena {
     pub fn new(chunk_size: usize) -> Self {
+        Self::new_with_initial_chunk_size(chunk_size, chunk_size)
+    }
+
+    /// Starts with a smaller allocation while preserving normal overflow capacity.
+    pub(crate) fn new_with_initial_chunk_size(
+        initial_chunk_size: usize,
+        chunk_size: usize,
+    ) -> Self {
+        let initial_chunk_size = NonZeroUsize::try_from(initial_chunk_size).unwrap();
         let chunk_size = NonZeroUsize::try_from(chunk_size).unwrap();
         Self {
-            chunks: vec![Chunk::new(chunk_size)],
+            chunks: Vec::new(),
             elements: Vec::new(),
             valid: Rc::new(Cell::new(true)),
             current_chunk_index: 0,
+            initial_chunk_size,
             chunk_size,
             scope_depth: 0,
         }
     }
 
     pub fn capacity(&self) -> usize {
-        self.chunks.len() * self.chunk_size.get()
+        self.chunks
+            .iter()
+            .map(|chunk| chunk.end.addr() - chunk.start.addr())
+            .sum()
     }
 
     /// Marks the start of a scope (e.g. a window draw) whose allocations must stay
@@ -148,11 +162,15 @@ impl Arena {
     }
 
     fn force_clear(&mut self) {
-        self.valid.set(false);
-        self.valid = Rc::new(Cell::new(true));
+        // A generation only needs replacing if a handle can still observe it.
+        // Most event scopes drop every handle before clearing the arena.
+        if Rc::strong_count(&self.valid) > 1 {
+            self.valid.set(false);
+            self.valid = Rc::new(Cell::new(true));
+        }
         self.elements.clear();
-        for chunk_index in 0..=self.current_chunk_index {
-            self.chunks[chunk_index].reset();
+        for chunk in self.chunks.iter_mut().take(self.current_chunk_index + 1) {
+            chunk.reset();
         }
         self.current_chunk_index = 0;
     }
@@ -172,6 +190,9 @@ impl Arena {
         }
 
         let layout = alloc::Layout::new::<T>();
+        if self.chunks.is_empty() {
+            self.chunks.push(Chunk::new(self.initial_chunk_size));
+        }
         let mut current_chunk = &mut self.chunks[self.current_chunk_index];
         let ptr = if let Some(ptr) = current_chunk.allocate(layout) {
             ptr.as_ptr()
@@ -198,10 +219,12 @@ impl Arena {
         };
 
         unsafe { inner_writer(ptr.cast(), f) };
-        self.elements.push(ArenaElement {
-            value: ptr,
-            drop: drop::<T>,
-        });
+        if std::mem::needs_drop::<T>() {
+            self.elements.push(ArenaElement {
+                value: ptr,
+                drop: drop::<T>,
+            });
+        }
 
         ArenaBox {
             ptr: ptr.cast(),
@@ -256,6 +279,90 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use super::*;
+
+    #[test]
+    fn unused_arena_does_not_allocate_chunks() {
+        let mut arena = Arena::new(1024 * 1024);
+        assert_eq!(arena.capacity(), 0);
+        arena.clear();
+        assert_eq!(arena.capacity(), 0);
+        assert_eq!(*arena.alloc(|| 7u64), 7);
+        assert_eq!(arena.capacity(), 1024 * 1024);
+    }
+
+    #[test]
+    fn small_initial_chunk_preserves_large_aligned_allocations_and_reuse() {
+        #[repr(align(256))]
+        struct LargeEvent {
+            payload: [u8; 8192],
+            drops: Rc<Cell<usize>>,
+        }
+        impl Drop for LargeEvent {
+            fn drop(&mut self) {
+                self.drops.set(self.drops.get() + 1);
+            }
+        }
+
+        let mut arena = Arena::new_with_initial_chunk_size(4096, 1024 * 1024);
+        let drops = Rc::new(Cell::new(0));
+        assert_eq!(arena.capacity(), 0);
+        let small = arena.alloc(|| 7u64);
+        let small_ptr = small.ptr;
+        assert_eq!(arena.capacity(), 4096);
+        let large = arena.alloc(|| LargeEvent {
+            payload: [23; 8192],
+            drops: drops.clone(),
+        });
+        let large_ptr = large.ptr;
+        assert_eq!(large_ptr.align_offset(256), 0);
+        assert_eq!(large.payload[8191], 23);
+        assert_eq!(*small, 7);
+        assert_eq!(arena.capacity(), 4096 + 1024 * 1024);
+
+        arena.clear();
+        assert_eq!(drops.get(), 1);
+        assert!(!small.valid.get());
+        assert!(!large.valid.get());
+        assert_eq!(arena.alloc(|| 11u64).ptr, small_ptr);
+        let reused = arena.alloc(|| LargeEvent {
+            payload: [42; 8192],
+            drops: drops.clone(),
+        });
+        assert_eq!(reused.ptr, large_ptr);
+        assert_eq!(reused.payload[8191], 42);
+        assert_eq!(arena.capacity(), 4096 + 1024 * 1024);
+        arena.clear();
+        assert_eq!(drops.get(), 2);
+        arena.clear();
+        assert_eq!(drops.get(), 2);
+    }
+
+    #[test]
+    fn trivial_values_do_not_allocate_destructor_records() {
+        let mut arena = Arena::new(1024);
+        for value in 0..100u64 {
+            assert_eq!(*arena.alloc(|| value), value);
+        }
+        assert_eq!(arena.elements.capacity(), 0);
+        arena.clear();
+        assert_eq!(arena.elements.capacity(), 0);
+    }
+
+    #[test]
+    fn clear_reuses_unobserved_generation() {
+        let mut arena = Arena::new(1024);
+        let generation = Rc::as_ptr(&arena.valid);
+        drop(arena.alloc(|| 7u64));
+        arena.clear();
+        assert_eq!(Rc::as_ptr(&arena.valid), generation);
+
+        let stale = arena.alloc(|| 11u64);
+        arena.clear();
+        assert!(!stale.valid.get());
+        assert_ne!(Rc::as_ptr(&arena.valid), generation);
+        assert_eq!(*arena.alloc(|| 13u64), 13);
+        assert!(!stale.valid.get());
+    }
 
     #[test]
     fn test_arena() {

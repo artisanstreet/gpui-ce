@@ -8,8 +8,10 @@ use std::rc::Rc;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
-    ForegroundExecutor, SharedString, SystemNotification, SystemNotificationResponse, Task,
+    BackgroundExecutor, ForegroundExecutor, SharedString, SystemNotification,
+    SystemNotificationResponse, Task,
 };
+use notify_rust::NotificationResponse;
 
 /// The XDG action key invoked when the user activates the notification body
 /// rather than a specific action button.
@@ -35,7 +37,12 @@ impl SystemNotificationState {
         }
     }
 
-    pub(crate) fn show(&self, app_name: Option<&str>, notification: SystemNotification) {
+    pub(crate) fn show(
+        &self,
+        executor: &BackgroundExecutor,
+        app_name: Option<&str>,
+        notification: SystemNotification,
+    ) {
         let mut builder = notify_rust::Notification::new();
         if let Some(app_name) = app_name {
             builder.appname(app_name);
@@ -54,42 +61,34 @@ impl SystemNotificationState {
 
         let sender = self.response_sender.clone();
         let tag = notification.tag.clone();
-        // `show` connects to the session bus and `wait_for_action` blocks
-        // until the notification closes, so both run off the UI thread.
-        let spawn_result = std::thread::Builder::new()
-            .name("system-notification".to_string())
-            .spawn(move || match built.show() {
-                Ok(handle) => handle.wait_for_action(|action| {
-                    let action_id = match action {
-                        // Sent by `notify-rust` when the notification closes
-                        // without being activated.
-                        "__closed" => return,
-                        transport_id => {
-                            let Some(action_id) = response_action_id(transport_id, &action_ids)
-                            else {
-                                log::warn!(
-                                    "system notification returned unknown action {transport_id:?}"
-                                );
-                                return;
-                            };
-                            action_id
-                        }
-                    };
-                    sender
-                        .unbounded_send(SystemNotificationResponse { tag, action_id })
-                        .ok();
-                }),
-                Err(error) => log::warn!("failed to show system notification: {error}"),
-            });
-        if let Err(error) = spawn_result {
-            log::warn!("failed to spawn system notification thread: {error}");
-        }
+        // The D-Bus future sleeps until a response arrives, without retaining a
+        // dedicated blocked OS thread and its stack for each live notification.
+        executor
+            .spawn(async move {
+                match built.show_async().await {
+                    Ok(handle) => {
+                        handle
+                            .wait_for_action_async(|response| {
+                                if let Some(action_id) = response_action_id(response, &action_ids) {
+                                    sender
+                                        .unbounded_send(SystemNotificationResponse {
+                                            tag,
+                                            action_id,
+                                        })
+                                        .ok();
+                                }
+                            })
+                            .await
+                    }
+                    Err(error) => log::warn!("failed to show system notification: {error}"),
+                }
+            })
+            .detach();
     }
 
     pub(crate) fn dismiss(&self, _tag: &str) {
-        // The XDG notifications protocol only allows closing via the
-        // server-assigned id on a live handle, which `wait_for_action`
-        // consumes; stale notifications simply age out of the shade.
+        // Response tasks own the native handles. Dismissal needs a separate
+        // tag-to-handle registry so it can target the server-assigned id.
     }
 
     pub(crate) fn on_response(
@@ -99,7 +98,7 @@ impl SystemNotificationState {
     ) {
         *self.callback.borrow_mut() = Some(callback);
 
-        // Responses arrive from per-notification threads; this task hands
+        // Responses arrive from background tasks; this task hands
         // them to the registered callback on the main thread.
         if let Some(mut receiver) = self.response_receiver.take() {
             let callback = self.callback.clone();
@@ -119,13 +118,20 @@ impl SystemNotificationState {
 }
 
 fn response_action_id(
-    transport_id: &str,
+    response: &NotificationResponse,
     action_ids: &HashMap<String, SharedString>,
 ) -> Option<Option<SharedString>> {
-    if transport_id == DEFAULT_ACTION {
-        Some(None)
-    } else {
-        action_ids.get(transport_id).cloned().map(Some)
+    match response {
+        NotificationResponse::Default => Some(None),
+        NotificationResponse::Action(transport_id) => {
+            if let Some(action_id) = action_ids.get(transport_id) {
+                Some(Some(action_id.clone()))
+            } else {
+                log::warn!("system notification returned unknown action {transport_id:?}");
+                None
+            }
+        }
+        NotificationResponse::Closed(_) | NotificationResponse::Reply(_) => None,
     }
 }
 
@@ -140,15 +146,39 @@ mod tests {
             ("gpui-action-1".to_string(), SharedString::from("__closed")),
         ]);
 
-        assert_eq!(response_action_id(DEFAULT_ACTION, &action_ids), Some(None));
         assert_eq!(
-            response_action_id("gpui-action-0", &action_ids),
+            response_action_id(&NotificationResponse::Default, &action_ids),
+            Some(None)
+        );
+        assert_eq!(
+            response_action_id(
+                &NotificationResponse::Action("gpui-action-0".into()),
+                &action_ids
+            ),
             Some(Some("default".into()))
         );
         assert_eq!(
-            response_action_id("gpui-action-1", &action_ids),
+            response_action_id(
+                &NotificationResponse::Action("gpui-action-1".into()),
+                &action_ids
+            ),
             Some(Some("__closed".into()))
         );
-        assert_eq!(response_action_id("unknown", &action_ids), None);
+        assert_eq!(
+            response_action_id(&NotificationResponse::Action("unknown".into()), &action_ids),
+            None
+        );
+    }
+
+    #[test]
+    fn closed_or_unsupported_responses_do_not_activate_the_notification() {
+        for response in [
+            NotificationResponse::Closed(notify_rust::CloseReason::Expired),
+            NotificationResponse::Closed(notify_rust::CloseReason::Dismissed),
+            NotificationResponse::Closed(notify_rust::CloseReason::CloseAction),
+            NotificationResponse::Reply("unsupported on XDG".into()),
+        ] {
+            assert_eq!(response_action_id(&response, &HashMap::new()), None);
+        }
     }
 }

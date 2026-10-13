@@ -14,6 +14,8 @@ mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
+#[cfg(feature = "wgpu")]
+mod frame_signal;
 mod keyboard;
 #[cfg(feature = "wgpu")]
 mod monitor_vsync;

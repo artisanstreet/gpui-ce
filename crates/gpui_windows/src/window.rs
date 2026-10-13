@@ -84,7 +84,7 @@ pub struct WindowsWindowState {
     #[cfg(feature = "wgpu")]
     pub(crate) frame_ready: Arc<AtomicBool>,
     #[cfg(feature = "wgpu")]
-    pub(crate) frame_paced: Cell<bool>,
+    pub(crate) frame_clock: RefCell<Option<crate::monitor_vsync::FrameClock>>,
     #[cfg(feature = "wgpu")]
     pub(crate) vsync_enabled: Arc<AtomicBool>,
 
@@ -207,7 +207,7 @@ impl WindowsWindowState {
             #[cfg(feature = "wgpu")]
             frame_ready: Arc::new(AtomicBool::new(true)),
             #[cfg(feature = "wgpu")]
-            frame_paced: Cell::new(false),
+            frame_clock: RefCell::new(None),
             #[cfg(feature = "wgpu")]
             vsync_enabled: Arc::new(AtomicBool::new(true)),
             click_state,
@@ -287,6 +287,19 @@ impl WindowsWindowState {
 }
 
 impl WindowsWindowInner {
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn request_frame(&self) {
+        if self.state.vsync_enabled.load(Ordering::Acquire)
+            && let Some(clock) = self.state.frame_clock.borrow().as_ref()
+        {
+            clock.request();
+        } else {
+            unsafe {
+                let _ = RedrawWindow(Some(self.hwnd), None, None, RDW_INVALIDATE);
+            }
+        }
+    }
+
     fn new(context: &mut WindowCreateContext, hwnd: HWND, cs: &CREATESTRUCTW) -> Result<Rc<Self>> {
         let state = WindowsWindowState::new(
             hwnd,
@@ -637,11 +650,8 @@ unsafe impl Sync for RawWindow {}
 #[cfg(feature = "wgpu")]
 impl rwh::HasWindowHandle for RawWindow {
     fn window_handle(&self) -> std::result::Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-        let raw = rwh::Win32WindowHandle::new(unsafe {
-            NonZeroIsize::new_unchecked(self.hwnd.0 as isize)
-        })
-        .into();
-        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw) })
+        let raw = raw_win32_window_handle(self.hwnd)?;
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw.into()) })
     }
 }
 
@@ -654,12 +664,20 @@ impl rwh::HasDisplayHandle for RawWindow {
 
 impl rwh::HasWindowHandle for WindowsWindow {
     fn window_handle(&self) -> std::result::Result<rwh::WindowHandle<'_>, rwh::HandleError> {
-        let raw = rwh::Win32WindowHandle::new(unsafe {
-            NonZeroIsize::new_unchecked(self.0.hwnd.0 as isize)
-        })
-        .into();
-        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw) })
+        let raw = raw_win32_window_handle(self.0.hwnd)?;
+        Ok(unsafe { rwh::WindowHandle::borrow_raw(raw.into()) })
     }
+}
+
+fn raw_win32_window_handle(
+    hwnd: HWND,
+) -> std::result::Result<rwh::Win32WindowHandle, rwh::HandleError> {
+    let hwnd = NonZeroIsize::new(hwnd.0 as isize).ok_or(rwh::HandleError::Unavailable)?;
+    let mut raw = rwh::Win32WindowHandle::new(hwnd);
+    // Vulkan surface creation requires the instance that owns this window's
+    // class, matching the module passed to CreateWindowExW above.
+    raw.hinstance = NonZeroIsize::new(get_module_handle().0 as isize);
+    Ok(raw)
 }
 
 impl rwh::HasDisplayHandle for WindowsWindow {
@@ -670,6 +688,8 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        #[cfg(feature = "wgpu")]
+        self.state.frame_clock.borrow_mut().take();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -1120,18 +1140,14 @@ impl PlatformWindow for WindowsWindow {
         let window = Rc::downgrade(&self.0);
         Some(Rc::new(move || {
             if let Some(window) = window.upgrade() {
-                unsafe {
-                    let _ = RedrawWindow(Some(window.hwnd), None, None, RDW_INVALIDATE);
-                }
+                window.request_frame();
             }
         }))
     }
 
     #[cfg(feature = "wgpu")]
     fn schedule_frame(&self) {
-        unsafe {
-            let _ = RedrawWindow(Some(self.0.hwnd), None, None, RDW_INVALIDATE);
-        }
+        self.0.request_frame();
     }
 
     #[cfg(feature = "wgpu")]
@@ -1169,6 +1185,7 @@ impl PlatformWindow for WindowsWindow {
                 }
 
                 self.state.force_render_pending.set(true);
+                self.0.request_frame();
                 return;
             }
             if !renderer.draw(scene) {
@@ -1177,6 +1194,7 @@ impl PlatformWindow for WindowsWindow {
 
             if renderer.needs_redraw() {
                 self.state.force_render_pending.set(true);
+                self.0.request_frame();
             }
         }
     }

@@ -1,5 +1,5 @@
 use crate::{
-    AssetSource, DevicePixels, IsZero, RenderImage, Result, SharedString, Size,
+    AssetSource, DevicePixels, IsZero, Pixels, RenderImage, Result, SharedString, Size, px, size,
     swap_rgba_pa_to_bgra,
 };
 use image::Frame;
@@ -102,6 +102,15 @@ pub struct SvgRenderer {
 /// to paths, so callers that need to rasterize the same SVG at multiple
 /// scales should retain this value to avoid re-paying the parse cost.
 pub struct ParsedSvg(usvg::Tree);
+
+impl ParsedSvg {
+    /// The document's intrinsic size in logical pixels, before raster scaling.
+    /// Reading this size does not allocate a pixel buffer or render the document.
+    pub fn size(&self) -> Size<Pixels> {
+        let dimensions = self.0.size();
+        size(px(dimensions.width()), px(dimensions.height()))
+    }
+}
 
 /// The size in which to rasterize the SVG.
 #[derive(Clone, Copy)]
@@ -371,6 +380,7 @@ mod tests {
         let svg = renderer.parse_svg(
             br#"<svg xmlns="http://www.w3.org/2000/svg" width="24pt" height="12pt"></svg>"#,
         )?;
+        assert_eq!(svg.size(), size(px(32.0), px(16.0)));
         let requested_size = Size::new(DevicePixels(24), DevicePixels(12));
         let image = renderer.render_parsed(&svg, SvgSize::ExactSize(requested_size))?;
 

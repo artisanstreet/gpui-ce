@@ -18,6 +18,12 @@ use crate::*;
 /// visual output.
 const DEFAULT_VIEWPORT_SIZE: i32 = 1000;
 
+#[derive(Default)]
+struct ManipulationActivity {
+    viewport: Cell<bool>,
+    interaction: Cell<bool>,
+}
+
 pub(crate) struct DirectManipulationHandler {
     manager: IDirectManipulationManager,
     update_manager: IDirectManipulationUpdateManager,
@@ -26,6 +32,7 @@ pub(crate) struct DirectManipulationHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    activity: Rc<ManipulationActivity>,
 }
 
 impl DirectManipulationHandler {
@@ -65,12 +72,14 @@ impl DirectManipulationHandler {
 
             let scale_factor = Rc::new(Cell::new(scale_factor));
             let pending_events = Rc::new(RefCell::new(Vec::new()));
+            let activity = Rc::new(ManipulationActivity::default());
 
             let event_handler: IDirectManipulationViewportEventHandler =
                 DirectManipulationEventHandler::new(
                     window,
                     Rc::clone(&scale_factor),
                     Rc::clone(&pending_events),
+                    Rc::clone(&activity),
                 )
                 .into();
 
@@ -86,6 +95,7 @@ impl DirectManipulationHandler {
                 window,
                 scale_factor,
                 pending_events,
+                activity,
             })
         }
     }
@@ -100,7 +110,9 @@ impl DirectManipulationHandler {
             let mut pointer_type = POINTER_INPUT_TYPE::default();
             if GetPointerType(pointer_id, &mut pointer_type).is_ok() && pointer_type == PT_TOUCHPAD
             {
-                self.viewport.SetContact(pointer_id).log_err();
+                if self.viewport.SetContact(pointer_id).log_err().is_some() {
+                    let _ = RedrawWindow(Some(self.window), None, None, RDW_INVALIDATE);
+                }
             }
         }
     }
@@ -113,6 +125,11 @@ impl DirectManipulationHandler {
 
     pub fn drain_events(&self) -> Vec<PlatformInput> {
         std::mem::take(&mut *self.pending_events.borrow_mut())
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn needs_update(&self) -> bool {
+        self.activity.viewport.get() || self.activity.interaction.get()
     }
 }
 
@@ -133,7 +150,10 @@ enum GestureKind {
     Pinch,
 }
 
-#[windows_core::implement(IDirectManipulationViewportEventHandler)]
+#[windows_core::implement(
+    IDirectManipulationViewportEventHandler,
+    IDirectManipulationInteractionEventHandler
+)]
 struct DirectManipulationEventHandler {
     window: HWND,
     scale_factor: Rc<Cell<f32>>,
@@ -143,6 +163,7 @@ struct DirectManipulationEventHandler {
     last_y_offset: Cell<f32>,
     scroll_phase: Cell<TouchPhase>,
     pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+    activity: Rc<ManipulationActivity>,
 }
 
 impl DirectManipulationEventHandler {
@@ -150,6 +171,7 @@ impl DirectManipulationEventHandler {
         window: HWND,
         scale_factor: Rc<Cell<f32>>,
         pending_events: Rc<RefCell<Vec<PlatformInput>>>,
+        activity: Rc<ManipulationActivity>,
     ) -> Self {
         Self {
             window,
@@ -160,6 +182,7 @@ impl DirectManipulationEventHandler {
             last_y_offset: Cell::new(0.0),
             scroll_phase: Cell::new(TouchPhase::Started),
             pending_events,
+            activity,
         }
     }
 
@@ -214,6 +237,10 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
             return Ok(());
         }
 
+        self.activity
+            .viewport
+            .set(current == DIRECTMANIPULATION_RUNNING || current == DIRECTMANIPULATION_INERTIA);
+
         // A new gesture interrupted inertia, so end the old sequence.
         if current == DIRECTMANIPULATION_RUNNING && previous == DIRECTMANIPULATION_INERTIA {
             self.end_gesture();
@@ -246,6 +273,13 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
             self.last_scale.set(1.0);
             self.last_x_offset.set(0.0);
             self.last_y_offset.set(0.0);
+        }
+
+        // A manual viewport needs clock ticks throughout contact and inertia,
+        // including gestures that start while the application is idle. The
+        // final status change also delivers any queued gesture-ended event.
+        unsafe {
+            let _ = RedrawWindow(Some(self.window), None, None, RDW_INVALIDATE);
         }
 
         Ok(())
@@ -349,6 +383,26 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
         self.last_x_offset.set(x_offset);
         self.last_y_offset.set(y_offset);
 
+        Ok(())
+    }
+}
+
+impl IDirectManipulationInteractionEventHandler_Impl for DirectManipulationEventHandler_Impl {
+    fn OnInteraction(
+        &self,
+        _viewport: windows_core::Ref<'_, IDirectManipulationViewport2>,
+        interaction: DIRECTMANIPULATION_INTERACTION_TYPE,
+    ) -> windows_core::Result<()> {
+        match interaction {
+            DIRECTMANIPULATION_INTERACTION_BEGIN => self.activity.interaction.set(true),
+            DIRECTMANIPULATION_INTERACTION_END => self.activity.interaction.set(false),
+            _ => return Ok(()),
+        }
+        // Interaction can begin before the viewport enters RUNNING. Keep the
+        // manual update clock alive across that gap and wake to deliver END.
+        unsafe {
+            let _ = RedrawWindow(Some(self.window), None, None, RDW_INVALIDATE);
+        }
         Ok(())
     }
 }

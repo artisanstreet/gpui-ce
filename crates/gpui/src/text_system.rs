@@ -432,7 +432,7 @@ impl WindowTextSystem {
             "text argument should not contain newlines"
         );
 
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
+        let mut decoration_runs = SmallVec::<[DecorationRun; 1]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
                 && last_run.color == run.color
@@ -480,7 +480,7 @@ impl WindowTextSystem {
         force_width: Option<Pixels>,
         materialize_text: impl FnOnce() -> SharedString,
     ) -> ShapedLine {
-        let mut decoration_runs = SmallVec::<[DecorationRun; 32]>::new();
+        let mut decoration_runs = SmallVec::<[DecorationRun; 1]>::new();
         for run in runs {
             if let Some(last_run) = decoration_runs.last_mut()
                 && last_run.color == run.color
@@ -559,7 +559,7 @@ impl WindowTextSystem {
         let mut process_line = |line_text: SharedString, line_start, line_end| {
             font_runs.clear();
 
-            let mut decoration_runs = <Vec<DecorationRun>>::with_capacity(32);
+            let mut decoration_runs = SmallVec::<[DecorationRun; 1]>::new();
             let mut run_start = line_start;
             while run_start < line_end {
                 let Some(run) = runs.peek_mut() else {
@@ -1253,5 +1253,97 @@ pub fn font_name_with_fallbacks_shared<'a>(
         ".ZedSans" | "Zed Plex Sans" => const { &SharedString::new_static("IBM Plex Sans") },
         ".ZedMono" | "Zed Plex Mono" => const { &SharedString::new_static("Lilex") },
         _ => name,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Hsla, NoopTextSystem};
+
+    fn text_system() -> WindowTextSystem {
+        WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(NoopTextSystem))))
+    }
+
+    #[test]
+    fn plain_line_decorations_stay_inline_after_merging_and_cache_reuse() {
+        let text_system = text_system();
+        let runs = [
+            TextRun {
+                len: 2,
+                ..Default::default()
+            },
+            TextRun {
+                len: 3,
+                ..Default::default()
+            },
+        ];
+        let shaped = text_system.shape_line("plain".into(), px(16.), &runs, None);
+        assert_eq!(shaped.decoration_runs.len(), 1);
+        assert_eq!(shaped.decoration_runs[0].len, 5);
+        assert!(!shaped.decoration_runs.spilled());
+
+        let lines = text_system
+            .shape_text("plain", px(16.), &runs, None, None)
+            .unwrap();
+        assert_eq!(lines[0].decoration_runs.len(), 1);
+        assert_eq!(lines[0].decoration_runs[0].len, 5);
+        assert!(!lines[0].decoration_runs.spilled());
+
+        text_system.finish_frame();
+        let cached = text_system
+            .shape_text("plain", px(16.), &runs, None, None)
+            .unwrap();
+        assert!(Arc::ptr_eq(&lines[0].layout, &cached[0].layout));
+        assert_eq!(cached[0].decoration_runs[0].len, 5);
+        assert!(!cached[0].decoration_runs.spilled());
+    }
+
+    #[test]
+    fn rich_line_decorations_spill_without_losing_styles_or_split_boundaries() {
+        let text_system = text_system();
+        let text = "ab".repeat(40);
+        let runs: Vec<_> = (0..40)
+            .map(|index| TextRun {
+                len: 2,
+                color: Hsla::new(index as f32 / 40., 1., 0.5, 1.),
+                background_color: Some(Hsla::new(0., 0., index as f32 / 40., 1.)),
+                underline: Some(UnderlineStyle {
+                    thickness: px(1.),
+                    color: None,
+                    wavy: index % 2 == 0,
+                }),
+                ..Default::default()
+            })
+            .collect();
+        let shaped = text_system.shape_line(text.clone().into(), px(16.), &runs, None);
+        let wrapped = text_system
+            .shape_text(text, px(16.), &runs, Some(px(80.)), None)
+            .unwrap();
+        assert_eq!(shaped.decoration_runs.len(), 40);
+        assert_eq!(wrapped[0].decoration_runs.len(), 40);
+        assert!(shaped.decoration_runs.spilled());
+        assert!(wrapped[0].decoration_runs.spilled());
+        for (decoration, run) in shaped
+            .decoration_runs
+            .iter()
+            .chain(wrapped[0].decoration_runs.iter())
+            .zip(runs.iter().cycle())
+        {
+            assert_eq!(decoration.len as usize, run.len);
+            assert_eq!(decoration.color, run.color);
+            assert_eq!(decoration.background_color, run.background_color);
+            assert_eq!(decoration.underline, run.underline);
+        }
+
+        // Split inside a run after enough distinct styles to spill both halves.
+        let (left, right) = shaped.split_at(41);
+        assert_eq!(left.decoration_runs.len(), 21);
+        assert_eq!(right.decoration_runs.len(), 20);
+        assert_eq!(left.decoration_runs.last().unwrap().len, 1);
+        assert_eq!(right.decoration_runs[0].len, 1);
+        assert_eq!(left.decoration_runs.last().unwrap().color, runs[20].color);
+        assert_eq!(right.decoration_runs[0].color, runs[20].color);
+        assert_eq!(left.len() + right.len(), shaped.len());
     }
 }

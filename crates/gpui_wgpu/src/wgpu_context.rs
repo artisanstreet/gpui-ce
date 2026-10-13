@@ -62,6 +62,22 @@ pub struct CompositorGpuHint {
     pub device_id: u32,
 }
 
+#[cfg(not(target_family = "wasm"))]
+type AdapterPriority = (u8, u8, u8, u8);
+
+#[cfg(not(target_family = "wasm"))]
+struct NativeBackend {
+    surface: wgpu::Surface<'static>,
+    instance: wgpu::Instance,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct NativeAdapter {
+    adapter: wgpu::Adapter,
+    backend_index: usize,
+    priority: AdapterPriority,
+}
+
 /// Extra wgpu features and limits that an application can request on top of
 /// gpui's baseline.  Pass an instance to the platform via
 /// [`gpui::App::set_gpu_requirements`] *before* opening any windows.
@@ -77,6 +93,14 @@ pub struct WgpuDeviceRequirements {
 }
 
 impl WgpuContext {
+    pub(crate) fn memory_hints() -> wgpu::MemoryHints {
+        // UI resources are smaller than game workloads. Keep allocator growth
+        // bounded; textures larger than a block still receive dedicated storage.
+        wgpu::MemoryHints::Manual {
+            suballocated_device_memory_block_size: 4 * 1024 * 1024..16 * 1024 * 1024,
+        }
+    }
+
     #[cfg(not(target_family = "wasm"))]
     pub fn new(
         instance: wgpu::Instance,
@@ -105,17 +129,7 @@ impl WgpuContext {
         reject_software: bool,
         extra_requirements: Option<&WgpuDeviceRequirements>,
     ) -> anyhow::Result<Self> {
-        let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
-            Ok(val) => parse_pci_id(&val)
-                .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
-                .log_err(),
-            Err(std::env::VarError::NotPresent) => None,
-            err => {
-                err.context("Failed to read value of `ZED_DEVICE_ID` environment variable")
-                    .log_err();
-                None
-            }
-        };
+        let device_id_filter = device_id_filter();
 
         // Select an adapter by actually testing surface configuration with the real device.
         // This is the only reliable way to determine compatibility on hybrid GPU systems.
@@ -129,6 +143,25 @@ impl WgpuContext {
                 extra_requirements,
             ))?;
 
+        Ok(Self::from_selected_device(
+            instance,
+            adapter,
+            device,
+            queue,
+            dual_source_blending,
+            color_texture_format,
+        ))
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn from_selected_device(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        dual_source_blending: bool,
+        color_texture_format: TextureFormat,
+    ) -> Self {
         let device_lost = Arc::new(AtomicBool::new(false));
         device.set_device_lost_callback({
             let device_lost = Arc::clone(&device_lost);
@@ -147,7 +180,7 @@ impl WgpuContext {
         );
 
         let backend = WgpuBackend::Native(adapter.get_info().backend);
-        Ok(Self {
+        Self {
             instance,
             adapter,
             device: Arc::new(device),
@@ -156,7 +189,165 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+        }
+    }
+
+    /// Creates a surface and context while releasing every unused backend.
+    ///
+    /// As in the renderer's existing raw-handle surface creation, the caller
+    /// keeps the native window alive until the returned surface is dropped.
+    #[cfg(not(target_family = "wasm"))]
+    pub(crate) fn prepare_for_window<W>(
+        window: &W,
+        compositor_gpu: Option<CompositorGpuHint>,
+        reject_software: bool,
+        extra_requirements: Option<&WgpuDeviceRequirements>,
+    ) -> anyhow::Result<(Self, wgpu::Surface<'static>)>
+    where
+        W: raw_window_handle::HasWindowHandle
+            + raw_window_handle::HasDisplayHandle
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let requested = native_backends(wgpu::Backends::from_env());
+        let device_id_filter = device_id_filter();
+        let gl_priority_bound = undiscovered_gl_priority(device_id_filter, compositor_gpu.as_ref());
+
+        gpui::block_on(async {
+            let mut backends = Vec::new();
+            let mut adapters = Vec::new();
+            // Match wgpu-core's stable enumeration order for equal priorities.
+            for backend in [wgpu::Backends::VULKAN, wgpu::Backends::DX12] {
+                if requested.contains(backend) {
+                    Self::discover_native_backend(
+                        window,
+                        backend,
+                        device_id_filter,
+                        compositor_gpu.as_ref(),
+                        &mut backends,
+                        &mut adapters,
+                    )
+                    .await;
+                }
+            }
+            let mut gl_pending = requested.contains(wgpu::Backends::GL);
+            loop {
+                adapters.sort_by_key(|candidate| candidate.priority);
+                if gl_pending
+                    && must_discover_gl(adapters.first().map(|c| c.priority), gl_priority_bound)
+                {
+                    gl_pending = false;
+                    Self::discover_native_backend(
+                        window,
+                        wgpu::Backends::GL,
+                        device_id_filter,
+                        compositor_gpu.as_ref(),
+                        &mut backends,
+                        &mut adapters,
+                    )
+                    .await;
+                    continue;
+                }
+                if adapters.is_empty() {
+                    anyhow::bail!("No GPU adapter found that can configure the display surface");
+                }
+                let candidate = adapters.remove(0);
+                let info = candidate.adapter.get_info();
+                if reject_software && info.device_type == wgpu::DeviceType::Cpu {
+                    log::info!(
+                        "Skipping software renderer: {} ({:?})",
+                        info.name,
+                        info.backend
+                    );
+                    continue;
+                }
+                match Self::try_adapter_with_surface(
+                    &candidate.adapter,
+                    &backends[candidate.backend_index].surface,
+                    extra_requirements,
+                )
+                .await
+                {
+                    Ok((device, queue, dual_source_blending, color_texture_format)) => {
+                        let selected = backends.swap_remove(candidate.backend_index);
+                        // Adapter handles and surfaces keep their instances alive.
+                        // Release all three before constructing renderer resources.
+                        drop(adapters);
+                        drop(backends);
+                        let context = Self::from_selected_device(
+                            selected.instance,
+                            candidate.adapter,
+                            device,
+                            queue,
+                            dual_source_blending,
+                            color_texture_format,
+                        );
+                        return Ok((context, selected.surface));
+                    }
+                    Err(error) => log::info!(
+                        "Adapter {} ({:?}) failed: {}, trying next...",
+                        info.name,
+                        info.backend,
+                        error
+                    ),
+                }
+            }
         })
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    async fn discover_native_backend<W>(
+        window: &W,
+        backend: wgpu::Backends,
+        device_id_filter: Option<u32>,
+        compositor_gpu: Option<&CompositorGpuHint>,
+        backends: &mut Vec<NativeBackend>,
+        adapters: &mut Vec<NativeAdapter>,
+    ) where
+        W: raw_window_handle::HasWindowHandle
+            + raw_window_handle::HasDisplayHandle
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + Clone
+            + 'static,
+    {
+        let instance = Self::instance_for_backends(Box::new(window.clone()), backend);
+        let surface = window
+            .window_handle()
+            .map_err(anyhow::Error::from)
+            .and_then(|handle| {
+                // The renderer retains the native window for the surface's lifetime.
+                unsafe {
+                    instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                        raw_display_handle: None,
+                        raw_window_handle: handle.as_raw(),
+                    })
+                }
+                .map_err(anyhow::Error::from)
+            });
+        let surface = match surface {
+            Ok(surface) => surface,
+            Err(error) => {
+                log::info!("Backend {backend:?} could not create a surface: {error}");
+                return;
+            }
+        };
+        let backend_index = backends.len();
+        let discovered = instance.enumerate_adapters(backend).await;
+        for adapter in discovered {
+            let info = adapter.get_info();
+            log::info!("Found adapter {} ({:?})", info.name, info.backend);
+            adapters.push(NativeAdapter {
+                priority: adapter_priority(&info, device_id_filter, compositor_gpu),
+                adapter,
+                backend_index,
+            });
+        }
+        backends.push(NativeBackend { surface, instance });
     }
 
     #[cfg(target_family = "wasm")]
@@ -296,7 +487,7 @@ impl WgpuContext {
                 label: Some("gpui_device"),
                 required_features,
                 required_limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
+                memory_hints: Self::memory_hints(),
                 trace: wgpu::Trace::Off,
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
@@ -313,11 +504,14 @@ impl WgpuContext {
 
     #[cfg(not(target_family = "wasm"))]
     pub fn instance(display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>) -> wgpu::Instance {
-        #[cfg(not(target_os = "windows"))]
-        let backends = wgpu::Backends::VULKAN | wgpu::Backends::GL;
-        #[cfg(target_os = "windows")]
-        let backends = wgpu::Backends::DX12;
+        Self::instance_for_backends(display, native_backends(wgpu::Backends::from_env()))
+    }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn instance_for_backends(
+        display: Box<dyn wgpu::wgt::WgpuHasDisplayHandle>,
+        backends: wgpu::Backends,
+    ) -> wgpu::Instance {
         wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
             flags: wgpu::InstanceFlags::default(),
@@ -380,51 +574,7 @@ impl WgpuContext {
         //    "Other" ranks above "Virtual" because OpenGL seems to count as "Other".
         // 4. Backend — prefer Vulkan/Metal/Dx12 over GL/etc.
         adapters.sort_by_key(|adapter| {
-            let info = adapter.get_info();
-
-            // Backends like OpenGL report device=0 for all adapters, so
-            // device-based matching is only meaningful when non-zero.
-            let device_known = info.device != 0;
-
-            let user_override: u8 = match device_id_filter {
-                Some(id) if device_known && info.device == id => 0,
-                _ => 1,
-            };
-
-            let compositor_match: u8 = match compositor_gpu {
-                Some(hint)
-                    if device_known
-                        && info.vendor == hint.vendor_id
-                        && info.device == hint.device_id =>
-                {
-                    0
-                }
-                _ => 1,
-            };
-
-            let type_priority: u8 = if info.device_type == wgpu::DeviceType::Cpu {
-                4
-            } else {
-                match info.device_type {
-                    wgpu::DeviceType::DiscreteGpu => 0,
-                    wgpu::DeviceType::IntegratedGpu => 1,
-                    wgpu::DeviceType::Other => 2,
-                    wgpu::DeviceType::VirtualGpu => 3,
-                    wgpu::DeviceType::Cpu => 4,
-                }
-            };
-
-            let backend_priority: u8 = match info.backend {
-                wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => 0,
-                _ => 1,
-            };
-
-            (
-                user_override,
-                compositor_match,
-                type_priority,
-                backend_priority,
-            )
+            adapter_priority(&adapter.get_info(), device_id_filter, compositor_gpu)
         });
 
         // Log all available adapters (in sorted order)
@@ -598,6 +748,92 @@ impl WgpuContext {
 }
 
 #[cfg(not(target_family = "wasm"))]
+fn native_backends(requested: Option<wgpu::Backends>) -> wgpu::Backends {
+    #[cfg(not(target_os = "windows"))]
+    let defaults = wgpu::Backends::VULKAN | wgpu::Backends::GL;
+    #[cfg(target_os = "windows")]
+    let defaults = wgpu::Backends::DX12;
+    #[cfg(not(target_os = "windows"))]
+    let supported = defaults;
+    #[cfg(target_os = "windows")]
+    let supported = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
+    requested
+        .map(|backends| backends & supported)
+        .filter(|backends| !backends.is_empty())
+        .unwrap_or(defaults)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn device_id_filter() -> Option<u32> {
+    match std::env::var("ZED_DEVICE_ID") {
+        Ok(value) => parse_pci_id(&value)
+            .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
+            .log_err(),
+        Err(std::env::VarError::NotPresent) => None,
+        error => {
+            error
+                .context("Failed to read value of `ZED_DEVICE_ID` environment variable")
+                .log_err();
+            None
+        }
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn adapter_priority(
+    info: &wgpu::AdapterInfo,
+    device_id_filter: Option<u32>,
+    compositor_gpu: Option<&CompositorGpuHint>,
+) -> AdapterPriority {
+    let device_known = info.device != 0;
+    let user_override = match device_id_filter {
+        Some(id) if device_known && info.device == id => 0,
+        _ => 1,
+    };
+    let compositor_match = match compositor_gpu {
+        Some(hint)
+            if device_known && info.vendor == hint.vendor_id && info.device == hint.device_id =>
+        {
+            0
+        }
+        _ => 1,
+    };
+    let device_type = match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => 0,
+        wgpu::DeviceType::IntegratedGpu => 1,
+        wgpu::DeviceType::Other => 2,
+        wgpu::DeviceType::VirtualGpu => 3,
+        wgpu::DeviceType::Cpu => 4,
+    };
+    let backend = match info.backend {
+        wgpu::Backend::Vulkan | wgpu::Backend::Metal | wgpu::Backend::Dx12 => 0,
+        _ => 1,
+    };
+    (user_override, compositor_match, device_type, backend)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn undiscovered_gl_priority(
+    device_id_filter: Option<u32>,
+    compositor_gpu: Option<&CompositorGpuHint>,
+) -> AdapterPriority {
+    // Conservatively allow an undiscovered GL adapter to match every requested
+    // GPU and be discrete. Today's wgpu GL reports device=0 and infers only
+    // Integrated/Other/CPU, but correctness must not depend on those details.
+    (
+        u8::from(device_id_filter.is_none()),
+        u8::from(compositor_gpu.is_none()),
+        0,
+        1,
+    )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn must_discover_gl(best_known: Option<AdapterPriority>, gl_bound: AdapterPriority) -> bool {
+    best_known.is_none_or(|priority| priority > gl_bound)
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     let mut id = id.trim();
 
@@ -614,9 +850,144 @@ fn parse_pci_id(id: &str) -> anyhow::Result<u32> {
     u32::from_str_radix(id, 16).context("parsing PCI ID as hex")
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
-    use super::parse_pci_id;
+    use super::*;
+
+    fn adapter_info(
+        backend: wgpu::Backend,
+        device_type: wgpu::DeviceType,
+        vendor: u32,
+        device: u32,
+    ) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: "selection fixture".into(),
+            vendor,
+            device,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend,
+            subgroup_min_size: 4,
+            subgroup_max_size: 128,
+            transient_saves_memory: false,
+        }
+    }
+
+    #[test]
+    fn lazy_gl_discovery_preserves_hardware_priority_and_failed_adapter_fallback() {
+        use wgpu::{Backend::*, DeviceType::*};
+        let discrete = adapter_priority(&adapter_info(Vulkan, DiscreteGpu, 1, 7), None, None);
+        let software = adapter_priority(&adapter_info(Vulkan, Cpu, 1, 8), None, None);
+        let gl_hardware = adapter_priority(&adapter_info(Gl, IntegratedGpu, 1, 0), None, None);
+        let gl_software = adapter_priority(&adapter_info(Gl, Cpu, 1, 0), None, None);
+        let bound = undiscovered_gl_priority(None, None);
+
+        assert!(!must_discover_gl(Some(discrete), bound));
+        // If the discrete device cannot configure the surface, the next known
+        // candidate is software. Discover GL before attempting that candidate.
+        assert!(must_discover_gl(Some(software), bound));
+        assert!(must_discover_gl(None, bound));
+        assert!(gl_hardware < software);
+        assert!(software < gl_software);
+        // Remain conservative even though current wgpu GL never reports Discrete.
+        let integrated = adapter_priority(&adapter_info(Vulkan, IntegratedGpu, 1, 9), None, None);
+        assert!(must_discover_gl(Some(integrated), bound));
+    }
+
+    #[test]
+    fn adapter_priority_preserves_explicit_and_compositor_gpu_choices() {
+        use wgpu::{Backend::*, DeviceType::*};
+        let discrete = adapter_info(Vulkan, DiscreteGpu, 1, 7);
+        let software = adapter_info(Vulkan, Cpu, 1, 8);
+        let compositor = CompositorGpuHint {
+            vendor_id: 1,
+            device_id: 8,
+        };
+        assert!(
+            adapter_priority(&software, Some(8), None) < adapter_priority(&discrete, Some(8), None)
+        );
+        assert!(
+            adapter_priority(&software, None, Some(&compositor))
+                < adapter_priority(&discrete, None, Some(&compositor))
+        );
+        // An explicit user choice takes precedence over the compositor hint.
+        assert!(
+            adapter_priority(&discrete, Some(7), Some(&compositor))
+                < adapter_priority(&software, Some(7), Some(&compositor))
+        );
+        let unknown_gl = adapter_info(Gl, IntegratedGpu, 1, 0);
+        assert_eq!(adapter_priority(&unknown_gl, Some(0), None).0, 1);
+    }
+
+    #[test]
+    fn undiscovered_gl_bound_covers_all_device_types_and_gpu_matches() {
+        use wgpu::{Backend::*, DeviceType::*};
+        let types = [DiscreteGpu, IntegratedGpu, Other, VirtualGpu, Cpu];
+        let compositor = CompositorGpuHint {
+            vendor_id: 1,
+            device_id: 7,
+        };
+        for filter in [None, Some(0), Some(7), Some(9)] {
+            for hint in [None, Some(&compositor)] {
+                let bound = undiscovered_gl_priority(filter, hint);
+                for device_type in types {
+                    for vendor in [0, 1, 2] {
+                        for device in [0, 7, 9] {
+                            let gl = adapter_priority(
+                                &adapter_info(Gl, device_type, vendor, device),
+                                filter,
+                                hint,
+                            );
+                            assert!(bound <= gl);
+                            for native_type in types {
+                                let native = adapter_priority(
+                                    &adapter_info(Vulkan, native_type, vendor, device),
+                                    filter,
+                                    hint,
+                                );
+                                if !must_discover_gl(Some(native), bound) {
+                                    assert!(native <= gl);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_backend_requests_keep_existing_supported_filtering() {
+        use wgpu::Backends;
+        assert_eq!(native_backends(Some(Backends::VULKAN)), Backends::VULKAN);
+        assert_eq!(
+            native_backends(Some(Backends::VULKAN | Backends::METAL)),
+            Backends::VULKAN
+        );
+        assert_eq!(
+            native_backends(Some(Backends::METAL)),
+            native_backends(None)
+        );
+        assert_eq!(
+            native_backends(Some(Backends::empty())),
+            native_backends(None)
+        );
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(native_backends(Some(Backends::GL)), Backends::GL);
+            assert_eq!(native_backends(None), Backends::VULKAN | Backends::GL);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(native_backends(None), Backends::DX12);
+            assert_eq!(
+                native_backends(Some(Backends::VULKAN | Backends::DX12)),
+                Backends::VULKAN | Backends::DX12
+            );
+        }
+    }
 
     #[test]
     fn test_parse_device_id() {

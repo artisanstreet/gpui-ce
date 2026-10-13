@@ -12,7 +12,6 @@ use std::{
 
 use calloop::ping::Ping;
 use collections::{FxHashMap, HashMap};
-use filedescriptor::FileDescriptor;
 use futures::channel::oneshot::Receiver;
 
 use image::{ImageBuffer, Rgba, imageops::FilterType};
@@ -138,7 +137,6 @@ pub struct WaylandWindowState {
     client_inset: Option<Pixels>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
     icon: Option<Arc<ImageBuffer<Rgba<u8>, Vec<u8>>>>,
-    generated_icons: Vec<FileDescriptor>,
 }
 
 pub enum WaylandSurfaceState {
@@ -616,7 +614,6 @@ impl WaylandWindowState {
             surface,
             app_id: options.app_id,
             icon: options.icon,
-            generated_icons: Vec::default(),
             blur: None,
             viewport,
             globals,
@@ -1636,13 +1633,21 @@ impl WaylandWindowStatePtr {
                     .set_len(u64::try_from(buffer_len).ok()?)
                     .ok()?;
 
-                let mut fd = FileDescriptor::new(mem);
+                let image = image::imageops::resize(
+                    &squared,
+                    size as u32,
+                    size as u32,
+                    FilterType::CatmullRom,
+                )
+                .into_raw_bgra();
+                mem.as_file().write_all(&image).ok()?;
 
-                let pool =
-                    state
-                        .globals
-                        .shm
-                        .create_pool(fd.as_fd(), buffer_len, &state.globals.qh, ());
+                let pool = state.globals.shm.create_pool(
+                    mem.as_file().as_fd(),
+                    buffer_len,
+                    &state.globals.qh,
+                    (),
+                );
 
                 let buffer = pool.create_buffer(
                     0,
@@ -1654,28 +1659,25 @@ impl WaylandWindowStatePtr {
                     (),
                 );
 
-                let image = image::imageops::resize(
-                    &squared,
-                    size as u32,
-                    size as u32,
-                    FilterType::CatmullRom,
-                )
-                .into_raw_bgra();
-
-                fd.write_all(&image).unwrap();
-
-                Some((buffer, fd))
+                // The buffer retains the pool's backing storage. Neither the
+                // protocol pool object nor our file descriptor needs to survive.
+                pool.destroy();
+                Some(buffer)
             })
             .collect();
 
         let icon = icon_manager.create_icon(&state.globals.qh, ());
         icon.set_name(state.app_id.clone().unwrap_or_default());
-        state.generated_icons = Vec::new();
-        for (ref buffer, fd) in icons {
+        for buffer in &icons {
             icon.add_buffer(buffer, 1);
-            state.generated_icons.push(fd)
         }
         icon_manager.set_icon(state.surface_state.toplevel().unwrap(), Some(&icon));
+        // set_icon copies the icon state. Its buffers must outlive the icon
+        // object, but all three kinds of protocol object can now be released.
+        icon.destroy();
+        for buffer in icons {
+            buffer.destroy();
+        }
     }
 }
 

@@ -18,11 +18,12 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 #[cfg(not(feature = "wgpu"))]
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
+#[cfg(not(feature = "wgpu"))]
+use windows::Win32::Graphics::Gdi::*;
 use windows::{
     UI::ViewManagement::UISettings,
     Win32::{
         Foundation::*,
-        Graphics::Gdi::*,
         Security::Credentials::*,
         System::{Com::*, LibraryLoader::*, Ole::*, Power::*, SystemInformation::*},
         UI::{Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
@@ -612,12 +613,9 @@ impl Platform for WindowsPlatform {
         self.raw_window_handles.write().push(handle.into());
         #[cfg(feature = "wgpu")]
         if !self.headless {
-            crate::monitor_vsync::start(
-                handle.into(),
-                &window.state.frame_ready,
-                Arc::clone(&window.state.vsync_enabled),
-            )?;
-            window.state.frame_paced.set(true);
+            let clock =
+                crate::monitor_vsync::start(handle.into(), Arc::clone(&window.state.frame_ready))?;
+            *window.state.frame_clock.borrow_mut() = Some(clock);
         }
 
         Ok(Box::new(window))

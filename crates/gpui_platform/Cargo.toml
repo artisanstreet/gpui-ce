@@ -20,6 +20,7 @@ test-support = [
   "gpui/test-support",
   "gpui_macos/test-support",
   "gpui_windows/test-support",
+  "gpui_linux/test-support",
 ]
 screen-capture = [
   "gpui/screen-capture",

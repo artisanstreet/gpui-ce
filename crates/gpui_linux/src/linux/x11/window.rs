@@ -1,4 +1,5 @@
 use anyhow::{Context as _, anyhow};
+use calloop::ping::Ping;
 use x11rb::connection::RequestConnection;
 
 use crate::linux::X11ClientStatePtr;
@@ -32,7 +33,9 @@ use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
 };
 
-use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
+use super::{
+    X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES, frame_schedule::FrameSchedule,
+};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -300,6 +303,8 @@ pub(crate) struct X11WindowStatePtr {
     pub(crate) callbacks: Rc<RefCell<Callbacks>>,
     xcb: Rc<XCBConnection>,
     pub(crate) x_window: xproto::Window,
+    pub(crate) frame_schedule: Rc<FrameSchedule>,
+    frame_ping: Ping,
 }
 
 impl rwh::HasWindowHandle for RawWindow {
@@ -921,6 +926,7 @@ impl X11Window {
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
+        frame_ping: Ping,
         executor: ForegroundExecutor,
         gpu_context: gpui_wgpu::GpuContext,
         compositor_gpu: Option<CompositorGpuHint>,
@@ -960,6 +966,8 @@ impl X11Window {
             callbacks: Rc::new(RefCell::new(Callbacks::default())),
             xcb: xcb.clone(),
             x_window,
+            frame_schedule: Rc::new(FrameSchedule::default()),
+            frame_ping,
         };
 
         let state = ptr.state.borrow_mut();
@@ -1051,6 +1059,12 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    pub(crate) fn request_frame(&self) {
+        if self.frame_schedule.request() {
+            self.frame_ping.ping();
+        }
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1684,6 +1698,20 @@ impl PlatformWindow for X11Window {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        let schedule = self.0.frame_schedule.clone();
+        let ping = self.0.frame_ping.clone();
+        Some(Rc::new(move || {
+            if schedule.request() {
+                ping.ping();
+            }
+        }))
+    }
+
+    fn schedule_frame(&self) {
+        self.0.request_frame();
+    }
+
     fn on_input(&self, callback: Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>) {
         self.0.callbacks.borrow_mut().input = Some(callback);
     }
@@ -1743,6 +1771,7 @@ impl PlatformWindow for X11Window {
             }
 
             inner.force_render_after_recovery = true;
+            self.0.request_frame();
             return;
         }
 
@@ -1750,7 +1779,20 @@ impl PlatformWindow for X11Window {
 
         if inner.renderer.needs_redraw() {
             inner.force_render_after_recovery = true;
+            self.0.request_frame();
         }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let captured = self
+            .0
+            .state
+            .borrow_mut()
+            .renderer
+            .render_to_rgba_image(scene)?;
+        image::RgbaImage::from_raw(captured.width, captured.height, captured.rgba)
+            .context("Failed to build RgbaImage from wgpu fixture readback")
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

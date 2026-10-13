@@ -1,4 +1,4 @@
-#[cfg(feature = "profiler")]
+#[cfg(feature = "frame-rate")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
 use crate::Inspector;
@@ -1223,7 +1223,7 @@ pub struct Window {
     frame_retry: Option<Task<()>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
-    #[cfg(feature = "profiler")]
+    #[cfg(feature = "frame-rate")]
     debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay,
     pub(crate) a11y: A11y,
 }
@@ -1341,6 +1341,15 @@ fn default_bounds(display_id: Option<DisplayId>, cx: &mut App) -> WindowBounds {
         (false, false) => display_bounds.origin,
     };
     window_bounds_ctor(Bounds::new(final_origin, base_size))
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        // Native window state can outlive this Window while platform teardown
+        // runs asynchronously. Its focused input handler owns an entity, so
+        // release it now rather than retaining it past App shutdown.
+        drop(self.platform_window.take_input_handler());
+    }
 }
 
 impl Window {
@@ -1664,7 +1673,7 @@ impl Window {
                         // A final animation callback can finish without drawing.
                         // End its cadence sample here too, or the next animation
                         // includes the intervening idle gap in its FPS readout.
-                        #[cfg(feature = "profiler")]
+                        #[cfg(feature = "frame-rate")]
                         window
                             .debug_frame_overlay
                             .set_frame_demand(!window.next_frame_callbacks.borrow().is_empty());
@@ -1920,7 +1929,7 @@ impl Window {
             frame_retry: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
-            #[cfg(feature = "profiler")]
+            #[cfg(feature = "frame-rate")]
             debug_frame_overlay: crate::debug_overlay::DebugFrameOverlay::new(),
             a11y: A11y::new(
                 a11y_active_flag,
@@ -2960,6 +2969,8 @@ impl Window {
     /// the contents of the new [`Scene`], use [`Self::present`].
     #[profiling::function]
     pub fn draw(&mut self, cx: &mut App) -> ArenaClearNeeded {
+        #[cfg(all(feature = "frame-rate", not(feature = "profiler")))]
+        let draw_start = Instant::now();
         // Drain every draw in profiler builds so a previous frame's
         // first-invalidation timestamp can't be attributed to this one.
         #[cfg(feature = "profiler")]
@@ -2996,7 +3007,7 @@ impl Window {
         }
         if !cx.mode.skip_drawing() {
             self.draw_roots(cx);
-            #[cfg(feature = "profiler")]
+            #[cfg(feature = "frame-rate")]
             {
                 let viewport_size = self.viewport_size;
                 let scale_factor = self.scale_factor();
@@ -3108,6 +3119,8 @@ impl Window {
                 .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
             self.debug_frame_overlay.record_draw(draw_duration);
         }
+        #[cfg(all(feature = "frame-rate", not(feature = "profiler")))]
+        self.debug_frame_overlay.record_draw(draw_start.elapsed());
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
@@ -3143,7 +3156,7 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.platform_window.draw(&self.rendered_frame.scene);
-        #[cfg(feature = "profiler")]
+        #[cfg(feature = "frame-rate")]
         self.debug_frame_overlay.record_present();
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3161,7 +3174,7 @@ impl Window {
     /// Benchmarks drive drawing synchronously rather than through a platform
     /// frame-request loop, so they call this after each measured update to
     /// submit the frame like production presentation would.
-    #[cfg(any(feature = "bench-support", all(test, feature = "profiler")))]
+    #[cfg(any(feature = "bench-support", all(test, feature = "frame-rate")))]
     pub fn present_if_needed(&mut self) {
         if self.needs_present.get() {
             self.present();
@@ -3181,13 +3194,13 @@ impl Window {
     }
 
     /// Returns the current mode of the debug frame overlay.
-    #[cfg(feature = "profiler")]
+    #[cfg(feature = "frame-rate")]
     pub fn debug_frame_overlay_mode(&self) -> DebugFrameOverlayMode {
         self.debug_frame_overlay.mode()
     }
 
     /// Sets the mode of the debug frame overlay and schedules a redraw.
-    #[cfg(feature = "profiler")]
+    #[cfg(feature = "frame-rate")]
     pub fn set_debug_frame_overlay_mode(&mut self, mode: DebugFrameOverlayMode) {
         self.debug_frame_overlay.set_mode(mode);
         self.refresh();
@@ -3195,14 +3208,14 @@ impl Window {
 
     /// Advances the debug frame overlay through its hidden, frame-time-only,
     /// and detailed modes.
-    #[cfg(feature = "profiler")]
+    #[cfg(feature = "frame-rate")]
     pub fn cycle_debug_frame_overlay_mode(&mut self) {
         self.set_debug_frame_overlay_mode(self.debug_frame_overlay.mode().next());
     }
 
     /// Clears the debug frame overlay's frame-time statistics, except for the
     /// total frame count, and schedules a redraw.
-    #[cfg(feature = "profiler")]
+    #[cfg(feature = "frame-rate")]
     pub fn reset_debug_frame_overlay_stats(&mut self) {
         self.debug_frame_overlay.reset_stats();
         self.refresh();
@@ -7658,7 +7671,7 @@ mod tests {
     }
 
     #[gpui::test]
-    #[cfg(feature = "profiler")]
+    #[cfg(feature = "frame-rate")]
     fn callback_finishing_without_a_draw_ends_the_fps_sample(cx: &mut TestAppContext) {
         struct Animation;
         impl Render for Animation {

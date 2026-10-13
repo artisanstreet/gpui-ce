@@ -161,9 +161,21 @@ fn paint(mesh: &Arc<Mesh>, edges: f32) -> PaintMesh {
 
 /// Renders `paints` through the mesh pass and composite; RGBA rows.
 fn render(device: &wgpu::Device, queue: &wgpu::Queue, paints: &[PaintMesh]) -> Result<Vec<u8>> {
+    render_with_scratch_mode(device, queue, paints, true)
+}
+
+fn render_with_scratch_mode(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    paints: &[PaintMesh],
+    shared: bool,
+) -> Result<Vec<u8>> {
     let layouts = WgpuRenderer::create_bind_group_layouts(device, false);
     let format = wgpu::TextureFormat::Rgba8Unorm;
-    let mut meshes = MeshRenderer::new(device, &layouts.globals, format);
+    // Separate renderers give each mesh independent color/depth scratch storage.
+    let mut renderers: Vec<_> = (0..if shared { 1 } else { paints.len() })
+        .map(|_| MeshRenderer::new(device, &layouts.globals, format))
+        .collect();
     let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh globals"),
         contents: bytemuck::bytes_of(&GlobalParams {
@@ -220,7 +232,13 @@ fn render(device: &wgpu::Device, queue: &wgpu::Queue, paints: &[PaintMesh]) -> R
         mapped_at_creation: false,
     });
     let mut encoder = device.create_command_encoder(&Default::default());
-    meshes.prepare(device, queue, &mut encoder, paints);
+    if shared {
+        renderers[0].prepare(device, queue, &mut encoder, paints);
+    } else {
+        for (renderer, paint) in renderers.iter_mut().zip(paints) {
+            renderer.prepare(device, queue, &mut encoder, std::slice::from_ref(paint));
+        }
+    }
     let view = texture.create_view(&Default::default());
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -236,7 +254,13 @@ fn render(device: &wgpu::Device, queue: &wgpu::Queue, paints: &[PaintMesh]) -> R
             })],
             ..Default::default()
         });
-        meshes.composite(0..paints.len(), &globals_group, &mut pass);
+        if shared {
+            renderers[0].composite(0..paints.len(), &globals_group, &mut pass);
+        } else {
+            for renderer in &renderers {
+                renderer.composite(0..1, &globals_group, &mut pass);
+            }
+        }
     }
     encoder.copy_texture_to_buffer(
         texture.as_image_copy(),
@@ -280,8 +304,97 @@ fn render(device: &wgpu::Device, queue: &wgpu::Queue, paints: &[PaintMesh]) -> R
 }
 
 #[test]
+fn shared_mesh_scratch_preserves_depth_transparency_and_composite_order() -> Result<()> {
+    let (device, queue) = device()?;
+    let mut first = paint(&Arc::new(cube()), 0.0);
+    first.bounds.origin = point(ScaledPixels(4.0), ScaledPixels(8.0));
+    let mut second = paint(&Arc::new(cube()), 1.0);
+    second.bounds.origin = point(ScaledPixels(28.0), ScaledPixels(24.0));
+    second.opacity = 0.6;
+    second.style.view = multiply(
+        translation(0.0, 0.0, -3.8),
+        multiply(rotation_x(-30.0), rotation_y(-50.0)),
+    );
+    second.style.base_color = [0.1, 0.8, 0.2];
+    let mut paints = [first, second];
+    let forward = render_with_scratch_mode(&device, &queue, &paints, true)?;
+    assert_eq!(
+        forward,
+        render_with_scratch_mode(&device, &queue, &paints, false)?
+    );
+    paints.reverse();
+    let reverse = render_with_scratch_mode(&device, &queue, &paints, true)?;
+    assert_eq!(
+        reverse,
+        render_with_scratch_mode(&device, &queue, &paints, false)?
+    );
+    assert_ne!(
+        forward, reverse,
+        "the fixture must exercise overlapping composites"
+    );
+    Ok(())
+}
+
+#[test]
+fn mesh_scratch_tracks_current_sizes_and_releases_while_commands_are_pending() -> Result<()> {
+    let (device, queue) = device()?;
+    let layouts = WgpuRenderer::create_bind_group_layouts(&device, false);
+    let mut renderer =
+        MeshRenderer::new(&device, &layouts.globals, wgpu::TextureFormat::Rgba8Unorm);
+    let first = paint(&Arc::new(cube()), 0.0);
+    let second = paint(&Arc::new(cube()), 1.0);
+    let mut paints = [first, second];
+    let mut prepare = |paints: &[PaintMesh]| {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.prepare(&device, &queue, &mut encoder, paints);
+        let commands = encoder.finish();
+        let stats = renderer.memory_stats();
+        (commands, stats)
+    };
+    let (first_commands, stats) = prepare(&paints);
+    assert_eq!(stats.targets, 2);
+    assert_eq!(stats.scratch_targets, 1);
+    assert_eq!(stats.target_bytes, 96 * 64 * (32 + 4 * 2));
+
+    paints[1].bounds.size = size(ScaledPixels(48.0), ScaledPixels(32.0));
+    let (mixed_commands, stats) = prepare(&paints);
+    assert_eq!(stats.scratch_targets, 2);
+    assert_eq!(stats.target_bytes, (96 * 64 + 48 * 32) * 36);
+    let (small_commands, stats) = prepare(&paints[1..]);
+    assert_eq!(stats.targets, 1);
+    assert_eq!(stats.scratch_targets, 1);
+    assert_eq!(stats.target_bytes, 48 * 32 * 36);
+    let (empty_commands, stats) = prepare(&[]);
+    assert_eq!(stats.target_bytes, 0);
+    let (reopened_commands, stats) = prepare(&paints);
+    assert_eq!(stats.scratch_targets, 2);
+    renderer.clear();
+    assert_eq!(renderer.memory_stats().target_bytes, 0);
+
+    // The encoded work still owns every old attachment after pool removal.
+    let submission = queue.submit([
+        first_commands,
+        mixed_commands,
+        small_commands,
+        empty_commands,
+        reopened_commands,
+    ]);
+    device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        timeout: Some(Duration::from_secs(10)),
+    })?;
+    Ok(())
+}
+
+#[test]
 fn meshes_draw_lit_on_a_transparent_rounded_viewport() -> Result<()> {
     let (device, queue) = device()?;
+    let empty = render(
+        &device,
+        &queue,
+        &[paint(&Arc::new(Mesh::new(Vec::new())), 0.0)],
+    )?;
+    assert!(empty.iter().all(|channel| *channel == 0));
     let mesh = Arc::new(cube());
     let pixels = render(&device, &queue, &[paint(&mesh, 0.0)])?;
     let pixel = |x: u32, y: u32| {

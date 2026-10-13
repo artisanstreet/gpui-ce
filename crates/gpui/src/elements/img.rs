@@ -210,10 +210,10 @@ pub fn img(source: impl Into<ImageSource>) -> Img {
 impl Img {
     /// A list of all format extensions currently supported by this img element
     pub fn extensions() -> &'static [&'static str] {
-        // This is the list in [image::ImageFormat::from_extension] + `svg`
+        // Keep this aligned with the image codecs enabled by the workspace.
         &[
-            "avif", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "dds", "bmp", "ico",
-            "hdr", "exr", "pbm", "pam", "ppm", "pgm", "ff", "farbfeld", "qoi", "svg",
+            "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "bmp", "ico", "pbm", "pam", "ppm",
+            "pgm", "svg",
         ]
     }
 

@@ -44,7 +44,10 @@ struct CosmicTextSystemState {
     font_system: FontSystem,
     scratch: ShapeBuffer,
     swash_scale_context: ScaleContext,
-    pending_glyph_images: HashMap<RenderGlyphParams, swash::scale::image::Image>,
+    /// Bounds lookup rasterizes once, then glyph painting consumes these bytes.
+    /// Keep only the latest image: bounds-only callers and atlas cache hits may
+    /// never request its pixels. Interleaved requests can rerasterize on a miss.
+    pending_glyph_image: Option<(RenderGlyphParams, swash::scale::image::Image)>,
     /// Contains all already loaded fonts, including all faces. Indexed by `FontId`.
     loaded_fonts: Vec<LoadedFont>,
     /// Caches the `FontId`s associated with a specific family to avoid iterating the font database
@@ -107,7 +110,7 @@ impl CosmicTextSystem {
             font_system,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
+            pending_glyph_image: None,
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
@@ -127,7 +130,7 @@ impl CosmicTextSystem {
             font_system,
             scratch: ShapeBuffer::default(),
             swash_scale_context: ScaleContext::new(),
-            pending_glyph_images: HashMap::default(),
+            pending_glyph_image: None,
             loaded_fonts: Vec::new(),
             font_ids_by_family_cache: HashMap::default(),
             system_font_fallback: system_font_fallback.to_string(),
@@ -426,11 +429,7 @@ impl CosmicTextSystemState {
         }
         let mut chain: Vec<(FontId, SharedString)> = Vec::new();
         for family in EMOJI_FALLBACK_FAMILIES {
-            let key = FontKey::new(
-                SharedString::from(*family),
-                FontFeatures::default(),
-                None,
-            );
+            let key = FontKey::new(SharedString::from(*family), FontFeatures::default(), None);
             let ids = if let Some(cached) = self.font_ids_by_family_cache.get(&key) {
                 cached.clone()
             } else {
@@ -439,8 +438,7 @@ impl CosmicTextSystemState {
                 else {
                     continue;
                 };
-                self.font_ids_by_family_cache
-                    .insert(key, loaded.clone());
+                self.font_ids_by_family_cache.insert(key, loaded.clone());
                 loaded
             };
             let Some(&id) = ids.first() else {
@@ -498,9 +496,7 @@ impl CosmicTextSystemState {
             origin: point(image.placement.left.into(), (-image.placement.top).into()),
             size: size(image.placement.width.into(), image.placement.height.into()),
         };
-        if !bounds.is_zero() {
-            self.pending_glyph_images.insert(params.clone(), image);
-        }
+        self.pending_glyph_image = (!bounds.is_zero()).then(|| (params.clone(), image));
         Ok(bounds)
     }
 
@@ -514,8 +510,11 @@ impl CosmicTextSystemState {
             anyhow::bail!("glyph bounds are empty");
         }
 
-        let mut image = match self.pending_glyph_images.remove(params) {
-            Some(image) => image,
+        let mut image = match self
+            .pending_glyph_image
+            .take_if(|(pending_params, _)| pending_params == params)
+        {
+            Some((_, image)) => image,
             None => self.render_glyph_image(params)?,
         };
         let bitmap_size = glyph_bounds.size;
@@ -739,6 +738,21 @@ impl CosmicTextSystemState {
                 .letter_spacing
                 .map(|spacing| spacing.as_f32() / font_size.as_f32());
 
+            let mut primary_attrs =
+                properties.attributes(run.font_id, &properties.primary_family_name);
+            if let Some(letter_spacing) = letter_spacing {
+                primary_attrs = primary_attrs.letter_spacing(letter_spacing);
+            }
+
+            // Both fallback selectors keep ASCII in the primary face. Avoid
+            // loading emoji fonts and walking graphemes for ordinary UI/code
+            // text; cosmic still performs full shaping, including ligatures.
+            if text[offs..run_end].is_ascii() {
+                attrs_list.add_span(offs..run_end, &primary_attrs);
+                offs = run_end;
+                continue;
+            }
+
             // Resolve the effective chain: the run's explicit user chain
             // when set, otherwise the synthesized native-first emoji
             // chain. Span slots index into this chain, so all attribute
@@ -753,11 +767,6 @@ impl CosmicTextSystemState {
 
             // build one `Attrs` per slot up front. each clone of span attrs
             // would otherwise re-allocate the `font_features` Vec.
-            let mut primary_attrs =
-                properties.attributes(run.font_id, &properties.primary_family_name);
-            if let Some(letter_spacing) = letter_spacing {
-                primary_attrs = primary_attrs.letter_spacing(letter_spacing);
-            }
             let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = chain
                 .iter()
                 .map(|(font_id, family_name)| {
@@ -772,14 +781,7 @@ impl CosmicTextSystemState {
             let spans = if chain.is_empty() {
                 let loaded_fonts = &self.loaded_fonts;
                 let covers = |id: FontId, ch: char| charmap_covers(loaded_fonts, id, ch);
-                compute_run_spans(
-                    text,
-                    offs,
-                    run.len,
-                    run.font_id,
-                    chain,
-                    &covers,
-                )
+                compute_run_spans(text, offs, run.len, run.font_id, chain, &covers)
             } else {
                 let CosmicTextSystemState {
                     loaded_fonts,
@@ -1423,7 +1425,11 @@ fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // wherever they cover a cluster.
     matches!(
         postscript_name,
-        "NotoColorEmoji" | "SegoeUIEmoji" | "AppleColorEmoji" | ".AppleColorEmojiUI" | "TwemojiMozilla"
+        "NotoColorEmoji"
+            | "SegoeUIEmoji"
+            | "AppleColorEmoji"
+            | ".AppleColorEmojiUI"
+            | "TwemojiMozilla"
     )
 }
 
@@ -1473,6 +1479,98 @@ mod tests {
             letter_spacing: None,
         }];
         Ok(text_system.layout_line(text, gpui::px(14.0), &runs))
+    }
+
+    fn glyph_params(
+        text_system: &CosmicTextSystem,
+        character: char,
+        subpixel_rendering: bool,
+    ) -> Result<RenderGlyphParams> {
+        let font_id = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        Ok(RenderGlyphParams {
+            font_id,
+            glyph_id: text_system
+                .glyph_for_char(font_id, character)
+                .context("fixture font must contain the test glyph")?,
+            font_size: gpui::px(17.0),
+            subpixel_variant: point(1u8, 0u8),
+            scale_factor: 1.5,
+            is_emoji: false,
+            subpixel_rendering,
+            dilation: 0,
+        })
+    }
+
+    #[test]
+    fn pending_glyph_image_is_consumed_without_changing_pixels() -> Result<()> {
+        let text_system = text_system()?;
+        for subpixel_rendering in [false, true] {
+            let params = glyph_params(&text_system, 'R', subpixel_rendering)?;
+            let bounds = text_system.glyph_raster_bounds(&params)?;
+            assert!(!bounds.is_zero());
+            assert_eq!(
+                text_system
+                    .0
+                    .read()
+                    .pending_glyph_image
+                    .as_ref()
+                    .map(|(params, _)| params),
+                Some(&params)
+            );
+
+            let cached = text_system.rasterize_glyph(&params, bounds)?;
+            assert!(text_system.0.read().pending_glyph_image.is_none());
+            assert!(!cached.1.is_empty());
+            let rerasterized = text_system.rasterize_glyph(&params, bounds)?;
+            assert_eq!(cached, rerasterized);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn interleaved_glyph_bounds_keep_only_latest_image_and_rerasterize_displaced_glyph()
+    -> Result<()> {
+        let text_system = text_system()?;
+        for subpixel_rendering in [false, true] {
+            let first = glyph_params(&text_system, 'A', subpixel_rendering)?;
+            let second = glyph_params(&text_system, 'B', subpixel_rendering)?;
+            let first_bounds = text_system.glyph_raster_bounds(&first)?;
+            let expected_first = text_system.rasterize_glyph(&first, first_bounds)?;
+            let second_bounds = text_system.glyph_raster_bounds(&second)?;
+            let expected_second = text_system.rasterize_glyph(&second, second_bounds)?;
+
+            text_system.glyph_raster_bounds(&first)?;
+            text_system.glyph_raster_bounds(&second)?;
+            assert_eq!(
+                text_system
+                    .0
+                    .read()
+                    .pending_glyph_image
+                    .as_ref()
+                    .map(|(params, _)| params),
+                Some(&second)
+            );
+            assert_eq!(
+                text_system.rasterize_glyph(&first, first_bounds)?,
+                expected_first
+            );
+            // A miss must preserve the latest image for its eventual consumer.
+            assert_eq!(
+                text_system
+                    .0
+                    .read()
+                    .pending_glyph_image
+                    .as_ref()
+                    .map(|(params, _)| params),
+                Some(&second)
+            );
+            assert_eq!(
+                text_system.rasterize_glyph(&second, second_bounds)?,
+                expected_second
+            );
+            assert!(text_system.0.read().pending_glyph_image.is_none());
+        }
+        Ok(())
     }
 
     /// Mirrors the original crash: mixed-direction text reaching the shaper
@@ -1616,6 +1714,70 @@ mod tests {
     }
 
     #[test]
+    fn ascii_runs_skip_emoji_loading_and_preserve_shaping_attributes() -> Result<()> {
+        for ligatures in [0, 1] {
+            for letter_spacing in [None, Some(gpui::px(1.25))] {
+                for explicit_fallback in [false, true] {
+                    let text_system = text_system()?;
+                    let mut font = gpui::font("IBM Plex Sans");
+                    font.features = FontFeatures(Arc::new(vec![("liga".into(), ligatures)]));
+                    if explicit_fallback {
+                        font.fallbacks =
+                            Some(FontFallbacks::from_fonts(vec!["IBM Plex Sans".into()]));
+                    }
+                    let font_id = text_system.font_id(&font)?;
+                    let text = "office ffi AV 0123 ";
+                    let run = FontRun {
+                        len: text.len(),
+                        font_id,
+                        letter_spacing,
+                    };
+                    let fast = text_system.layout_line(text, gpui::px(16.), &[run]);
+                    assert!(text_system.0.read().emoji_chain_cache.is_none());
+
+                    // A non-ASCII suffix takes the full fallback path. All
+                    // earlier glyphs must retain their font, cluster, and
+                    // position with ligatures, spacing, and user fallbacks.
+                    let reference_text = format!("{text}é");
+                    let reference = text_system.layout_line(
+                        &reference_text,
+                        gpui::px(16.),
+                        &[FontRun {
+                            len: reference_text.len(),
+                            ..run
+                        }],
+                    );
+                    let glyphs = |layout: &LineLayout| {
+                        layout
+                            .runs
+                            .iter()
+                            .flat_map(|run| {
+                                run.glyphs
+                                    .iter()
+                                    .filter(|glyph| glyph.index < text.len())
+                                    .map(|glyph| {
+                                        (
+                                            run.font_id,
+                                            glyph.id,
+                                            glyph.index,
+                                            glyph.position,
+                                            glyph.is_emoji,
+                                        )
+                                    })
+                            })
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(glyphs(&fast), glyphs(&reference));
+                    if !explicit_fallback {
+                        assert!(text_system.0.read().emoji_chain_cache.is_some());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn paragraph_separator_detection() {
         for separator in SEPARATORS {
             assert!(is_paragraph_separator(*separator), "{separator:?}");
@@ -1692,13 +1854,7 @@ mod tests {
                 "{name} must take the color raster path"
             );
         }
-        for name in [
-            "Spline Sans",
-            "Segoe UI",
-            "Segoe UI Symbol",
-            "Arial",
-            "",
-        ] {
+        for name in ["Spline Sans", "Segoe UI", "Segoe UI Symbol", "Arial", ""] {
             assert!(
                 !check_is_known_emoji_font(name),
                 "{name} must stay on the outline path"
@@ -2051,11 +2207,7 @@ mod tests {
     }
 
     /// Shapes `text` with an ordinary body-font request.
-    fn shape_body(
-        text_system: &CosmicTextSystem,
-        font_id: FontId,
-        text: &str,
-    ) -> LineLayout {
+    fn shape_body(text_system: &CosmicTextSystem, font_id: FontId, text: &str) -> LineLayout {
         let runs = [FontRun {
             len: text.len(),
             font_id,
@@ -2197,14 +2349,7 @@ mod tests {
             1,
             "England flag must shape as one combined glyph"
         );
-        assert_single_color_cluster(
-            &text_system,
-            &layout,
-            0,
-            text.len(),
-            "TwemojiMozilla",
-            text,
-        )
+        assert_single_color_cluster(&text_system, &layout, 0, text.len(), "TwemojiMozilla", text)
     }
 
     /// VS16 requests emoji presentation: whole cluster, native face, color.
@@ -2227,14 +2372,7 @@ mod tests {
         let font_id = text_system.font_id(&gpui::font("Segoe UI"))?;
         let text = "\u{2764}\u{FE0F}";
         let layout = shape_body(&text_system, font_id, text);
-        assert_single_color_cluster(
-            &text_system,
-            &layout,
-            0,
-            text.len(),
-            "SegoeUIEmoji",
-            text,
-        )
+        assert_single_color_cluster(&text_system, &layout, 0, text.len(), "SegoeUIEmoji", text)
     }
 
     /// VS15 requests text presentation: Twemoji lacks U+FE0E, so it must
@@ -2299,14 +2437,7 @@ mod tests {
             1,
             "ZWJ family must shape as one combined glyph"
         );
-        assert_single_color_cluster(
-            &text_system,
-            &layout,
-            0,
-            text.len(),
-            "TwemojiMozilla",
-            text,
-        )
+        assert_single_color_cluster(&text_system, &layout, 0, text.len(), "TwemojiMozilla", text)
     }
 
     /// Skin tone: both faces ligate, so native-first order keeps Segoe
@@ -2336,14 +2467,7 @@ mod tests {
             1,
             "skin-tone cluster must shape as one combined glyph"
         );
-        assert_single_color_cluster(
-            &text_system,
-            &layout,
-            0,
-            text.len(),
-            "SegoeUIEmoji",
-            text,
-        )
+        assert_single_color_cluster(&text_system, &layout, 0, text.len(), "SegoeUIEmoji", text)
     }
 
     /// Keycap: whichever face forms the sequence wins it whole with
@@ -2440,19 +2564,37 @@ mod tests {
         // First face forms: native-first order holds.
         let mut first_forms = |id: FontId, _: &str| id == fid(1);
         assert_eq!(
-            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut first_forms),
+            pick_cluster_slot(
+                "\u{1F1F3}\u{1F1F4}",
+                primary,
+                &fb,
+                &covers_all,
+                &mut first_forms
+            ),
             Some(0)
         );
         // Only the fallback forms: whole cluster reroutes.
         let mut second_forms = |id: FontId, _: &str| id == fid(2);
         assert_eq!(
-            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut second_forms),
+            pick_cluster_slot(
+                "\u{1F1F3}\u{1F1F4}",
+                primary,
+                &fb,
+                &covers_all,
+                &mut second_forms
+            ),
             Some(1)
         );
         // Nothing forms: chain order, same as coverage-only selection.
         let mut none_forms = |_: FontId, _: &str| false;
         assert_eq!(
-            pick_cluster_slot("\u{1F1F3}\u{1F1F4}", primary, &fb, &covers_all, &mut none_forms),
+            pick_cluster_slot(
+                "\u{1F1F3}\u{1F1F4}",
+                primary,
+                &fb,
+                &covers_all,
+                &mut none_forms
+            ),
             Some(0)
         );
     }
@@ -2465,7 +2607,10 @@ mod tests {
     /// combination.
     #[test]
     fn single_combined_cluster_rejects_mixed_output() {
-        assert!(is_single_combined_cluster([(true, 42u16)].into_iter(), true));
+        assert!(is_single_combined_cluster(
+            [(true, 42u16)].into_iter(),
+            true
+        ));
         assert!(!is_single_combined_cluster(
             [(true, 42u16), (true, 0u16)].into_iter(),
             true
@@ -2483,9 +2628,18 @@ mod tests {
             true
         ));
         assert!(!is_single_combined_cluster([].into_iter(), true));
-        assert!(!is_single_combined_cluster([(true, 3u16)].into_iter(), true));
-        assert!(!is_single_combined_cluster([(false, 3u16)].into_iter(), true));
-        assert!(is_single_combined_cluster([(true, 3u16)].into_iter(), false));
+        assert!(!is_single_combined_cluster(
+            [(true, 3u16)].into_iter(),
+            true
+        ));
+        assert!(!is_single_combined_cluster(
+            [(false, 3u16)].into_iter(),
+            true
+        ));
+        assert!(is_single_combined_cluster(
+            [(true, 3u16)].into_iter(),
+            false
+        ));
     }
 
     #[test]

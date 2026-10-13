@@ -17,12 +17,12 @@ mod bounds_tree;
 mod color;
 /// The default colors used by GPUI.
 pub mod colors;
-#[cfg(feature = "profiler")]
+#[cfg(feature = "frame-rate")]
 mod debug_overlay;
-mod frame_rate_limiter;
 mod element;
 mod elements;
 mod executor;
+mod frame_rate_limiter;
 mod platform_scheduler;
 pub(crate) use platform_scheduler::PlatformScheduler;
 mod geometry;
@@ -34,6 +34,7 @@ mod interactive;
 mod key_dispatch;
 mod keymap;
 mod lerp;
+mod mesh;
 mod motion;
 mod path_builder;
 mod platform;
@@ -50,7 +51,6 @@ pub mod profiler;
 ))]
 #[expect(missing_docs)]
 pub mod queue;
-mod mesh;
 mod scene;
 mod shared_uri;
 mod spring;
@@ -105,7 +105,7 @@ pub use asset_cache::*;
 pub use assets::*;
 pub use color::*;
 pub use ctor::ctor;
-#[cfg(feature = "profiler")]
+#[cfg(feature = "frame-rate")]
 pub use debug_overlay::*;
 pub use element::*;
 pub use elements::*;
@@ -151,6 +151,7 @@ pub use interactive::*;
 use key_dispatch::*;
 pub use keymap::*;
 pub use lerp::*;
+pub use mesh::*;
 pub use motion::*;
 pub use path_builder::*;
 pub use platform::*;
@@ -158,7 +159,6 @@ pub use profiler::*;
 #[cfg(any(target_os = "windows", target_os = "linux", target_family = "wasm"))]
 pub use queue::{PriorityQueueReceiver, PriorityQueueSender};
 pub use refineable::*;
-pub use mesh::*;
 pub use scene::*;
 pub use shared_uri::*;
 use std::{any::Any, future::Future};
