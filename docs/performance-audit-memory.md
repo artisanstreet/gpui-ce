@@ -145,6 +145,15 @@ experiment is not supported by these counters alone.
 
 ## Text, font and asset ownership
 
+`gpui_ce_wgpu` separates its shared Cosmic text implementation from the
+`renderer` feature. The renderer remains enabled by default for direct crate
+users, and Linux, web and Windows WGPU integrations enable it explicitly.
+Native Windows enables only Cosmic and font matching, so its normal dependency
+graph excludes WGPU, Naga, Ash, Glow and the GPU allocator. Native Cosmic,
+Windows WGPU and Linux X11/Wayland configurations pass strict Clippy checks.
+This removes unused build dependencies; it does not establish a resident-memory
+saving, since release linking can already discard unused renderer code.
+
 | Owner | Established retention and limits |
 | --- | --- |
 | `text_system.rs`, `text_system/line.rs` | Before this change, x86_64 `DecorationRun` was 92 bytes, `ShapedLine` was 2,984 bytes, and every wrapped logical line reserved 32×92 = 2,944 heap bytes for decorations. Both line forms now keep one run inline and spill for arbitrary rich text. Plain-style merging/cache reuse and 40-style split/spill cases are tested. The per-line reservation is known; whole-process savings require a live-line count. |

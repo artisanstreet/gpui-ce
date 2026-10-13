@@ -59,7 +59,7 @@ image.workspace = true
 futures.workspace = true
 gpui.workspace = true
 gpui_util.workspace = true
-gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
+gpui_wgpu = { workspace = true, optional = true, features = ["font-kit", "renderer"] }
 itertools.workspace = true
 libc.workspace = true
 log.workspace = true
