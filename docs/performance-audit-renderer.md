@@ -76,4 +76,50 @@ Resolved wgpu-hal 29.0.4 allocates raw command buffers in batches of sixteen whe
 
 GPUI already submits one public main encoder per normal frame; its meshes, paths, filters and final blit share that encoder. Queue writes use wgpu's separate internal upload encoder. There is no redundant GPUI submission per render pass to remove. The public maximum-frame-latency hint could reduce concurrent frames, but it changes the concurrency/throughput policy and cannot release cached pools; it is outside this experiment.
 
-Two dependency copies under the Editor workspace's `.dist/performance/command-pool-audit/` differ only in Vulkan allocation granularity, sixteen versus one. Shared Cargo registry sources and production GPUI are untouched. A matched diagnostic snapshot will enable wgpu's existing counters to expose actual HAL pool count; heaptrack supplies raw-buffer counts. The experiment must preserve rendering, explicit Vulkan selection, viewport and clean fixture data, then compare profiled allocation attribution and unprofiled RSS separately. Smaller batches may reduce unused raw buffers but increase native allocation calls while growing. No memory saving is claimed before that comparison.
+Two dependency copies under the Editor workspace's `.dist/performance/command-pool-audit/` differ only in Vulkan allocation granularity, sixteen versus one. Shared Cargo registry sources and production GPUI are untouched. Matched release diagnostic binaries enable wgpu's existing counters to expose actual HAL pool count; heaptrack supplies raw-buffer counts. Both builds passed, and their GPUI/Editor source manifests and profiles match.
+
+The paired llvmpipe runs report five pools in both variants. Granularity one reduces raw command arenas from 208 to 135, removing 4,789,968 requested bytes. Unprofiled 60-second samples show RSS of 210,640,896 and 210,300,928 bytes, a difference of only 339,968 bytes. CPU totals are zero and 0.01 seconds respectively. Both windows stay focused/visible at the same 1898×1125 rectangle, and all four captures show the same completed conversation with an empty composer. Numeric pixel comparison matches outside the fixture-specific avatar and last-frame timing overlay.
+
+This single pair establishes lower requested command capacity on the tested Mesa driver, but not a repeatable resident-memory improvement. Smaller batches can increase native allocation calls during growth; active rendering performance and other Vulkan drivers remain untested. The isolated dependency patch is not recommended for production from this evidence alone. Full qualification, attribution and raw samples are recorded in the experiment's `results.json` and per-run directories.
+
+## Surface validation probe and synchronization
+
+`WgpuContext::try_adapter_with_surface` configures a 64×64 FIFO surface and checks a validation error scope. It does not acquire or present an image. This is true in the pinned original fork and the current source, so an acquire without submission cannot explain the observed AMD worker spin through this probe.
+
+Resolved wgpu-core 29.0.4 `device/resource.rs::configure_surface` waits for existing queue work, rejects reconfiguration while an acquired texture exists, calls the backend configuration method, then records `acquired_texture: None`. DX12 configuration waits for its separate present queue with an event and an infinite timeout. Reconfiguration releases the old latency handle and resizes the swapchain buffers. Vulkan reconfiguration waits for device idle, releases old acquisition/presentation synchronization objects, and replaces the swapchain. No probe frame is pending in either backend.
+
+Removing the probe in an isolated diagnostic tests whether an extra swapchain configuration triggers the driver issue. Source inspection does not establish that causal link or justify removing the adapter fallback check in production. The real frame submission path supplies texture transitions and presentation synchronization; adding an acquire/present pair to the probe would introduce work it currently does not perform.
+
+## EGL library lifetime after discovery
+
+Resolved khronos-egl loads libEGL on Linux with `RTLD_NOW | RTLD_NODELETE`. Its source explicitly identifies this as a fix for a segmentation fault, with [the upstream issue](https://github.com/timothee-haudebourg/khronos-egl/issues/14) pointing to the driver-unloading discussion. wgpu-hal's EGL `Inner::drop` destroys the native context and terminates the display, but that does not unload the library marked NODELETE. Persistent code mappings after context cleanup therefore do not alone establish a retained GPUI context. This accounts for libEGL's lifetime; the exact libgallium dependency chain still needs loader attribution. Preventing unused backend discovery avoids these loads. Forcing library unmapping is not a safe cleanup policy.
+
+## Native Windows atlas and blur allocation
+
+The native D3D11 atlas now uses the same 256/512/1024 page growth policy as
+WGPU. The helper lives on `AtlasTextureList`; moving it does not change WGPU's
+policy. Removed page slots do not inflate the live page count. Individual large
+images still receive a sufficient page, and invalid or oversized dimensions
+are rejected before texture creation.
+
+Native scene/ping/pong blur textures are allocated on the first frame that
+needs filters and released after a frame without filters. Content-group targets
+grow to the actual nesting depth, up to the existing two-level limit. Sibling
+filters share that capacity. Resize and device-resource recreation reset the
+optional allocation. The render loop retains group capacity during continuous
+filter use to avoid reallocating during animation.
+
+Four native Windows WARP tests pass for atlas hole reuse, filter nesting,
+texture/view reuse and resource recreation. The core/Linux/GPU suites pass
+385/58/80 tests, and strict library/test Clippy passes. An independent source
+review found no ownership, dimension or resource-release blocker. Native
+display/device-loss integration remains separate from these headless tests.
+
+An isolated D3D11 idle comparison measured 83.81 MB mean resident memory and
+196.06 MB private commit before this change, versus 84.45 MB and 171.25 MB after.
+Both recorded zero CPU time over 60 seconds. The 24.81 MB commit reduction is
+not a resident-memory reduction. Both binaries retain known appearance
+differences and do not qualify as a production replacement. The atlas/blur
+allocation changes preserve those binaries' existing rendering behavior.
+Artifacts are in Editor `.dist/performance/native-allocation/`, including
+`native-tests/`, `idle/`, the immutable executable hash and source manifest.

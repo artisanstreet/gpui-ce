@@ -47,6 +47,23 @@ const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 /// the wgpu backend's `MAX_FILTER_DEPTH` so nested blur renders consistently across platforms.
 const MAX_FILTER_DEPTH: usize = 2;
 
+fn filter_group_depth(boundaries: &[FilterBoundary]) -> usize {
+    let mut depth = 0usize;
+    let mut maximum = 0;
+    for boundary in boundaries {
+        if boundary.is_start {
+            depth += 1;
+            maximum = maximum.max(depth);
+            if maximum == MAX_FILTER_DEPTH {
+                break;
+            }
+        } else {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    maximum
+}
+
 pub(crate) struct FontInfo {
     pub gamma_ratios: [f32; 4],
     pub grayscale_enhanced_contrast: f32,
@@ -104,7 +121,7 @@ struct DirectXResources {
     path_intermediate_msaa_view: Option<ID3D11RenderTargetView>,
 
     // Offscreen targets for blur filters (each is render-target + shader-resource).
-    blur: BlurResources,
+    blur: Option<BlurResources>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
@@ -116,20 +133,19 @@ struct DirectXResources {
 /// (indexed by isolation depth), up to [`MAX_FILTER_DEPTH`], so nested content blurs isolate
 /// correctly; deeper nests render inline.
 struct BlurResources {
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     scene_color: ID3D11Texture2D,
     scene_color_rtv: Option<ID3D11RenderTargetView>,
     scene_color_srv: Option<ID3D11ShaderResourceView>,
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     ping: ID3D11Texture2D,
     ping_rtv: Option<ID3D11RenderTargetView>,
     ping_srv: Option<ID3D11ShaderResourceView>,
-    #[expect(dead_code)]
+    #[cfg_attr(not(test), expect(dead_code))]
     pong: ID3D11Texture2D,
     pong_rtv: Option<ID3D11RenderTargetView>,
     pong_srv: Option<ID3D11ShaderResourceView>,
     // Kept alive for the lifetime of their views; indexed by isolation depth.
-    #[expect(dead_code)]
     groups: Vec<ID3D11Texture2D>,
     group_rtvs: Vec<Option<ID3D11RenderTargetView>>,
     group_srvs: Vec<Option<ID3D11ShaderResourceView>>,
@@ -143,15 +159,6 @@ impl BlurResources {
             create_color_target(device, width, height)?;
         let (ping, ping_rtv, ping_srv) = create_color_target(device, half_w, half_h)?;
         let (pong, pong_rtv, pong_srv) = create_color_target(device, half_w, half_h)?;
-        let mut groups = Vec::with_capacity(MAX_FILTER_DEPTH);
-        let mut group_rtvs = Vec::with_capacity(MAX_FILTER_DEPTH);
-        let mut group_srvs = Vec::with_capacity(MAX_FILTER_DEPTH);
-        for _ in 0..MAX_FILTER_DEPTH {
-            let (group, group_rtv, group_srv) = create_color_target(device, width, height)?;
-            groups.push(group);
-            group_rtvs.push(group_rtv);
-            group_srvs.push(group_srv);
-        }
         Ok(Self {
             scene_color,
             scene_color_rtv,
@@ -162,10 +169,26 @@ impl BlurResources {
             pong,
             pong_rtv,
             pong_srv,
-            groups,
-            group_rtvs,
-            group_srvs,
+            groups: Vec::new(),
+            group_rtvs: Vec::new(),
+            group_srvs: Vec::new(),
         })
+    }
+
+    fn ensure_groups(
+        &mut self,
+        device: &ID3D11Device,
+        width: u32,
+        height: u32,
+        depth: usize,
+    ) -> Result<()> {
+        for _ in self.groups.len()..depth {
+            let (texture, rtv, srv) = create_color_target(device, width, height)?;
+            self.groups.push(texture);
+            self.group_rtvs.push(rtv);
+            self.group_srvs.push(srv);
+        }
+        Ok(())
     }
 }
 
@@ -460,18 +483,45 @@ impl DirectXRenderer {
         // otherwise render straight to the swapchain exactly as before.
         let use_offscreen =
             !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
+        let resources = self.resources.as_mut().context("resources missing")?;
+        if use_offscreen {
+            let device = &self.devices.as_ref().context("devices missing")?.device;
+            if resources.blur.is_none() {
+                resources.blur = Some(BlurResources::new(device, self.width, self.height)?);
+            }
+            resources.blur.as_mut().unwrap().ensure_groups(
+                device,
+                self.width,
+                self.height,
+                filter_group_depth(&scene.filter_boundaries),
+            )?;
+        } else {
+            // pre_draw rebound the swapchain, and blur passes unbind their SRVs.
+            // The immediate context retains anything needed by pending GPU work.
+            resources.blur = None;
+        }
 
         // Clone the views we need (AddRef) so the loop can rebind render targets without holding a
         // borrow of `self` across the `&mut self` draw_* calls.
         let (scene_rtv, scene_srv, group_rtvs, group_srvs, swapchain_rtv) = {
             let r = self.resources.as_ref().context("resources missing")?;
-            (
-                r.blur.scene_color_rtv.clone(),
-                r.blur.scene_color_srv.clone(),
-                r.blur.group_rtvs.clone(),
-                r.blur.group_srvs.clone(),
-                r.render_target_view.clone(),
-            )
+            if let Some(blur) = r.blur.as_ref() {
+                (
+                    blur.scene_color_rtv.clone(),
+                    blur.scene_color_srv.clone(),
+                    blur.group_rtvs.clone(),
+                    blur.group_srvs.clone(),
+                    r.render_target_view.clone(),
+                )
+            } else {
+                (
+                    None,
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                    r.render_target_view.clone(),
+                )
+            }
         };
         let ctx = self
             .devices
@@ -1141,12 +1191,13 @@ impl DirectXRenderer {
         };
         let (full_vp, ping_rtv, ping_srv, pong_rtv, pong_srv) = {
             let r = self.resources.as_ref().context("resources missing")?;
+            let blur = r.blur.as_ref().context("blur resources missing")?;
             (
                 r.viewport,
-                r.blur.ping_rtv.clone(),
-                r.blur.ping_srv.clone(),
-                r.blur.pong_rtv.clone(),
-                r.blur.pong_srv.clone(),
+                blur.ping_rtv.clone(),
+                blur.ping_srv.clone(),
+                blur.pong_rtv.clone(),
+                blur.pong_srv.clone(),
             )
         };
 
@@ -1329,7 +1380,6 @@ impl DirectXResources {
             viewport,
         ) = create_resources(devices, &swap_chain, width, height)?;
         set_rasterizer_state(&devices.device, &devices.device_context)?;
-        let blur = BlurResources::new(&devices.device, width, height)?;
 
         Ok(Self {
             swap_chain,
@@ -1339,7 +1389,7 @@ impl DirectXResources {
             path_intermediate_msaa_texture,
             path_intermediate_msaa_view,
             path_intermediate_srv,
-            blur,
+            blur: None,
             viewport,
         })
     }
@@ -1366,7 +1416,7 @@ impl DirectXResources {
         self.path_intermediate_msaa_texture = path_intermediate_msaa_texture;
         self.path_intermediate_msaa_view = path_intermediate_msaa_view;
         self.path_intermediate_srv = path_intermediate_srv;
-        self.blur = BlurResources::new(&devices.device, width, height)?;
+        self.blur = None;
         self.viewport = viewport;
         Ok(())
     }
@@ -2641,6 +2691,169 @@ mod amd {
             ags_deinitialize(context);
             Ok(format!("{} ({})", software_version, driver_version))
         })
+    }
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::{
+        BlurResources, DirectXRendererDevices, DirectXResources, MAX_FILTER_DEPTH,
+        filter_group_depth,
+    };
+    use anyhow::{Context, Result};
+    use gpui::{Bounds, ContentMask, Corners, FilterBoundary, ScaledFilter, ScaledPixels};
+    use windows::{
+        Win32::{
+            Foundation::{HMODULE, HWND},
+            Graphics::{
+                Direct3D::D3D_DRIVER_TYPE_WARP,
+                Direct3D11::{
+                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+                    D3D11CreateDevice, ID3D11Texture2D,
+                },
+                Dxgi::{IDXGIAdapter1, IDXGIDevice, IDXGIFactory6},
+            },
+        },
+        core::Interface,
+    };
+
+    fn test_devices() -> Result<DirectXRendererDevices> {
+        let mut device = None;
+        let mut device_context = None;
+        unsafe {
+            D3D11CreateDevice(
+                None,
+                D3D_DRIVER_TYPE_WARP,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                Some(&mut device_context),
+            )?;
+        }
+        let device = device.context("WARP device missing")?;
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let adapter: IDXGIAdapter1 = unsafe { dxgi_device.GetAdapter()? }.cast()?;
+        let dxgi_factory = unsafe { adapter.GetParent::<IDXGIFactory6>()? };
+        Ok(DirectXRendererDevices {
+            adapter,
+            dxgi_factory,
+            device,
+            device_context: device_context.context("WARP device context missing")?,
+            dxgi_device: Some(dxgi_device),
+            annotation: None,
+        })
+    }
+
+    fn texture_size(texture: &ID3D11Texture2D) -> (u32, u32) {
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut desc) };
+        (desc.Width, desc.Height)
+    }
+
+    fn boundary(is_start: bool) -> FilterBoundary {
+        FilterBoundary {
+            order: 0,
+            bounds: Bounds::default(),
+            content_mask: ContentMask::default(),
+            corner_radii: Corners::default(),
+            filters: smallvec::smallvec![ScaledFilter::Blur(ScaledPixels(4.0))],
+            opacity: 1.0,
+            is_start,
+        }
+    }
+
+    #[test]
+    fn content_group_depth_counts_nesting_instead_of_sibling_count() {
+        let depth = |markers: &[bool]| {
+            filter_group_depth(&markers.iter().copied().map(boundary).collect::<Vec<_>>())
+        };
+        assert_eq!(depth(&[]), 0);
+        assert_eq!(depth(&[false]), 0);
+        assert_eq!(depth(&[true, false, true, false, true, false]), 1);
+        assert_eq!(depth(&[true, true, false, false]), 2);
+        assert_eq!(
+            depth(&[true, true, true, false, false, false]),
+            MAX_FILTER_DEPTH
+        );
+    }
+
+    #[test]
+    fn blur_groups_allocate_only_required_depth_and_reuse_existing_textures() -> Result<()> {
+        let devices = test_devices()?;
+        let mut blur = BlurResources::new(&devices.device, 65, 33)?;
+        assert_eq!(texture_size(&blur.scene_color), (65, 33));
+        assert_eq!(texture_size(&blur.ping), (32, 16));
+        assert_eq!(texture_size(&blur.pong), (32, 16));
+        assert!(blur.groups.is_empty());
+        assert!(blur.group_rtvs.is_empty());
+        assert!(blur.group_srvs.is_empty());
+
+        blur.ensure_groups(&devices.device, 65, 33, 0)?;
+        assert!(blur.groups.is_empty());
+        blur.ensure_groups(&devices.device, 65, 33, 1)?;
+        let first_group = blur.groups[0].clone();
+        let first_rtv = blur.group_rtvs[0].clone();
+        let first_srv = blur.group_srvs[0].clone();
+        assert_eq!(texture_size(&first_group), (65, 33));
+        for requested_depth in [1, 0, 1] {
+            blur.ensure_groups(&devices.device, 65, 33, requested_depth)?;
+            assert_eq!(blur.groups.len(), 1);
+            assert_eq!(blur.groups[0], first_group);
+            assert_eq!(blur.group_rtvs[0], first_rtv);
+            assert_eq!(blur.group_srvs[0], first_srv);
+        }
+
+        let markers = [true, true, true, false, false, false].map(boundary);
+        blur.ensure_groups(&devices.device, 65, 33, filter_group_depth(&markers))?;
+        assert_eq!(blur.groups.len(), MAX_FILTER_DEPTH);
+        assert_eq!(blur.group_rtvs.len(), MAX_FILTER_DEPTH);
+        assert_eq!(blur.group_srvs.len(), MAX_FILTER_DEPTH);
+        assert_eq!(blur.groups[0], first_group);
+        for ix in 0..MAX_FILTER_DEPTH {
+            let rtv_resource: ID3D11Texture2D =
+                unsafe { blur.group_rtvs[ix].as_ref().unwrap().GetResource()? }.cast()?;
+            let srv_resource: ID3D11Texture2D =
+                unsafe { blur.group_srvs[ix].as_ref().unwrap().GetResource()? }.cast()?;
+            assert_eq!(rtv_resource, blur.groups[ix]);
+            assert_eq!(srv_resource, blur.groups[ix]);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resource_recreation_discards_blur_targets_until_needed_again() -> Result<()> {
+        let devices = test_devices()?;
+        // Composition swapchains do not require an HWND or a visible window.
+        let mut resources = DirectXResources::new(&devices, 65, 33, HWND::default(), false)?;
+        assert!(resources.blur.is_none());
+        let mut blur = BlurResources::new(&devices.device, 65, 33)?;
+        blur.ensure_groups(&devices.device, 65, 33, 1)?;
+        let old_scene = blur.scene_color.clone();
+        let old_group_view = blur.group_rtvs[0].clone().unwrap();
+        resources.blur = Some(blur);
+
+        resources.recreate_resources(&devices, 65, 33)?;
+        assert!(resources.blur.is_none());
+        let replacement = BlurResources::new(&devices.device, 65, 33)?;
+        assert_ne!(replacement.scene_color, old_scene);
+        assert!(replacement.groups.is_empty());
+        resources.blur = Some(replacement);
+        drop(resources);
+
+        // Views held by already encoded work remain valid when the owner is dropped.
+        let retained_group: ID3D11Texture2D = unsafe { old_group_view.GetResource()? }.cast()?;
+        assert_eq!(texture_size(&retained_group), (65, 33));
+        let mut replacement = DirectXResources::new(&devices, 97, 49, HWND::default(), false)?;
+        assert!(replacement.blur.is_none());
+        replacement.blur = Some(BlurResources::new(&devices.device, 97, 49)?);
+        let blur = replacement.blur.as_ref().unwrap();
+        assert_eq!(texture_size(&blur.scene_color), (97, 49));
+        assert_eq!(texture_size(&blur.ping), (48, 24));
+        assert!(blur.groups.is_empty());
+        Ok(())
     }
 }
 

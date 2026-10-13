@@ -33,28 +33,6 @@ fn device_size_to_etagere(size: Size<DevicePixels>) -> etagere::Size {
     size2(size.width.0, size.height.0)
 }
 
-fn atlas_page_size(
-    minimum: Size<DevicePixels>,
-    live_pages: usize,
-    maximum: u32,
-) -> Option<Size<DevicePixels>> {
-    let maximum = i32::try_from(maximum).unwrap_or(i32::MAX);
-    if minimum.width.0 <= 0
-        || minimum.height.0 <= 0
-        || minimum.width.0 > maximum
-        || minimum.height.0 > maximum
-    {
-        return None;
-    }
-    // Small windows need only a few icons and glyphs. Grow subsequent pages to
-    // preserve batching for text-heavy scenes without reserving 1024² per format.
-    let side = (256 << live_pages.min(2)).min(maximum);
-    Some(Size {
-        width: DevicePixels(minimum.width.0.max(side)),
-        height: DevicePixels(minimum.height.0.max(side)),
-    })
-}
-
 fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     Point {
         x: DevicePixels(point.x),
@@ -265,8 +243,7 @@ impl WgpuAtlasState {
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
     ) -> Option<&mut WgpuAtlasTexture> {
-        let live_pages = self.storage[kind].textures.iter().flatten().count();
-        let size = atlas_page_size(min_size, live_pages, self.max_texture_size)?;
+        let size = self.storage[kind].next_texture_size(min_size, self.max_texture_size)?;
         let format = match kind {
             AtlasTextureKind::Monochrome => wgpu::TextureFormat::R8Unorm,
             AtlasTextureKind::Subpixel | AtlasTextureKind::Polychrome => self.color_texture_format,
@@ -513,34 +490,6 @@ mod tests {
                 .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
             Ok((Arc::new(device), Arc::new(queue)))
         })
-    }
-
-    #[test]
-    fn atlas_pages_grow_without_exceeding_device_limits() {
-        let size = |width, height| Size {
-            width: DevicePixels(width),
-            height: DevicePixels(height),
-        };
-        assert_eq!(atlas_page_size(size(16, 24), 0, 4096), Some(size(256, 256)));
-        assert_eq!(atlas_page_size(size(16, 24), 1, 4096), Some(size(512, 512)));
-        assert_eq!(
-            atlas_page_size(size(16, 24), 2, 4096),
-            Some(size(1024, 1024))
-        );
-        assert_eq!(
-            atlas_page_size(size(16, 24), 20, 4096),
-            Some(size(1024, 1024))
-        );
-        assert_eq!(
-            atlas_page_size(size(1800, 300), 0, 4096),
-            Some(size(1800, 300))
-        );
-        assert_eq!(atlas_page_size(size(16, 24), 20, 512), Some(size(512, 512)));
-        assert_eq!(atlas_page_size(size(16, 24), 0, 128), Some(size(128, 128)));
-        assert_eq!(atlas_page_size(size(513, 24), 0, 512), None);
-        assert_eq!(atlas_page_size(size(16, 513), 0, 512), None);
-        assert_eq!(atlas_page_size(size(0, 24), 0, 4096), None);
-        assert_eq!(atlas_page_size(size(16, -1), 0, 4096), None);
     }
 
     #[test]

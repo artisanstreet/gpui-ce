@@ -1456,6 +1456,30 @@ impl<T> ops::Index<usize> for AtlasTextureList<T> {
 }
 
 impl<T> AtlasTextureList<T> {
+    /// Size a new page from current occupancy, allowing large individual images.
+    pub fn next_texture_size(
+        &self,
+        minimum: Size<DevicePixels>,
+        maximum: u32,
+    ) -> Option<Size<DevicePixels>> {
+        let maximum = i32::try_from(maximum).unwrap_or(i32::MAX);
+        if minimum.width.0 <= 0
+            || minimum.height.0 <= 0
+            || minimum.width.0 > maximum
+            || minimum.height.0 > maximum
+        {
+            return None;
+        }
+        // Start small for icons and glyphs, then grow to preserve batching.
+        // Removed pages do not keep a now-empty atlas at its old high-water size.
+        let live_pages = self.textures.iter().flatten().take(2).count();
+        let side = (256 << live_pages).min(maximum);
+        Some(Size {
+            width: DevicePixels(minimum.width.0.max(side)),
+            height: DevicePixels(minimum.height.0.max(side)),
+        })
+    }
+
     #[allow(unused)]
     pub fn drain(&mut self) -> std::vec::Drain<'_, Option<T>> {
         self.free_list.clear();
@@ -2978,6 +3002,66 @@ impl From<String> for ClipboardString {
             text: value,
             metadata: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod atlas_tests {
+    use super::*;
+
+    #[test]
+    fn atlas_pages_grow_without_exceeding_device_limits() {
+        let atlas_page_size = |minimum, live_pages, maximum| {
+            let atlas = AtlasTextureList {
+                textures: vec![Some(()); live_pages],
+                free_list: Vec::new(),
+            };
+            atlas.next_texture_size(minimum, maximum)
+        };
+        let size = |width, height| Size {
+            width: DevicePixels(width),
+            height: DevicePixels(height),
+        };
+        assert_eq!(atlas_page_size(size(16, 24), 0, 4096), Some(size(256, 256)));
+        assert_eq!(atlas_page_size(size(16, 24), 1, 4096), Some(size(512, 512)));
+        assert_eq!(
+            atlas_page_size(size(16, 24), 2, 4096),
+            Some(size(1024, 1024))
+        );
+        assert_eq!(
+            atlas_page_size(size(16, 24), 20, 4096),
+            Some(size(1024, 1024))
+        );
+        assert_eq!(
+            atlas_page_size(size(1800, 300), 0, 4096),
+            Some(size(1800, 300))
+        );
+        assert_eq!(atlas_page_size(size(16, 24), 20, 512), Some(size(512, 512)));
+        assert_eq!(atlas_page_size(size(16, 24), 0, 128), Some(size(128, 128)));
+        assert_eq!(atlas_page_size(size(513, 24), 0, 512), None);
+        assert_eq!(atlas_page_size(size(16, 513), 0, 512), None);
+        assert_eq!(atlas_page_size(size(0, 24), 0, 4096), None);
+        assert_eq!(atlas_page_size(size(16, -1), 0, 4096), None);
+    }
+
+    #[test]
+    fn removed_atlas_pages_do_not_inflate_the_next_page() {
+        let mut atlas = AtlasTextureList {
+            textures: vec![None, Some(()), None],
+            free_list: vec![0, 2],
+        };
+        let minimum = size(DevicePixels(16), DevicePixels(24));
+        assert_eq!(
+            atlas.next_texture_size(minimum, 4096),
+            Some(size(DevicePixels(512), DevicePixels(512)))
+        );
+        atlas.textures[1] = None;
+        atlas.free_list.push(1);
+        assert_eq!(
+            atlas.next_texture_size(minimum, 4096),
+            Some(size(DevicePixels(256), DevicePixels(256)))
+        );
+        assert_eq!(atlas.next_texture_size(minimum, 0), None);
     }
 }
 

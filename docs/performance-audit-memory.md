@@ -253,8 +253,8 @@ Trace snapshots were cut about 30 seconds after content settled, before quit.
 | --- | ---: | ---: |
 | Native live requested bytes intercepted by heaptrack | 97,977,165 | 68,170,582 |
 | Allocations still live at the snapshot | 35,896 | 13,240 |
-| Live bytes attributed to the Vulkan driver as first resolved module | 66,780,781 | 66,780,813 |
-| Live bytes attributed to Gallium as first resolved module | 29,500,640 | 0 |
+| Live bytes attributed to the Vulkan driver as recorded leaf module | 66,780,781 | 66,780,813 |
+| Live bytes attributed to Gallium as recorded leaf module | 29,500,640 | 0 |
 | Separate uninstrumented 60-second process RSS | 236,142,592 | 210,796,544 |
 | CPU time during that uninstrumented sample | 0.00 s | 0.01 s |
 
@@ -280,15 +280,50 @@ GL discovery can be deferred only when the known adapter outranks a
 conservative best possible GL adapter. Otherwise GL is discovered before
 selection, preserving explicit GPU choices, compositor affinity, hardware
 over software, and failure fallback. Existing public constructors and the
-web path remain available. Tests cover priority bounds and backend filtering;
-a new default-backend runtime sample must establish the actual retained-memory
-effect of this implementation. The explicit Vulkan experiment above measures
-the opportunity, not the implementation's result.
+web path remain available. Tests cover priority bounds and backend filtering.
+
+Round8 then validated the default path with the same untouched fixture and
+an external image. Its native live requested bytes were 68,384,745, down
+29,592,420 from round7 default. Gallium live bytes fell from 29,500,640 to 176;
+the selected Vulkan driver retained 66,780,813 bytes, exactly matching the
+explicit-Vulkan experiment. This establishes that the losing GL context is
+released in practice. A separate visible 60-second sample reported constant
+RSS of 228,118,528 bytes and 0.01 seconds CPU time (0.0167% of one core).
+Round8 also includes the event-arena, ARIA and mesh changes, so its 8,024,064-byte
+RSS reduction is a combined checkpoint result.
+
+Dropping the context does not unload all native driver code or return every
+free allocator page. Round8 still had 11,739,136 resident bytes in
+`libgallium`, absent from explicit Vulkan. Its main `[heap]` mapping used
+27,484,160 resident bytes versus 22,372,352 in the explicit-Vulkan sample.
+These maps explain why freeing about 29.6 MB of native requested allocations
+does not imply an equal RSS reduction. The resolved `khronos-egl` 6.0 loader
+deliberately uses `RTLD_NODELETE` on Linux. Its upstream discussion describes
+a TLS-destructor failure when unloading libraries; removing that workaround
+requires a separate compatibility investigation, not just dropping another
+Rust handle. [Upstream loader issue](https://github.com/timothee-haudebourg/khronos-egl/issues/14).
+
+A separate child-only preload called `malloc_trim(0)` once after 30 seconds
+and captured glibc counters and `/proc/self/smaps` immediately before and
+after. RSS fell 974,848 bytes (229,171,200 to 228,196,352); live `uordblks`
+stayed 67,254,880 bytes. The call took 0.299 ms. This fixture does not justify
+adding production trimming. The helper thread exited before the subsequent
+10-second diagnostic sample, which recorded no CPU ticks. This was not an
+acceptance run: the window manager moved the window after initial placement,
+so its final external image clipped the bottom of the client. The same
+1898×1125 renderer viewport, completed conversation and GPU allocations were
+recorded. Before/after allocator evidence and the capture limitation are
+preserved in `.dist/performance/linux-glibc-trim-round8`; no production trim
+policy was added.
 
 Raw traces, captures, exact snapshot timestamps and the combined comparison
 are under `.dist/performance/linux-native-heaptrack-round7`,
 `linux-native-heaptrack-round7-vulkan-clean`, and
 `linux-native-heaptrack-backend-comparison.json` in the Editor workspace.
+Round8 attribution and process results are in
+`linux-native-heaptrack-round8-default`,
+`linux-conversation-release-round8-default`, and
+`linux-native-heaptrack-round8-comparison.json`.
 Earlier Vulkan runs that inherited a typed draft are preserved with
 `excluded-from-comparison.json`; their results are excluded from this table.
 
