@@ -161,4 +161,28 @@ The current native library passes 18 graphics tests and strict Cosmic Clippy;
 all 24 WGPU renderer tests and strict core/Linux/WGPU Clippy pass. Artifacts are
 in Editor `.dist/performance/native-integrated-v1`, `native-paths`,
 `native-cosmic-integration/directwrite-exclusion` and `native-blur-lifecycle`.
+
+## Native blur edge and pass bounds
+
+Native blur now uses a dedicated Clamp sampler, matching WGPU at window edges.
+Atlas sampling retains its existing sampler. Each half-resolution blur pass
+uses WGPU's `bounds.dilate(3 * radius)` scissor and transparent cleared pixels
+outside it. The previous rasterizer state and scissor rectangles are restored
+after each pass so later primitives keep their original clipping.
+
+The original implementation differed from WGPU by up to 21 channel values at
+window edges and by up to nine values around content-filter pass bounds. On
+the same AMD RX 9070 XT, all blurred pixels match exactly across 36 corrected
+native/WGPU scenes covering edges, distant content, wide kernels, nested
+filters, masks, and even/odd sizes. Twenty-four full frames match exactly.
+The other twelve differ only at two background pixels outside the blur, each
+by one channel value. Both added regressions fail on the old WARP renderer and
+pass on the corrected AMD and WARP renderers.
+
+These are appearance corrections. Full texture dimensions and shader bytecode
+are unchanged, and this change makes no process-memory saving claim. Source,
+compiler, executable and shader hashes are preserved in Editor
+`.dist/performance/native-blur-edge-parity`. Its initial `run-v1` reused stale
+experimental shader output and is excluded; the accepted comparison is
+`parity-v4.json` with independently verified embedded bytecode.
 Process memory and idle CPU are measured independently of these pixel tests.

@@ -9,7 +9,7 @@ use gpui_util::ResultExt;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::{
             Direct3D::*,
             Direct3D11::*,
@@ -261,6 +261,7 @@ struct DirectXRenderPipelines {
     blur_params_buffer: ID3D11Buffer,
     blur_blend_replace: ID3D11BlendState,
     blur_blend_composite: ID3D11BlendState,
+    blur_rasterizer: ID3D11RasterizerState,
 }
 
 struct DirectXGlobalElements {
@@ -268,6 +269,7 @@ struct DirectXGlobalElements {
     batch_params_buffer: Option<ID3D11Buffer>,
     path_params_buffer: Option<ID3D11Buffer>,
     sampler: Option<ID3D11SamplerState>,
+    blur_sampler: Option<ID3D11SamplerState>,
 }
 
 struct Annotation<'a>(&'a ID3DUserDefinedAnnotation);
@@ -1243,6 +1245,7 @@ impl DirectXRenderer {
         source_srv: &Option<ID3D11ShaderResourceView>,
         params: BlurParams,
         viewport: &D3D11_VIEWPORT,
+        scissor: Option<RECT>,
         topology: D3D_PRIMITIVE_TOPOLOGY,
         vertex_count: u32,
         clear: bool,
@@ -1270,10 +1273,25 @@ impl DirectXRenderer {
             ctx.PSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
             ctx.VSSetConstantBuffers(1, Some(&blur_params));
             ctx.PSSetConstantBuffers(1, Some(&blur_params));
-            ctx.PSSetSamplers(0, Some(slice::from_ref(&self.globals.sampler)));
+            ctx.PSSetSamplers(0, Some(slice::from_ref(&self.globals.blur_sampler)));
             ctx.PSSetShaderResources(0, Some(slice::from_ref(source_srv)));
             ctx.OMSetBlendState(blend, None, 0xFFFFFFFF);
+            let previous_rasterizer = scissor.and_then(|_| ctx.RSGetState().ok());
+            let mut previous_scissors = [RECT::default(); 16];
+            let mut previous_scissor_count = previous_scissors.len() as u32;
+            if let Some(scissor) = scissor {
+                ctx.RSGetScissorRects(
+                    &mut previous_scissor_count,
+                    Some(previous_scissors.as_mut_ptr()),
+                );
+                ctx.RSSetState(&self.pipelines.blur_rasterizer);
+                ctx.RSSetScissorRects(Some(slice::from_ref(&scissor)));
+            }
             ctx.DrawInstanced(vertex_count, 1, 0, 0);
+            if scissor.is_some() {
+                ctx.RSSetState(previous_rasterizer.as_ref());
+                ctx.RSSetScissorRects(Some(&previous_scissors[..previous_scissor_count as usize]));
+            }
             // Unbind the source so the target can be rebound as a render target next.
             ctx.PSSetShaderResources(0, Some(&null_srv));
         }
@@ -1314,6 +1332,30 @@ impl DirectXRenderer {
         };
         let half_w = (self.width / 2).max(1);
         let half_h = (self.height / 2).max(1);
+        // Match the shipping WGPU pass footprint, including the transparent
+        // outside pixels sampled by later passes of a content filter.
+        let dilation = 3.0 * blur_radius;
+        let x0 = (((bounds.origin.x.0 - dilation) * 0.5).floor().max(0.0) as u32).min(half_w);
+        let y0 = (((bounds.origin.y.0 - dilation) * 0.5).floor().max(0.0) as u32).min(half_h);
+        let x1 = ((((bounds.origin.x.0 + bounds.size.width.0 + dilation) * 0.5)
+            .ceil()
+            .max(0.0) as u32)
+            .min(half_w))
+        .max(x0);
+        let y1 = ((((bounds.origin.y.0 + bounds.size.height.0 + dilation) * 0.5)
+            .ceil()
+            .max(0.0) as u32)
+            .min(half_h))
+        .max(y0);
+        if x0 == x1 || y0 == y1 {
+            return Ok(());
+        }
+        let scissor = RECT {
+            left: x0 as i32,
+            top: y0 as i32,
+            right: x1 as i32,
+            bottom: y1 as i32,
+        };
         let half_vp = D3D11_VIEWPORT {
             TopLeftX: 0.0,
             TopLeftY: 0.0,
@@ -1346,6 +1388,7 @@ impl DirectXRenderer {
                 ..Default::default()
             },
             &half_vp,
+            Some(scissor),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -1364,6 +1407,7 @@ impl DirectXRenderer {
                 ..Default::default()
             },
             &half_vp,
+            Some(scissor),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -1382,6 +1426,7 @@ impl DirectXRenderer {
                 ..Default::default()
             },
             &half_vp,
+            Some(scissor),
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -1402,6 +1447,7 @@ impl DirectXRenderer {
                 ..Default::default()
             },
             &full_vp,
+            None,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
             4,
             false,
@@ -1428,6 +1474,7 @@ impl DirectXRenderer {
             source_srv,
             BlurParams::default(),
             &full_vp,
+            None,
             D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
             3,
             true,
@@ -1667,6 +1714,7 @@ impl DirectXRenderPipelines {
             blur_params_buffer,
             blur_blend_replace,
             blur_blend_composite,
+            blur_rasterizer: create_rasterizer_state(device, true)?,
         })
     }
 }
@@ -1700,8 +1748,8 @@ impl DirectXGlobalElements {
         let batch_params_buffer = create_constant_buffer::<BatchParams>(device)?;
         let path_params_buffer = create_constant_buffer::<PathParams>(device)?;
 
-        let sampler = unsafe {
-            let desc = D3D11_SAMPLER_DESC {
+        let (sampler, blur_sampler) = unsafe {
+            let mut desc = D3D11_SAMPLER_DESC {
                 Filter: D3D11_FILTER_MIN_MAG_MIP_LINEAR,
                 AddressU: D3D11_TEXTURE_ADDRESS_WRAP,
                 AddressV: D3D11_TEXTURE_ADDRESS_WRAP,
@@ -1715,7 +1763,14 @@ impl DirectXGlobalElements {
             };
             let mut output = None;
             device.CreateSamplerState(&desc, Some(&mut output))?;
-            output
+            // Blur samples the scene and must clamp at its edges, matching WGPU.
+            // Atlas sampling keeps its existing address mode.
+            desc.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+            desc.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+            desc.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+            let mut blur_sampler = None;
+            device.CreateSamplerState(&desc, Some(&mut blur_sampler))?;
+            (output, blur_sampler)
         };
 
         Ok(Self {
@@ -1723,6 +1778,7 @@ impl DirectXGlobalElements {
             batch_params_buffer,
             path_params_buffer,
             sampler,
+            blur_sampler,
         })
     }
 }
@@ -2204,6 +2260,12 @@ fn create_path_intermediate_msaa_texture_and_view(
 
 #[inline]
 fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceContext) -> Result<()> {
+    let state = create_rasterizer_state(device, false)?;
+    unsafe { device_context.RSSetState(&state) };
+    Ok(())
+}
+
+fn create_rasterizer_state(device: &ID3D11Device, scissor: bool) -> Result<ID3D11RasterizerState> {
     let desc = D3D11_RASTERIZER_DESC {
         FillMode: D3D11_FILL_SOLID,
         CullMode: D3D11_CULL_NONE,
@@ -2212,7 +2274,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         DepthBiasClamp: 0.0,
         SlopeScaledDepthBias: 0.0,
         DepthClipEnable: true.into(),
-        ScissorEnable: false.into(),
+        ScissorEnable: scissor.into(),
         MultisampleEnable: true.into(),
         AntialiasedLineEnable: false.into(),
     };
@@ -2221,8 +2283,7 @@ fn set_rasterizer_state(device: &ID3D11Device, device_context: &ID3D11DeviceCont
         device.CreateRasterizerState(&desc, Some(&mut state))?;
         state.unwrap()
     };
-    unsafe { device_context.RSSetState(&rasterizer_state) };
-    Ok(())
+    Ok(rasterizer_state)
 }
 
 // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/ns-d3d11-d3d11_blend_desc
@@ -3030,3 +3091,7 @@ mod path_pixel_tests;
 #[cfg(test)]
 #[path = "directx_blur_lifecycle_tests.rs"]
 mod blur_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "directx_blur_regression_tests.rs"]
+mod blur_regression_tests;
