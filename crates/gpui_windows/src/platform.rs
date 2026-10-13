@@ -18,8 +18,6 @@ use parking_lot::RwLock;
 use smallvec::SmallVec;
 #[cfg(not(feature = "wgpu"))]
 use windows::Win32::Graphics::Direct3D11::ID3D11Device;
-#[cfg(not(feature = "wgpu"))]
-use windows::Win32::Graphics::Gdi::*;
 use windows::{
     UI::ViewManagement::UISettings,
     Win32::{
@@ -43,12 +41,9 @@ pub struct WindowsPlatform {
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
-    #[cfg(not(feature = "wgpu"))]
+    #[cfg(all(not(feature = "wgpu"), not(feature = "cosmic-text")))]
     direct_write_text_system: Option<Arc<DirectWriteTextSystem>>,
     drop_target_helper: Option<IDropTargetHelper>,
-    /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
-    /// as resizing them has failed, causing us to have lost at least the render target.
-    invalidate_devices: Arc<AtomicBool>,
     handle: HWND,
     suspend_resume_notification: RefCell<Option<HPOWERNOTIFY>>,
     disable_direct_composition: bool,
@@ -79,6 +74,8 @@ pub(crate) struct WindowsPlatformState {
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     #[cfg(not(feature = "wgpu"))]
     directx_devices: RefCell<Option<DirectXDevices>>,
+    #[cfg(not(feature = "wgpu"))]
+    device_recovery: Arc<DeviceRecoverySignal>,
 }
 
 #[derive(Default)]
@@ -107,6 +104,8 @@ impl WindowsPlatformState {
             draw_coordinator: Rc::new(DrawCoordinator::new()),
             #[cfg(not(feature = "wgpu"))]
             directx_devices: RefCell::new(directx_devices),
+            #[cfg(not(feature = "wgpu"))]
+            device_recovery: Arc::default(),
             menus: RefCell::new(Vec::new()),
         }
     }
@@ -117,23 +116,28 @@ impl WindowsPlatform {
         unsafe {
             OleInitialize(None).context("unable to initialize Windows OLE")?;
         }
+        #[cfg(all(not(feature = "wgpu"), not(feature = "cosmic-text")))]
+        let mut direct_write_text_system = None;
         #[cfg(not(feature = "wgpu"))]
-        let (directx_devices, text_system, direct_write_text_system) = if !headless {
+        let (directx_devices, text_system) = if !headless {
             let devices = DirectXDevices::new().context("Creating DirectX devices")?;
-            let dw_text_system = Arc::new(
-                DirectWriteTextSystem::new(&devices)
-                    .context("Error creating DirectWriteTextSystem")?,
-            );
-            (
-                Some(devices),
-                dw_text_system.clone() as Arc<dyn PlatformTextSystem>,
-                Some(dw_text_system),
-            )
+            #[cfg(feature = "cosmic-text")]
+            let text_system = Arc::new(gpui_wgpu::CosmicTextSystem::new("Segoe UI"))
+                as Arc<dyn PlatformTextSystem>;
+            #[cfg(not(feature = "cosmic-text"))]
+            let text_system = {
+                let direct_write = Arc::new(
+                    DirectWriteTextSystem::new(&devices)
+                        .context("Error creating DirectWriteTextSystem")?,
+                );
+                direct_write_text_system = Some(direct_write.clone());
+                direct_write as Arc<dyn PlatformTextSystem>
+            };
+            (Some(devices), text_system)
         } else {
             (
                 None,
                 Arc::new(gpui::NoopTextSystem::new()) as Arc<dyn PlatformTextSystem>,
-                None,
             )
         };
         #[cfg(feature = "wgpu")]
@@ -216,13 +220,12 @@ impl WindowsPlatform {
             background_executor,
             foreground_executor,
             text_system,
-            #[cfg(not(feature = "wgpu"))]
+            #[cfg(all(not(feature = "wgpu"), not(feature = "cosmic-text")))]
             direct_write_text_system,
             suspend_resume_notification: RefCell::new(None),
             disable_direct_composition,
             has_package_identity: has_package_identity(),
             drop_target_helper,
-            invalidate_devices: Arc::new(AtomicBool::new(false)),
             app_identity: RefCell::new(None),
             system_notifications: RefCell::new(SystemNotificationState::new()),
         })
@@ -259,7 +262,8 @@ impl WindowsPlatform {
             disable_direct_composition: self.disable_direct_composition,
             #[cfg(not(feature = "wgpu"))]
             directx_devices: self.inner.state.directx_devices.borrow().clone().unwrap(),
-            invalidate_devices: self.invalidate_devices.clone(),
+            #[cfg(not(feature = "wgpu"))]
+            device_recovery: self.inner.state.device_recovery.clone(),
             draw_coordinator: self.inner.state.draw_coordinator.clone(),
         }
     }
@@ -326,56 +330,40 @@ impl WindowsPlatform {
     }
 
     #[cfg(not(feature = "wgpu"))]
-    fn begin_vsync_thread(&self) {
-        #[cfg(not(feature = "wgpu"))]
-        let Some(directx_devices) = self.inner.state.directx_devices.borrow().clone() else {
+    fn begin_device_recovery_thread(&self) {
+        let Some(mut directx_device) = self.inner.state.directx_devices.borrow().clone() else {
             return;
         };
-        #[cfg(not(feature = "wgpu"))]
-        let Some(direct_write_text_system) = &self.direct_write_text_system else {
-            return;
-        };
-        #[cfg(not(feature = "wgpu"))]
-        let mut directx_device = directx_devices;
-        #[cfg(not(feature = "wgpu"))]
         let platform_window: SafeHwnd = self.handle.into();
-        #[cfg(not(feature = "wgpu"))]
         let validation_number = self.inner.validation_number;
         let all_windows = Arc::downgrade(&self.raw_window_handles);
-        #[cfg(not(feature = "wgpu"))]
-        let text_system = Arc::downgrade(direct_write_text_system);
-        #[cfg(not(feature = "wgpu"))]
-        let invalidate_devices = self.invalidate_devices.clone();
+        // Cosmic owns a CPU glyph cache; only DirectWrite needs this GPU callback.
+        #[cfg(not(feature = "cosmic-text"))]
+        let text_system = self
+            .direct_write_text_system
+            .as_ref()
+            .map(Arc::downgrade)
+            .unwrap_or_default();
+        let recovery = self.inner.state.device_recovery.clone();
 
         std::thread::Builder::new()
-            .name("VSyncProvider".to_owned())
+            .name("GpuRecovery".to_owned())
             .spawn(move || {
-                let vsync_provider = VSyncProvider::new();
-                loop {
-                    vsync_provider.wait_for_vsync();
-                    #[cfg(not(feature = "wgpu"))]
-                    {
-                        if check_device_lost(&directx_device.device)
-                            || invalidate_devices.fetch_and(false, Ordering::Acquire)
-                        {
-                            if let Err(err) = handle_gpu_device_lost(
-                                &mut directx_device,
-                                platform_window.as_raw(),
-                                validation_number,
-                                &all_windows,
-                                &text_system,
-                            ) {
-                                panic!("Device lost: {err}");
-                            }
-                        }
-                    }
-                    let Some(all_windows) = all_windows.upgrade() else {
+                while let Some(invalidated) = recovery.wait() {
+                    if all_windows.upgrade().is_none() {
                         break;
-                    };
-                    for hwnd in all_windows.read().iter() {
-                        unsafe {
-                            let _ = RedrawWindow(Some(hwnd.as_raw()), None, None, RDW_INVALIDATE);
-                        }
+                    }
+                    if (invalidated || check_device_lost(&directx_device.device))
+                        && let Err(err) = handle_gpu_device_lost(
+                            &mut directx_device,
+                            platform_window.as_raw(),
+                            validation_number,
+                            &all_windows,
+                            #[cfg(not(feature = "cosmic-text"))]
+                            &text_system,
+                        )
+                    {
+                        panic!("Device lost: {err}");
                     }
                 }
             })
@@ -475,7 +463,7 @@ impl Platform for WindowsPlatform {
         on_finish_launching();
         #[cfg(not(feature = "wgpu"))]
         if !self.headless {
-            self.begin_vsync_thread();
+            self.begin_device_recovery_thread();
         }
 
         let mut msg = MSG::default();
@@ -611,7 +599,6 @@ impl Platform for WindowsPlatform {
         let window = WindowsWindow::new(handle, options, self.generate_creation_info())?;
         let handle = window.get_raw_handle();
         self.raw_window_handles.write().push(handle.into());
-        #[cfg(feature = "wgpu")]
         if !self.headless {
             let clock =
                 crate::monitor_vsync::start(handle.into(), Arc::clone(&window.state.frame_ready))?;
@@ -1207,6 +1194,8 @@ impl WindowsPlatformInner {
 
     fn handle_power_broadcast(&self, wparam: WPARAM) -> Option<isize> {
         if wparam.0 as u32 == PBT_APMRESUMEAUTOMATIC {
+            #[cfg(not(feature = "wgpu"))]
+            self.state.device_recovery.request_check();
             self.with_callback(|callbacks| &callbacks.system_wake, |callback| callback());
         }
         Some(1)
@@ -1225,6 +1214,8 @@ impl WindowsPlatformInner {
 
 impl Drop for WindowsPlatform {
     fn drop(&mut self) {
+        #[cfg(not(feature = "wgpu"))]
+        self.inner.state.device_recovery.close();
         unsafe {
             if let Some(notification) = self.suspend_resume_notification.borrow_mut().take() {
                 // SAFETY: notification was returned by RegisterSuspendResumeNotification.
@@ -1250,9 +1241,9 @@ pub(crate) struct WindowCreationInfo {
     pub(crate) disable_direct_composition: bool,
     #[cfg(not(feature = "wgpu"))]
     pub(crate) directx_devices: DirectXDevices,
-    /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
-    /// as resizing them has failed, causing us to have lost at least the render target.
-    pub(crate) invalidate_devices: Arc<AtomicBool>,
+    /// Shared native device recovery demand, including failed swapchain resizes.
+    #[cfg(not(feature = "wgpu"))]
+    pub(crate) device_recovery: Arc<DeviceRecoverySignal>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
 }
@@ -1487,7 +1478,7 @@ fn handle_gpu_device_lost(
     platform_window: HWND,
     validation_number: usize,
     all_windows: &std::sync::Weak<RwLock<SmallVec<[SafeHwnd; 4]>>>,
-    text_system: &std::sync::Weak<DirectWriteTextSystem>,
+    #[cfg(not(feature = "cosmic-text"))] text_system: &std::sync::Weak<DirectWriteTextSystem>,
 ) -> Result<()> {
     // Here we wait a bit to ensure the system has time to recover from the device lost state.
     // If we don't wait, the final drawing result will be blank.
@@ -1508,6 +1499,7 @@ fn handle_gpu_device_lost(
         );
     }
 
+    #[cfg(not(feature = "cosmic-text"))]
     if let Some(text_system) = text_system.upgrade() {
         text_system.handle_gpu_lost(&directx_devices)?;
     }

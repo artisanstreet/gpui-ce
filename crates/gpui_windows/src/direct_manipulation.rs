@@ -127,7 +127,6 @@ impl DirectManipulationHandler {
         std::mem::take(&mut *self.pending_events.borrow_mut())
     }
 
-    #[cfg(feature = "wgpu")]
     pub fn needs_update(&self) -> bool {
         self.activity.viewport.get() || self.activity.interaction.get()
     }

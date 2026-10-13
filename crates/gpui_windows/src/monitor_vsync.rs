@@ -1,4 +1,4 @@
-//! One demand-driven display clock per wgpu window. Idle clocks sleep until
+//! One demand-driven display clock per window. Idle clocks sleep until
 //! invalidation or animation requests a frame.
 
 use std::{

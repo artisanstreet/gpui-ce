@@ -23,6 +23,30 @@ A separate native D3D11 diagnostic found a rendering defect outside Artisan's pr
 3. Wayland serial tracking is a HashMap for a fixed five-element enum. An inline array removes one small allocation and hashing in input dispatch. Low absolute benefit; retained as a later cleanup candidate.
 4. X11 creates temporary event Vec and exposed-window HashSet per drain pass, and frame pings temporarily collect window ids. These are active-event costs. Reusing storage must preserve reentrant callbacks and is not justified by the current idle measurements.
 
+## Native Windows followup
+
+The native D3D11 path now shares the demand-driven per-window display clock
+with WGPU. The former unconditional native loop is removed. Device recovery
+has a separate coalescing signal that parks until a draw or resize reports a
+failure. Requests received during recovery remain pending. Window destruction
+closes its frame signal before callbacks, and platform teardown closes the
+recovery signal. Resize, restore and successful device recreation request a
+forced redraw so cached atlas references cannot survive a replaced device.
+
+The `cosmic-text` feature uses the same text system as WGPU and excludes the
+unused DirectWrite owner and recovery callback. Existing native DirectWrite
+builds remain available without that feature. The native/Cosmic, native
+DirectWrite, WGPU and combined-feature configurations all compile.
+
+The current native Windows library passes 18 graphics tests and strict Cosmic
+Clippy. Its wider non-clipboard run passes 29 tests, with the previously
+documented Norwegian keyboard-layout mismatch. Full Editor hardware captures
+preserve conversation/input/palette and mesh-control appearance; resize and
+minimize/restore return identical transcript/composer pixels. Physical GPU
+removal during teardown and real touchpad inertia remain unverified. The
+pre-existing synchronous device-recovery message path still warrants a
+separate shutdown-race investigation.
+
 ## File coverage
 
 | File | Review depth/status | Result |
@@ -77,6 +101,6 @@ A separate native D3D11 diagnostic found a rendering defect outside Artisan's pr
 | [crates/gpui_windows/src/system_notifications.rs](../crates/gpui_windows/src/system_notifications.rs) | Changed; regression tests | Terminal native events release retained toast; generation guard protects replacement; weak callbacks avoid ownership cycle. |
 | [crates/gpui_windows/src/system_settings.rs](../crates/gpui_windows/src/system_settings.rs) | Inspected | Two cached scroll-setting integers, refreshed on OS settings messages. |
 | [crates/gpui_windows/src/util.rs](../crates/gpui_windows/src/util.rs) | Inspected | Fixed lazy native cursor cache and on-demand utility calls. |
-| [crates/gpui_windows/src/vsync.rs](../crates/gpui_windows/src/vsync.rs) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| Former `crates/gpui_windows/src/vsync.rs` | Removed in native followup | Replaced by the shared demand-driven per-window clock and separate device-recovery signal. |
 | [crates/gpui_windows/src/window.rs](../crates/gpui_windows/src/window.rs) | Changed; reviewed | All GPUI frame wakes reach demand clock. Drop closes the clock before HWND destruction; native callbacks remain lazy. |
 | [crates/gpui_windows/src/wrapper.rs](../crates/gpui_windows/src/wrapper.rs) | Inspected | Copy native-handle wrappers; no owning allocation. |

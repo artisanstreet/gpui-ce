@@ -813,7 +813,7 @@ mod tests {
 
     fn test_image_with_size(width: u32, height: u32) -> Arc<RenderImage> {
         let frame = Frame::new(ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0])));
-        Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1)))
+        Arc::new(RenderImage::new(SmallVec::from_buf([frame])))
     }
 
     /// Overwrites the cached `frame_index` of the sibling `img` during paint.

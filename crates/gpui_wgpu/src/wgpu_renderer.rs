@@ -3,10 +3,8 @@ mod pipelines;
 use pipelines::WgpuPipelines;
 #[path = "wgpu_recovery.rs"]
 mod recovery;
+use gpui::path_targets::{path_batch_bounds, path_target_size, retained_path_target_size};
 use recovery::{FrameErrorAction, FrameErrorState};
-#[path = "wgpu_paths.rs"]
-mod paths;
-use paths::{path_batch_bounds, path_target_size, retained_path_target_size};
 #[path = "wgpu_diagnostics.rs"]
 pub(crate) mod diagnostics;
 use diagnostics::RendererMemoryDiagnostics;
@@ -19,7 +17,6 @@ use gpui::{
     AtlasTextureId, BackdropFilter, Background, Bounds, DevicePixels, FilterBoundary, GpuSpecs,
     MonochromeSprite, PaintMesh, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledFilter, ScaledPixels, Scene, Shadow, Size, SubpixelSprite, Underline,
-    get_gamma_correction_ratios,
 };
 use log::warn;
 
@@ -1141,8 +1138,8 @@ impl WgpuRenderer {
 
     /// Allocate only the offscreen targets needed by this frame. Capture needs the scene
     /// texture; blur also needs half-resolution scratch textures, and content filters need
-    /// one full-resolution target per active nesting level. Keep them during continuous
-    /// offscreen use; a normal frame releases the pool without discarding its pipelines.
+    /// one full-resolution target per active nesting level. Group targets release when
+    /// content filters disappear; the rest release when all offscreen use ends.
     fn ensure_offscreen_textures(&mut self, needs_blur: bool, group_depth: usize) {
         let format = self.surface_config.format;
         let width = self.surface_config.width;
@@ -1380,11 +1377,9 @@ impl WgpuRenderer {
         let capture = self.capture_armed.take();
         let needs_blur = !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
         let use_offscreen = capture || needs_blur;
+        let content_depth = filter_group_depth(&scene.filter_boundaries);
         if use_offscreen {
-            self.ensure_offscreen_textures(
-                needs_blur,
-                filter_group_depth(&scene.filter_boundaries),
-            );
+            self.ensure_offscreen_textures(needs_blur, content_depth);
         } else {
             // Only release after successful acquisition. Submitted commands keep
             // their resources alive, including a preceding capture's texture copy.
@@ -1461,6 +1456,12 @@ impl WgpuRenderer {
 
             frame.present();
             self.frame_presented();
+            let resources = self.resources_mut();
+            release_unused_group_targets(
+                content_depth,
+                &mut resources.group_textures,
+                &mut resources.group_views,
+            );
             self.report_memory_allocations(scene);
             return true;
         }
@@ -1777,6 +1778,12 @@ impl WgpuRenderer {
             }
             frame.present();
             self.frame_presented();
+            let resources = self.resources_mut();
+            release_unused_group_targets(
+                content_depth,
+                &mut resources.group_textures,
+                &mut resources.group_views,
+            );
             self.report_memory_allocations(scene);
             return true;
         }
@@ -3497,6 +3504,20 @@ fn instance_range(range: Range<usize>) -> Range<u32> {
     range.start as u32..range.end as u32
 }
 
+/// Backdrop blur keeps scene/ping/pong alive but does not use content-group targets.
+/// Keep positive nesting high-water capacity to avoid reallocating alternating depths;
+/// submitted commands retain their own resource references after these handles drop.
+fn release_unused_group_targets(
+    content_depth: usize,
+    textures: &mut Vec<wgpu::Texture>,
+    views: &mut Vec<wgpu::TextureView>,
+) {
+    if content_depth == 0 {
+        views.clear();
+        textures.clear();
+    }
+}
+
 fn filter_group_depth(boundaries: &[FilterBoundary]) -> usize {
     let mut depth = 0usize;
     let mut max_depth = 0;
@@ -3539,38 +3560,19 @@ struct RenderingParameters {
 
 impl RenderingParameters {
     fn new(adapter: &wgpu::Adapter, surface_format: wgpu::TextureFormat) -> Self {
-        use std::env;
-
         let format_features = adapter.get_texture_format_features(surface_format);
         let path_sample_count = [4, 2, 1]
             .into_iter()
             .find(|&n| format_features.flags.sample_count_supported(n))
             .unwrap_or(1);
 
-        let gamma = env::var("ZED_FONTS_GAMMA")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.8_f32)
-            .clamp(1.0, 2.2);
-        let gamma_ratios = get_gamma_correction_ratios(gamma);
-
-        let grayscale_enhanced_contrast = env::var("ZED_FONTS_GRAYSCALE_ENHANCED_CONTRAST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(1.0_f32)
-            .max(0.0);
-
-        let subpixel_enhanced_contrast = env::var("ZED_FONTS_SUBPIXEL_ENHANCED_CONTRAST")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.5_f32)
-            .max(0.0);
+        let font = gpui::FontRenderingParameters::from_env();
 
         Self {
             path_sample_count,
-            gamma_ratios,
-            grayscale_enhanced_contrast,
-            subpixel_enhanced_contrast,
+            gamma_ratios: font.gamma_ratios,
+            grayscale_enhanced_contrast: font.grayscale_enhanced_contrast,
+            subpixel_enhanced_contrast: font.subpixel_enhanced_contrast,
         }
     }
 }

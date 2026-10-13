@@ -446,3 +446,117 @@ fn render_paths(
     readback.unmap();
     Ok(pixels)
 }
+
+/// Content-filter targets can disappear while persistent backdrop blur keeps the rest
+/// of the offscreen pool alive. Encoded work must survive dropping every pool handle.
+#[test]
+fn content_group_targets_release_without_invalidating_queued_commands() -> Result<()> {
+    let (device, queue) = test_device()?;
+    let mut textures = Vec::new();
+    let mut views = Vec::new();
+    let allocate = || WgpuRenderer::create_path_intermediate(&device, FORMAT, 8, 8);
+    for _ in 0..2 {
+        let (texture, view) = allocate();
+        textures.push(texture);
+        views.push(view);
+    }
+    release_unused_group_targets(1, &mut textures, &mut views);
+    assert_eq!(
+        textures.len(),
+        2,
+        "active filters retain nesting high-water capacity"
+    );
+    assert_eq!(views.len(), 2);
+
+    let row_bytes = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    let target_bytes = u64::from(row_bytes) * 8;
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("released content-group readback"),
+        size: target_bytes * 2,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&Default::default());
+    for (index, color) in [wgpu::Color::RED, wgpu::Color::GREEN]
+        .into_iter()
+        .enumerate()
+    {
+        {
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("old content group"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &views[index],
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(color),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
+        encoder.copy_texture_to_buffer(
+            textures[index].as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: index as u64 * target_bytes,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(8),
+                },
+            },
+            textures[index].size(),
+        );
+    }
+    let old_commands = encoder.finish();
+    release_unused_group_targets(0, &mut textures, &mut views);
+    assert!(textures.is_empty());
+    assert!(views.is_empty());
+    // Recreate the same target sizes before submitting work on the previous pool.
+    let mut replacement_encoder = device.create_command_encoder(&Default::default());
+    for _ in 0..2 {
+        let (texture, view) = allocate();
+        {
+            let _pass = replacement_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("replacement content group"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLUE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+        }
+        textures.push(texture);
+        views.push(view);
+    }
+    let submission = queue.submit([replacement_encoder.finish(), old_commands]);
+    let (sender, receiver) = mpsc::channel();
+    readback
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            sender.send(result).unwrap();
+        });
+    device.poll(wgpu::PollType::Wait {
+        submission_index: Some(submission),
+        timeout: Some(Duration::from_secs(10)),
+    })?;
+    receiver.recv_timeout(Duration::from_secs(10))??;
+    {
+        let pixels = readback.slice(..).get_mapped_range();
+        for (index, expected) in [[255, 0, 0, 255], [0, 255, 0, 255]].iter().enumerate() {
+            let begin = index * target_bytes as usize;
+            for row in pixels[begin..begin + target_bytes as usize].chunks_exact(row_bytes as usize)
+            {
+                assert!(row[..8 * 4].chunks_exact(4).all(|pixel| pixel == expected));
+            }
+        }
+    }
+    readback.unmap();
+    Ok(())
+}

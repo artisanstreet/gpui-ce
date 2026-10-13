@@ -53,7 +53,7 @@ Tests should cover one oversized hidden model, multiple hidden entries evicted i
 | [wgpu_atlas.rs](../crates/gpui_wgpu/src/wgpu_atlas.rs) | Inspected; tests reviewed | Page growth, device bounds, owned staging uploads, page deletion, index reuse, and accounting. |
 | [wgpu_renderer.rs](../crates/gpui_wgpu/src/wgpu_renderer.rs) | Changed; allocation/recovery paths reviewed | Lazy resources, path rebasing, capacity growth, surface failures, capture, filter target stack, and mesh lifecycle. Large file has focused path coverage rather than a claim that every branch was executed. |
 | [wgpu_recovery.rs](../crates/gpui_wgpu/src/wgpu_recovery.rs) | Changed; tests pass | Failure count survives skipped frames and resets; successful presentation starts a fresh retry budget. |
-| [wgpu_paths.rs](../crates/gpui_wgpu/src/wgpu_paths.rs) | Changed; tests pass | Batch bounds, outward rounding, viewport clamp, tall/wide retention, and no-path release/reset. |
+| [path_targets.rs](../crates/gpui/src/path_targets.rs) | Shared by native and WGPU; tests pass | Batch bounds, outward rounding, viewport clamp, tall/wide retention, and no-path release/reset. |
 | [wgpu_pipelines.rs](../crates/gpui_wgpu/src/wgpu_pipelines.rs) | Inspected; tests reviewed | Lazy groups retain explicit layouts, blend states, formats, and shader module reuse. Transparency changes re-create the groups on demand. |
 | [wgpu_diagnostics.rs](../crates/gpui_wgpu/src/wgpu_diagnostics.rs) | Inspected | Opt-in allocation scans; excludes swapchain, driver/compiler memory, and allocator padding from texel totals. |
 | [wgpu_mesh.rs](../crates/gpui_wgpu/src/wgpu_mesh.rs) | Changed; pixel/lifetime tests pass | Exact-size color/depth scratch sharing and direct mapped vertex uploads remove duplicate storage. Frame-count geometry expiration remains a candidate. |
@@ -123,3 +123,42 @@ differences and do not qualify as a production replacement. The atlas/blur
 allocation changes preserve those binaries' existing rendering behavior.
 Artifacts are in Editor `.dist/performance/native-allocation/`, including
 `native-tests/`, `idle/`, the immutable executable hash and source manifest.
+
+## Native Windows appearance and bounded paths
+
+The native renderer can now share Cosmic text shaping and BGRA glyph coverage
+with WGPU through `cosmic-text`. WGPU takes precedence when both features are
+enabled. Cosmic excludes the dormant DirectWrite owner, recovery callback and
+two DirectWrite-only shader stages. Native color emoji uses the CPU glyph cache
+and existing polychrome sprite path.
+
+Native draws now restore their batch constant buffer after a blur pass. Color
+conversion, ordered RGB dither, outer-shadow clipping and premultiplied alpha
+accumulation match WGPU. A frozen full Editor comparison on the Windows GPU
+covers ten conversation/input/palette scenes and six mesh-control scenes.
+Outside the changing FPS display, every channel differs by at most one value.
+The model region is byte-identical for initial, orbit, zoom, reset, wireframe
+and shaded states. Resize and minimize/restore preserve transcript/composer
+pixels exactly. Pointer-drag/pan and physical touchpad tests remain separate.
+These captures precede the later Taffy, DirectWrite exclusion and unused-group
+release followups; they do not silently validate a newer executable.
+
+Native path targets now use the shared bounds/capacity helper, integer target
+origins and screen-space gradients/dither. They grow in 64-pixel buckets and
+release after a path-free frame. A failed growth retains valid old targets;
+resize unbinds the active render target before resizing swapchain buffers.
+The composite reads exact integer texels instead of resampling normalized UVs.
+Full and compact targets produce byte-identical images across all six checked
+path scenes, including odd dimensions. Historical compiler-specific rounding
+goldens are retained separately from these always-on comparisons.
+
+Native mesh rendering uses lazy mesh/composite pipelines and shared color/depth
+scratch, preserving draw order, premultiplied composition, depth and edge
+appearance. Portable HLSL compilation uses the host compiler and embeds DXBC
+when cross-compiling. Native FXC and D3DCompile paths remain supported.
+
+The current native library passes 18 graphics tests and strict Cosmic Clippy;
+all 24 WGPU renderer tests and strict core/Linux/WGPU Clippy pass. Artifacts are
+in Editor `.dist/performance/native-integrated-v1`, `native-paths`,
+`native-cosmic-integration/directwrite-exclusion` and `native-blur-lifecycle`.
+Process memory and idle CPU are measured independently of these pixel tests.

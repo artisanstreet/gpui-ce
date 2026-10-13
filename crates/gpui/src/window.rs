@@ -5002,14 +5002,13 @@ impl Window {
         });
     }
 
-    /// Whether this window's renderer draws [`crate::Mesh`]es. Only the wgpu
-    /// renderer does; elsewhere [`Self::paint_mesh`] paints nothing, so draw a
-    /// fallback instead.
+    /// Whether this window's renderer draws [`crate::Mesh`]es. The wgpu and
+    /// native Windows renderers do; elsewhere draw a fallback instead.
     pub fn supports_meshes(&self) -> bool {
         cfg!(any(
             target_os = "linux",
             target_os = "freebsd",
-            all(target_os = "windows", feature = "wgpu-surfaces")
+            target_os = "windows"
         ))
     }
 

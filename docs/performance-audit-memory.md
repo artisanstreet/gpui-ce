@@ -330,3 +330,61 @@ Earlier Vulkan runs that inherited a typed draft are preserved with
 The 25–30 MB whole-application target is not established. GPU reservations,
 Rust allocator storage, native allocations and mapped driver pages overlap
 in process accounting and must not be summed as independent RSS savings.
+
+## Taffy feature selection
+
+GPUI now enables Taffy's tree, standard library, block, flex and grid features
+explicitly. Its style conversion does not expose float or calc inputs, and its
+layout output reads do not use detailed grid information or Taffy's content-size
+field. GPUI maintains content bounds separately.
+
+An isolated layout probe compares 9,144 node geometries across 72 mixed cases.
+Locations, sizes, padding and scrollbar widths match exactly. For a tree with
+capacity 2,048, requested allocation falls from 2,430,112 to 2,364,544 bytes.
+The integrated core/Linux/GPU suites pass 393/58/75 tests, and strict Clippy
+passes. This establishes layout parity and a 65,568-byte capacity reduction,
+not an Editor RSS reduction. The native Editor capture snapshot predates this
+manifest-only followup. Evidence is in Editor `.dist/performance/taffy-feature-audit`.
+
+
+## Native and WGPU content-filter target lifetimes
+
+Content-filter group targets used to retain their nesting high-water capacity
+as long as any backdrop blur remained. Editor copy-feedback icons use transient
+content blur during their cross-fade, while the composer keeps backdrop blur
+active. A finished animation could therefore leave full-window group textures
+retained for the rest of the window lifetime.
+
+The native renderer now drops group textures and views after the frame's blur
+passes and final scene blit when no content filters remain. It keeps the
+scene-color and half-resolution ping/pong targets for backdrop blur, and keeps
+positive-depth high-water capacity to avoid reallocating alternating nested
+frames. At 1898×1125 each group descriptor represents 8,541,000 texel bytes;
+this is GPU resource size, not a measured process RSS reduction.
+
+The native regression failed before the change at the empty-group assertion.
+Afterward, the scene with two nested filters renders byte-identically when the
+filters reappear. A separate deferred-command test drops all caller handles,
+recreates the pool, and still reads the old commands' exact red/green pixels.
+The integrated Cosmic/native library passed all 18 DirectX tests, including
+mesh, bounded-path and resize checks. The wider non-clipboard suite passed
+29 tests; its keyboard-layout-dependent Ctrl+$ assertion still receives Ctrl+¤.
+An earlier native Windows run at fork revision `3f17269` shows the same failure
+in unchanged keyboard code, preserved in
+`.dist/performance/windows-platform-library-tests/native-run`. The test that
+writes to the real clipboard was not run.
+
+WGPU had the same retention path. It now releases depth-zero group targets
+after a successful submission/presentation in both instance-data transports.
+Its headless regression clears/recreates every pool handle before submitting
+old recorded work and reads the original pixels. All 24 WGPU renderer tests
+passed, including the path, gradient, mesh and shader checks. Native Cosmic
+library Clippy passed with warnings denied; the existing MinGW linker-message
+warning is explicitly outside that compiler lint setting. Strict core, WGPU
+and Linux library Clippy also passed after the matching release change.
+
+Artifacts and binary hashes are in
+`.dist/performance/native-blur-lifecycle`. Actual completed-conversation filter
+rectangles are not yet measured; a separate opt-in descriptor/extent probe is
+prepared under `.dist/performance/native-blur-extents`. The full scene-color
+texture remains unchanged while bounded blur scratch targets are investigated.

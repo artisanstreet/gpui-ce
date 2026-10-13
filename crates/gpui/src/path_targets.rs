@@ -1,6 +1,9 @@
-use gpui::{Path, PrimitiveBatch, ScaledPixels, Scene};
+//! Shared bounds and retained capacity for antialiased path render targets.
 
-pub(super) fn path_target_size(scene: &Scene, viewport: [u32; 2]) -> Option<[u32; 2]> {
+use crate::{Path, PrimitiveBatch, ScaledPixels, Scene};
+
+/// Required target capacity for the scene, rounded to stable 64-pixel buckets.
+pub fn path_target_size(scene: &Scene, viewport: [u32; 2]) -> Option<[u32; 2]> {
     if scene.paths.is_empty() {
         return None;
     }
@@ -19,7 +22,8 @@ pub(super) fn path_target_size(scene: &Scene, viewport: [u32; 2]) -> Option<[u32
     ])
 }
 
-pub(super) fn retained_path_target_size(
+/// Grow existing targets componentwise, releasing them when the scene has no paths.
+pub fn retained_path_target_size(
     current: Option<[u32; 2]>,
     required: Option<[u32; 2]>,
 ) -> Option<[u32; 2]> {
@@ -33,7 +37,7 @@ pub(super) fn retained_path_target_size(
 
 /// Integer-aligned extent of a path batch, with a one-pixel sampling guard.
 /// All paths retain their screen-space positions relative to this origin.
-pub(super) fn path_batch_bounds(paths: &[Path<ScaledPixels>], viewport: [u32; 2]) -> [u32; 4] {
+pub fn path_batch_bounds(paths: &[Path<ScaledPixels>], viewport: [u32; 2]) -> [u32; 4] {
     let mut left = viewport[0] as f32;
     let mut top = viewport[1] as f32;
     let mut right = 0.0f32;
@@ -64,7 +68,7 @@ pub(super) fn path_batch_bounds(paths: &[Path<ScaledPixels>], viewport: [u32; 2]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{Bounds, ContentMask, point, px, size};
+    use crate::{Bounds, ContentMask, point, px, size};
 
     fn path(x: f32, y: f32, width: f32, height: f32) -> Path<ScaledPixels> {
         let mut path = Path::new(point(px(x), px(y))).scale(1.0);

@@ -81,11 +81,8 @@ pub struct WindowsWindowState {
     /// progress and had to be deferred.
     pub force_render_pending: Cell<bool>,
     /// One render permit per monitor vblank; missed frames coalesce.
-    #[cfg(feature = "wgpu")]
     pub(crate) frame_ready: Arc<AtomicBool>,
-    #[cfg(feature = "wgpu")]
     pub(crate) frame_clock: RefCell<Option<crate::monitor_vsync::FrameClock>>,
-    #[cfg(feature = "wgpu")]
     pub(crate) vsync_enabled: Arc<AtomicBool>,
 
     pub click_state: ClickState,
@@ -96,10 +93,9 @@ pub struct WindowsWindowState {
     pub dragging: Cell<bool>,
 
     pub display: Cell<WindowsDisplay>,
-    /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
-    /// as resizing them has failed, causing us to have lost at least the render target.
+    /// Wakes shared native device recovery after a draw or resize failure.
     #[cfg(not(feature = "wgpu"))]
-    pub invalidate_devices: Arc<AtomicBool>,
+    pub device_recovery: Arc<DeviceRecoverySignal>,
     /// Shared with [`WindowsPlatformState::draw_coordinator`] and every other window.
     pub(crate) draw_coordinator: Rc<DrawCoordinator>,
     fullscreen: Cell<Option<StyleAndBounds>>,
@@ -136,7 +132,7 @@ impl WindowsWindowState {
         min_size: Option<Size<Pixels>>,
         appearance: WindowAppearance,
         #[cfg(not(feature = "wgpu"))] disable_direct_composition: bool,
-        #[cfg(not(feature = "wgpu"))] invalidate_devices: Arc<AtomicBool>,
+        #[cfg(not(feature = "wgpu"))] device_recovery: Arc<DeviceRecoverySignal>,
         draw_coordinator: Rc<DrawCoordinator>,
     ) -> Result<Self> {
         let scale_factor = {
@@ -204,11 +200,8 @@ impl WindowsWindowState {
             hovered: Cell::new(hovered),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
-            #[cfg(feature = "wgpu")]
             frame_ready: Arc::new(AtomicBool::new(true)),
-            #[cfg(feature = "wgpu")]
             frame_clock: RefCell::new(None),
-            #[cfg(feature = "wgpu")]
             vsync_enabled: Arc::new(AtomicBool::new(true)),
             click_state,
             current_cursor: Cell::new(current_cursor),
@@ -220,7 +213,7 @@ impl WindowsWindowState {
             initial_placement: Cell::new(initial_placement),
             hwnd,
             #[cfg(not(feature = "wgpu"))]
-            invalidate_devices,
+            device_recovery,
             draw_coordinator,
             direct_manipulation,
             a11y: RefCell::new(None),
@@ -287,7 +280,6 @@ impl WindowsWindowState {
 }
 
 impl WindowsWindowInner {
-    #[cfg(feature = "wgpu")]
     pub(crate) fn request_frame(&self) {
         if self.state.vsync_enabled.load(Ordering::Acquire)
             && let Some(clock) = self.state.frame_clock.borrow().as_ref()
@@ -314,7 +306,7 @@ impl WindowsWindowInner {
             #[cfg(not(feature = "wgpu"))]
             context.disable_direct_composition,
             #[cfg(not(feature = "wgpu"))]
-            context.invalidate_devices.clone(),
+            context.device_recovery.clone(),
             context.draw_coordinator.clone(),
         )?;
 
@@ -465,7 +457,7 @@ struct WindowCreateContext {
     #[cfg(not(feature = "wgpu"))]
     directx_devices: DirectXDevices,
     #[cfg(not(feature = "wgpu"))]
-    invalidate_devices: Arc<AtomicBool>,
+    device_recovery: Arc<DeviceRecoverySignal>,
     draw_coordinator: Rc<DrawCoordinator>,
     parent_hwnd: Option<HWND>,
 }
@@ -494,13 +486,10 @@ impl WindowsWindow {
             disable_direct_composition,
             #[cfg(not(feature = "wgpu"))]
             directx_devices,
-            invalidate_devices,
+            #[cfg(not(feature = "wgpu"))]
+            device_recovery,
             draw_coordinator,
         } = creation_info;
-        #[cfg(feature = "wgpu")]
-        {
-            _ = invalidate_devices;
-        }
         register_window_class(icon);
         let parent_hwnd = if params.kind == WindowKind::Dialog {
             let parent_window = unsafe { GetActiveWindow() };
@@ -586,7 +575,7 @@ impl WindowsWindow {
             #[cfg(not(feature = "wgpu"))]
             directx_devices,
             #[cfg(not(feature = "wgpu"))]
-            invalidate_devices,
+            device_recovery,
             draw_coordinator,
             parent_hwnd,
         };
@@ -688,7 +677,6 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
-        #[cfg(feature = "wgpu")]
         self.state.frame_clock.borrow_mut().take();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
@@ -1135,7 +1123,6 @@ impl PlatformWindow for WindowsWindow {
         Some(self.state.renderer.borrow().device_lost())
     }
 
-    #[cfg(feature = "wgpu")]
     fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
         let window = Rc::downgrade(&self.0);
         Some(Rc::new(move || {
@@ -1145,30 +1132,33 @@ impl PlatformWindow for WindowsWindow {
         }))
     }
 
-    #[cfg(feature = "wgpu")]
     fn schedule_frame(&self) {
         self.0.request_frame();
     }
 
-    #[cfg(feature = "wgpu")]
     fn set_vsync(&self, enabled: bool) {
-        if self.state.renderer.borrow_mut().set_vsync(enabled) {
-            self.state.vsync_enabled.store(enabled, Ordering::Release);
-            self.state.frame_ready.store(true, Ordering::Release);
-            self.schedule_frame();
-        } else {
+        #[cfg(feature = "wgpu")]
+        if !self.state.renderer.borrow_mut().set_vsync(enabled) {
             log::warn!("Adapter does not support presentation without VSync");
+            return;
         }
+        self.state.vsync_enabled.store(enabled, Ordering::Release);
+        self.state.frame_ready.store(true, Ordering::Release);
+        self.schedule_frame();
     }
 
     fn draw(&self, scene: &Scene) {
         #[cfg(not(feature = "wgpu"))]
         {
-            self.state
+            let result = self
+                .state
                 .renderer
                 .borrow_mut()
-                .draw(scene, self.state.background_appearance.get())
-                .log_err();
+                .draw(scene, self.state.background_appearance.get());
+            if let Err(error) = result {
+                log::error!("failed to render scene: {error}");
+                self.state.device_recovery.request_check();
+            }
         }
 
         #[cfg(feature = "wgpu")]

@@ -1,4 +1,6 @@
 mod app_menu;
+mod font_rendering;
+pub use font_rendering::FontRenderingParameters;
 mod keyboard;
 mod keystroke;
 
@@ -2823,7 +2825,7 @@ pub(crate) fn decode_static_image_from_decoder(
         pixel.swap(0, 2);
     }
 
-    Ok(SmallVec::from_elem(Frame::new(data), 1))
+    Ok(SmallVec::from_buf([Frame::new(data)]))
 }
 
 impl Hash for Image {

@@ -1,245 +1,236 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
-fn main() {
-    #[cfg(target_os = "windows")]
+use std::{
+    env, fs,
+    io::Write,
+    path::{Path, PathBuf},
+    process::Command,
+};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn main() -> Result<()> {
+    println!("cargo:rustc-check-cfg=cfg(gpui_precompiled_shaders)");
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        || env::var_os("CARGO_FEATURE_WGPU").is_some()
     {
-        // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
-        compile_shaders();
+        return Ok(());
     }
+    for file in [
+        "shaders.hlsl",
+        "alpha_correction.hlsl",
+        "color_text_raster.hlsl",
+        "shaders_mesh.hlsl",
+    ] {
+        println!("cargo:rerun-if-changed=src/{file}");
+    }
+    for name in ["GPUI_FXC_PATH", "GPUI_VKD3D_COMPILER", "PATH"] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
+    // Native Windows debug builds compile from source at runtime for hot reload.
+    // A cross-compiled executable cannot open its build host's source paths.
+    if cfg!(debug_assertions) && env::var("HOST")? == env::var("TARGET")? {
+        return Ok(());
+    }
+    let compiler = Compiler::find()?;
+    let source_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").ok_or("missing manifest directory")?)
+            .join("src");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").ok_or("missing output directory")?);
+    let use_directwrite = env::var_os("CARGO_FEATURE_COSMIC_TEXT").is_none();
+    let scene_modules = [
+        "quad",
+        "shadow",
+        "path_rasterization",
+        "path_sprite",
+        "underline",
+        "monochrome_sprite",
+        "subpixel_sprite",
+        "polychrome_sprite",
+        "blur_downsample",
+        "blur",
+        "blur_composite",
+        "emoji_rasterization",
+    ]
+    .into_iter()
+    .filter(|module| *module != "emoji_rasterization" || use_directwrite)
+    .map(|module| {
+        (
+            module,
+            if module == "emoji_rasterization" {
+                "color_text_raster.hlsl"
+            } else {
+                "shaders.hlsl"
+            },
+        )
+    })
+    .collect::<Vec<_>>();
+    compile_modules(
+        &compiler,
+        &source_dir,
+        &output_dir,
+        &scene_modules,
+        "shaders_bytes.rs",
+    )?;
+    compile_modules(
+        &compiler,
+        &source_dir,
+        &output_dir,
+        &[
+            ("mesh", "shaders_mesh.hlsl"),
+            ("mesh_composite", "shaders_mesh.hlsl"),
+        ],
+        "mesh_shaders_bytes.rs",
+    )?;
+    println!("cargo:rustc-cfg=gpui_precompiled_shaders");
+    Ok(())
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
-mod shader_compilation {
-    use std::{
-        fs,
-        io::Write,
-        path::{Path, PathBuf},
-        process::{self, Command},
-    };
-
-    pub fn compile_shaders() {
-        let shader_path =
-            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/shaders.hlsl");
-        let out_dir = std::env::var("OUT_DIR").unwrap();
-
-        println!("cargo:rerun-if-changed={}", shader_path.display());
-
-        // Check if fxc.exe is available
-        let fxc_path = find_fxc_compiler();
-
-        // Define all modules
-        let modules = [
-            "quad",
-            "shadow",
-            "path_rasterization",
-            "path_sprite",
-            "underline",
-            "monochrome_sprite",
-            "subpixel_sprite",
-            "polychrome_sprite",
-            "blur_downsample",
-            "blur",
-            "blur_composite",
-        ];
-
-        let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);
-        if Path::new(&rust_binding_path).exists() {
-            fs::remove_file(&rust_binding_path)
-                .expect("Failed to remove existing Rust binding file");
-        }
-        for module in modules {
-            compile_shader_for_module(
-                module,
-                &out_dir,
-                &fxc_path,
-                shader_path.to_str().unwrap(),
-                &rust_binding_path,
-            );
-        }
-
-        {
-            let shader_path = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
-                .join("src/color_text_raster.hlsl");
-            compile_shader_for_module(
-                "emoji_rasterization",
-                &out_dir,
-                &fxc_path,
-                shader_path.to_str().unwrap(),
-                &rust_binding_path,
-            );
-        }
-    }
-
-    /// Locate `binary` in the newest installed Windows SDK.
-    pub fn find_latest_windows_sdk_binary(
-        binary: &str,
-    ) -> Result<Option<PathBuf>, Box<dyn std::error::Error>> {
-        let key = windows_registry::LOCAL_MACHINE
-            .open("SOFTWARE\\WOW6432Node\\Microsoft\\Microsoft SDKs\\Windows\\v10.0")?;
-
-        let install_folder: String = key.get_string("InstallationFolder")?; // "C:\Program Files (x86)\Windows Kits\10\"
-        let install_folder_bin = Path::new(&install_folder).join("bin");
-
-        let mut versions: Vec<_> = std::fs::read_dir(&install_folder_bin)?
-            .flatten()
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect();
-
-        versions.sort_by_key(|s| {
-            s.split('.')
-                .filter_map(|p| p.parse().ok())
-                .collect::<Vec<u32>>()
-        });
-
-        let arch = match std::env::consts::ARCH {
-            "x86_64" => "x64",
-            "aarch64" => "arm64",
-            _ => Err(format!(
-                "Unsupported architecture: {}",
-                std::env::consts::ARCH
-            ))?,
-        };
-
-        if let Some(highest_version) = versions.last() {
-            return Ok(Some(
-                install_folder_bin
-                    .join(highest_version)
-                    .join(arch)
-                    .join(binary),
+fn compile_modules(
+    compiler: &Compiler,
+    source_dir: &Path,
+    output_dir: &Path,
+    modules: &[(&str, &str)],
+    binding_file: &str,
+) -> Result<()> {
+    let mut bindings = String::new();
+    for &(module, source) in modules {
+        for (stage, profile) in [("vertex", "vs_4_1"), ("fragment", "ps_4_1")] {
+            let entry = format!("{module}_{stage}");
+            let output = output_dir.join(format!("{entry}.dxbc"));
+            if output.exists() {
+                fs::remove_file(&output)?;
+            }
+            compiler.compile(source_dir, source, &entry, profile, &output)?;
+            let bytes = fs::read(&output).map_err(|error| {
+                format!(
+                    "shader compiler did not produce readable output for {entry} at {}: {error}",
+                    output.display()
+                )
+            })?;
+            if bytes.len() < 32 || !bytes.starts_with(b"DXBC") {
+                return Err(format!("{entry} did not produce DXBC bytecode").into());
+            }
+            bindings.push_str(&format!(
+                "const {}_BYTES: &[u8] = include_bytes!(concat!(env!(\"OUT_DIR\"), \"/{entry}.dxbc\"));\n",
+                entry.to_ascii_uppercase(),
             ));
         }
-
-        Ok(None)
     }
+    fs::File::create(output_dir.join(binding_file))?.write_all(bindings.as_bytes())?;
+    Ok(())
+}
 
-    /// You can set the `GPUI_FXC_PATH` environment variable to specify the path to the fxc.exe compiler.
-    fn find_fxc_compiler() -> String {
-        // Check environment variable
-        if let Ok(path) = std::env::var("GPUI_FXC_PATH")
-            && Path::new(&path).exists()
+enum Compiler {
+    #[cfg(target_os = "windows")]
+    Fxc(PathBuf),
+    Vkd3d(PathBuf),
+}
+
+impl Compiler {
+    fn find() -> Result<Self> {
+        // Explicit portable compiler selection also works on Windows hosts.
+        if let Some(path) = env::var_os("GPUI_VKD3D_COMPILER") {
+            return Ok(Self::Vkd3d(path.into()));
+        }
+        #[cfg(target_os = "windows")]
         {
-            return path;
+            Ok(Self::Fxc(find_fxc_compiler()?))
         }
-
-        // Try to find in PATH
-        // NOTE: This has to be `where.exe` on Windows, not `where`, it must be ended with `.exe`
-        if let Ok(output) = std::process::Command::new("where.exe")
-            .arg("fxc.exe")
-            .output()
-            && output.status.success()
+        #[cfg(not(target_os = "windows"))]
         {
-            let path = String::from_utf8_lossy(&output.stdout);
-            return path.trim().to_string();
+            Ok(Self::Vkd3d(PathBuf::from("vkd3d-compiler")))
         }
-
-        if let Ok(Some(path)) = find_latest_windows_sdk_binary("fxc.exe") {
-            return path.to_string_lossy().into_owned();
-        }
-
-        panic!("Failed to find fxc.exe");
     }
 
-    fn compile_shader_for_module(
-        module: &str,
-        out_dir: &str,
-        fxc_path: &str,
-        shader_path: &str,
-        rust_binding_path: &str,
-    ) {
-        // Compile vertex shader
-        let output_file = format!("{}/{}_vs.h", out_dir, module);
-        let const_name = format!("{}_VERTEX_BYTES", module.to_uppercase());
-        compile_shader_impl(
-            fxc_path,
-            &format!("{module}_vertex"),
-            &output_file,
-            &const_name,
-            shader_path,
-            "vs_4_1",
-        );
-        generate_rust_binding(&const_name, &output_file, rust_binding_path);
-
-        // Compile fragment shader
-        let output_file = format!("{}/{}_ps.h", out_dir, module);
-        let const_name = format!("{}_FRAGMENT_BYTES", module.to_uppercase());
-        compile_shader_impl(
-            fxc_path,
-            &format!("{module}_fragment"),
-            &output_file,
-            &const_name,
-            shader_path,
-            "ps_4_1",
-        );
-        generate_rust_binding(&const_name, &output_file, rust_binding_path);
-    }
-
-    fn compile_shader_impl(
-        fxc_path: &str,
-        entry_point: &str,
-        output_path: &str,
-        var_name: &str,
-        shader_path: &str,
-        target: &str,
-    ) {
-        let output = Command::new(fxc_path)
-            .args([
-                "/T",
-                target,
-                "/E",
-                entry_point,
-                "/Fh",
-                output_path,
-                "/Vn",
-                var_name,
-                "/O3",
-                shader_path,
-            ])
-            .output();
-
-        match output {
-            Ok(result) => {
-                if result.status.success() {
-                    return;
-                }
-                println!(
-                    "cargo::error=Shader compilation failed for {}:\n{}",
-                    entry_point,
-                    String::from_utf8_lossy(&result.stderr)
-                );
-                process::exit(1);
+    fn compile(
+        &self,
+        source_dir: &Path,
+        source: &str,
+        entry: &str,
+        profile: &str,
+        output: &Path,
+    ) -> Result<()> {
+        let mut command = match self {
+            #[cfg(target_os = "windows")]
+            Self::Fxc(path) => {
+                let mut command = Command::new(path);
+                command
+                    .args(["/nologo", "/T", profile, "/E", entry, "/O3", "/Fo"])
+                    .arg(output)
+                    .arg(source);
+                command
             }
-            Err(e) => {
-                println!("cargo::error=Failed to run fxc for {}: {}", entry_point, e);
-                process::exit(1);
+            Self::Vkd3d(path) => {
+                let mut command = Command::new(path);
+                command
+                    .args([
+                        "-x", "hlsl", "-b", "dxbc-tpf", "-p", profile, "-e", entry, "-o",
+                    ])
+                    .arg(output)
+                    .arg(source);
+                command
             }
-        }
-    }
-
-    fn generate_rust_binding(const_name: &str, head_file: &str, output_path: &str) {
-        let header_content = fs::read_to_string(head_file).expect("Failed to read header file");
-        let const_definition = {
-            let global_var_start = header_content.find("const BYTE").unwrap();
-            let global_var = &header_content[global_var_start..];
-            let equal = global_var.find('=').unwrap();
-            global_var[equal + 1..].trim()
         };
-        let rust_binding = format!(
-            "const {}: &[u8] = &{}\n",
-            const_name,
-            const_definition.replace('{', "[").replace('}', "]")
-        );
-        let mut options = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(output_path)
-            .expect("Failed to open Rust binding file");
-        options
-            .write_all(rust_binding.as_bytes())
-            .expect("Failed to write Rust binding file");
+        // vkd3d resolves quoted includes against the working directory.
+        let result = command.current_dir(source_dir).output().map_err(|error| {
+            format!("failed to run shader compiler for {entry}: {error}. Windows hosts need FXC from the Windows SDK; other hosts need vkd3d-compiler with HLSL support (2.1 or later), optionally set by GPUI_VKD3D_COMPILER")
+        })?;
+        if !result.status.success() {
+            return Err(format!(
+                "shader compilation failed for {entry} ({}):\n{}\n{}",
+                result.status,
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            )
+            .into());
+        }
+        Ok(())
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
-use shader_compilation::compile_shaders;
+#[cfg(target_os = "windows")]
+fn find_fxc_compiler() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("GPUI_FXC_PATH") {
+        return Ok(path.into());
+    }
+    if let Ok(output) = Command::new("where.exe").arg("fxc.exe").output()
+        && output.status.success()
+        && let Some(path) = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())
+    {
+        return Ok(path);
+    }
+    let key = windows_registry::LOCAL_MACHINE
+        .open("SOFTWARE\\WOW6432Node\\Microsoft\\Microsoft SDKs\\Windows\\v10.0")?;
+    let install_folder: String = key.get_string("InstallationFolder")?;
+    let bin = Path::new(&install_folder).join("bin");
+    let mut versions: Vec<_> = fs::read_dir(&bin)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    versions.sort_by_key(|entry| {
+        entry
+            .file_name()
+            .to_string_lossy()
+            .split('.')
+            .filter_map(|part| part.parse::<u32>().ok())
+            .collect::<Vec<_>>()
+    });
+    let arch = match env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        "x86" => "x86",
+        architecture => {
+            return Err(format!("unsupported FXC host architecture: {architecture}").into());
+        }
+    };
+    versions
+        .into_iter()
+        .rev()
+        .map(|entry| entry.path().join(arch).join("fxc.exe"))
+        .find(|path| path.is_file())
+        .ok_or_else(|| "FXC not found; install the Windows SDK or set GPUI_FXC_PATH".into())
+}

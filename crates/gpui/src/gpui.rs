@@ -37,6 +37,9 @@ mod lerp;
 mod mesh;
 mod motion;
 mod path_builder;
+/// Shared render-target sizing used by graphics backends.
+#[doc(hidden)]
+pub mod path_targets;
 mod platform;
 pub mod prelude;
 /// Profiling utilities for task, frame, and thread performance tracking.

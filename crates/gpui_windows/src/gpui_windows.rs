@@ -2,35 +2,37 @@
 
 mod clipboard;
 mod destination_list;
-mod direct_manipulation;
 #[cfg(not(feature = "wgpu"))]
+mod device_recovery;
+mod direct_manipulation;
+#[cfg(all(not(feature = "wgpu"), not(feature = "cosmic-text")))]
 mod direct_write;
 #[cfg(not(feature = "wgpu"))]
 mod directx_atlas;
 #[cfg(not(feature = "wgpu"))]
 mod directx_devices;
 #[cfg(not(feature = "wgpu"))]
+mod directx_mesh;
+#[cfg(not(feature = "wgpu"))]
 mod directx_renderer;
 mod dispatcher;
 mod display;
 mod events;
-#[cfg(feature = "wgpu")]
 mod frame_signal;
 mod keyboard;
-#[cfg(feature = "wgpu")]
 mod monitor_vsync;
 mod platform;
 mod system_notifications;
 mod system_settings;
 mod util;
-#[cfg(not(feature = "wgpu"))]
-mod vsync;
 mod window;
 mod wrapper;
 
 pub(crate) use clipboard::*;
 pub(crate) use destination_list::*;
 #[cfg(not(feature = "wgpu"))]
+pub(crate) use device_recovery::DeviceRecoverySignal;
+#[cfg(all(not(feature = "wgpu"), not(feature = "cosmic-text")))]
 pub(crate) use direct_write::*;
 #[cfg(not(feature = "wgpu"))]
 pub(crate) use directx_atlas::*;
@@ -46,8 +48,6 @@ pub(crate) use platform::*;
 pub(crate) use system_notifications::*;
 pub(crate) use system_settings::*;
 pub(crate) use util::*;
-#[cfg(not(feature = "wgpu"))]
-pub(crate) use vsync::*;
 pub(crate) use window::*;
 pub(crate) use wrapper::*;
 
