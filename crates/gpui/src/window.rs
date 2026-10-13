@@ -4884,10 +4884,8 @@ impl Window {
             .get_or_insert_with(&params.into(), &mut || {
                 Ok(Some((
                     data.size(frame_index),
-                    Cow::Borrowed(
-                        data.as_bytes(frame_index)
-                            .expect("It's the caller's job to pass a valid frame index"),
-                    ),
+                    data.upload_bytes(frame_index)?
+                        .expect("It's the caller's job to pass a valid frame index"),
                 )))
             })?
             .expect("Callback above only returns Some");

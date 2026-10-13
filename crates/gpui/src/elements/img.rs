@@ -3,7 +3,7 @@ use crate::{
     Element, ElementId, Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId,
     InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
     RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
-    decode_static_image, decode_static_image_from_decoder, px,
+    decode_static_image_from_decoder, px,
 };
 use anyhow::Result;
 
@@ -726,10 +726,17 @@ impl Asset for ImageAssetLoader {
 
                             frames
                         } else {
-                            decode_static_image_from_decoder(decoder)?
+                            let frames = decode_static_image_from_decoder(decoder)?;
+                            return Ok(Arc::new(RenderImage::from_static_frames(
+                                frames, &bytes, format,
+                            )));
                         }
                     }
-                    _ => decode_static_image(&bytes, format)?,
+                    _ => {
+                        return RenderImage::from_static_encoded(&bytes, format)
+                            .map(Arc::new)
+                            .map_err(Into::into);
+                    }
                 };
 
                 Ok(Arc::new(RenderImage::new(data)))

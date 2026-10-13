@@ -2916,18 +2916,39 @@ impl Image {
 
                 frames
             }
-            ImageFormat::Png => decode_static_image(&self.bytes, image::ImageFormat::Png)?,
-            ImageFormat::Jpeg => decode_static_image(&self.bytes, image::ImageFormat::Jpeg)?,
-            ImageFormat::Webp => decode_static_image(&self.bytes, image::ImageFormat::WebP)?,
-            ImageFormat::Bmp => decode_static_image(&self.bytes, image::ImageFormat::Bmp)?,
-            ImageFormat::Tiff => decode_static_image(&self.bytes, image::ImageFormat::Tiff)?,
-            ImageFormat::Ico => decode_static_image(&self.bytes, image::ImageFormat::Ico)?,
+            ImageFormat::Png => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::Png)
+                    .map(Arc::new);
+            }
+            ImageFormat::Jpeg => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::Jpeg)
+                    .map(Arc::new);
+            }
+            ImageFormat::Webp => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::WebP)
+                    .map(Arc::new);
+            }
+            ImageFormat::Bmp => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::Bmp)
+                    .map(Arc::new);
+            }
+            ImageFormat::Tiff => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::Tiff)
+                    .map(Arc::new);
+            }
+            ImageFormat::Ico => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::Ico)
+                    .map(Arc::new);
+            }
             ImageFormat::Svg => {
                 return svg_renderer
                     .render_single_frame(&self.bytes, 1.0)
                     .map_err(Into::into);
             }
-            ImageFormat::Pnm => decode_static_image(&self.bytes, image::ImageFormat::Pnm)?,
+            ImageFormat::Pnm => {
+                return RenderImage::from_static_encoded(&self.bytes, image::ImageFormat::Pnm)
+                    .map(Arc::new);
+            }
         };
 
         Ok(Arc::new(RenderImage::new(frames)))
