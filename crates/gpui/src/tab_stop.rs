@@ -102,10 +102,6 @@ impl TabStopMap {
 
     pub fn clear(&mut self) {
         *self = Self::default();
-        self.current_path.0.clear();
-        self.insertion_history.clear();
-        self.by_id.clear();
-        self.order = SumTree::new(());
     }
 
     pub fn next(&self, focused_id: Option<&FocusId>) -> Option<FocusHandle> {

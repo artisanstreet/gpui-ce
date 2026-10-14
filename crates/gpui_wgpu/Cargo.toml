@@ -13,35 +13,37 @@ workspace = true
 path = "src/gpui_wgpu.rs"
 
 [features]
-default = []
+default = ["renderer"]
+renderer = ["dep:bytemuck", "dep:etagere", "dep:raw-window-handle", "dep:tracing", "dep:gpui_util", "dep:wgpu", "dep:web-sys"]
 font-kit = ["dep:font-kit"]
-wgpu-surfaces = ["gpui/wgpu-surfaces"]
+wgpu-surfaces = ["renderer", "gpui/wgpu-surfaces"]
 
 [dependencies]
 gpui.workspace = true
 anyhow.workspace = true
-bytemuck = "1"
+bytemuck = { version = "1", optional = true }
 collections.workspace = true
 cosmic-text = "0.19.0"
-etagere.workspace = true
+etagere = { workspace = true, optional = true }
 itertools.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 profiling.workspace = true
-raw-window-handle.workspace = true
+raw-window-handle = { workspace = true, optional = true }
 smallvec.workspace = true
+tracing = { workspace = true, optional = true }
 swash.workspace = true
 unicode-bidi.workspace = true
 unicode-segmentation.workspace = true
-gpui_util.workspace = true
-wgpu.workspace = true
+gpui_util = { workspace = true, optional = true }
+wgpu = { workspace = true, optional = true }
 
 # Optional: only needed on platforms with multiple font sources (e.g. Linux)
 font-kit = { version = "0.14.1-zed", package = "zed-font-kit", optional = true }
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-web-sys = { version = "0.3", features = ["HtmlCanvasElement"] }
-wgpu = { workspace = true, features = ["webgl"] }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement"], optional = true }
+wgpu = { workspace = true, features = ["webgl"], optional = true }
 
 [dev-dependencies]
 criterion.workspace = true

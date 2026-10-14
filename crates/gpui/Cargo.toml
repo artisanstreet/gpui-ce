@@ -37,7 +37,9 @@ wayland = []
 x11 = ["scap?/x11"]
 screen-capture = ["scap"]
 windows-manifest = ["dep:embed-resource"]
-profiler = ["dep:hdrhistogram"]
+# Frame overlay without task tracing, frame histograms, or the flight recorder.
+frame-rate = []
+profiler = ["frame-rate", "dep:hdrhistogram"]
 stacker = ["dep:stacksafe"]
 
 [lib]
@@ -97,7 +99,7 @@ async-channel.workspace = true
 stacksafe = { workspace = true, optional = true }
 strum.workspace = true
 sum_tree.workspace = true
-taffy = "=0.13.0"
+taffy = { version = "=0.13.0", default-features = false, features = ["std", "taffy_tree", "block_layout", "flexbox", "grid"] }
 thiserror.workspace = true
 tracing.workspace = true
 gpui_util.workspace = true

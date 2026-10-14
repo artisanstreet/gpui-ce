@@ -42,6 +42,7 @@ impl From<bool> for PaddedBool32 {
 #[expect(missing_docs)]
 pub struct Scene {
     pub(crate) paint_operations: Vec<PaintOperation>,
+    sort_scratch: Vec<SortEntry>,
     primitive_bounds: BoundsTree<ScaledPixels>,
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
@@ -61,6 +62,7 @@ pub struct Scene {
 impl Scene {
     pub fn clear(&mut self) {
         self.paint_operations.clear();
+        self.sort_scratch.clear();
         self.primitive_bounds.clear();
         self.layer_stack.clear();
         self.paths.clear();
@@ -102,7 +104,7 @@ impl Scene {
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
+        let primitive = primitive.into();
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -136,49 +138,69 @@ impl Scene {
                 .copied()
                 .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
         };
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
+        let (kind, index) = match primitive {
+            Primitive::Shadow(mut shadow) => {
                 shadow.order = order;
-                self.shadows.push(*shadow);
+                let index = self.shadows.len();
+                self.shadows.push(shadow);
+                (PrimitiveKind::Shadow, index)
             }
-            Primitive::Quad(quad) => {
+            Primitive::Quad(mut quad) => {
                 quad.order = order;
-                self.quads.push(*quad);
+                let index = self.quads.len();
+                self.quads.push(quad);
+                (PrimitiveKind::Quad, index)
             }
-            Primitive::Path(path) => {
+            Primitive::Path(mut path) => {
                 path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
+                let index = self.paths.len();
+                path.id = PathId(index);
+                self.paths.push(path);
+                (PrimitiveKind::Path, index)
             }
-            Primitive::Underline(underline) => {
+            Primitive::Underline(mut underline) => {
                 underline.order = order;
-                self.underlines.push(*underline);
+                let index = self.underlines.len();
+                self.underlines.push(underline);
+                (PrimitiveKind::Underline, index)
             }
-            Primitive::MonochromeSprite(sprite) => {
+            Primitive::MonochromeSprite(mut sprite) => {
                 sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
+                let index = self.monochrome_sprites.len();
+                self.monochrome_sprites.push(sprite);
+                (PrimitiveKind::MonochromeSprite, index)
             }
-            Primitive::SubpixelSprite(sprite) => {
+            Primitive::SubpixelSprite(mut sprite) => {
                 sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
+                let index = self.subpixel_sprites.len();
+                self.subpixel_sprites.push(sprite);
+                (PrimitiveKind::SubpixelSprite, index)
             }
-            Primitive::PolychromeSprite(sprite) => {
+            Primitive::PolychromeSprite(mut sprite) => {
                 sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
+                let index = self.polychrome_sprites.len();
+                self.polychrome_sprites.push(sprite);
+                (PrimitiveKind::PolychromeSprite, index)
             }
-            Primitive::Surface(surface) => {
+            Primitive::Surface(mut surface) => {
                 surface.order = order;
-                self.surfaces.push(surface.clone());
+                let index = self.surfaces.len();
+                self.surfaces.push(surface);
+                (PrimitiveKind::Surface, index)
             }
-            Primitive::Mesh(mesh) => {
+            Primitive::Mesh(mut mesh) => {
                 mesh.order = order;
-                self.meshes.push(mesh.clone());
+                let index = self.meshes.len();
+                self.meshes.push(mesh);
+                (PrimitiveKind::Mesh, index)
             }
-            Primitive::BackdropFilter(filter) => {
+            Primitive::BackdropFilter(mut filter) => {
                 filter.order = order;
-                self.backdrop_filters.push(filter.clone());
+                let index = self.backdrop_filters.len();
+                self.backdrop_filters.push(filter);
+                (PrimitiveKind::BackdropFilter, index)
             }
-            Primitive::FilterBoundary(boundary) => {
+            Primitive::FilterBoundary(mut boundary) => {
                 boundary.order = order;
                 if !boundary.is_start {
                     // A closed content-filter group is a draw-order barrier: everything painted
@@ -188,43 +210,126 @@ impl Scene {
                     // `raise_order_floor`.
                     self.primitive_bounds.set_order_floor(order + 1);
                 }
-                self.filter_boundaries.push(boundary.clone());
+                let index = self.filter_boundaries.len();
+                let kind = if boundary.is_start {
+                    PrimitiveKind::FilterBoundaryStart
+                } else {
+                    PrimitiveKind::FilterBoundaryEnd
+                };
+                self.filter_boundaries.push(boundary);
+                (kind, index)
             }
-        }
+        };
         self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+            .push(PaintOperation::Primitive { kind, index });
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                PaintOperation::Primitive { kind, index } => {
+                    self.insert_primitive(prev_scene.primitive_at(*kind, *index));
+                }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
             }
         }
     }
 
+    fn primitive_at(&self, kind: PrimitiveKind, index: usize) -> Primitive {
+        match kind {
+            PrimitiveKind::Shadow => Primitive::Shadow(self.shadows[index]),
+            PrimitiveKind::Quad => Primitive::Quad(self.quads[index]),
+            PrimitiveKind::Path => Primitive::Path(self.paths[index].clone()),
+            PrimitiveKind::Underline => Primitive::Underline(self.underlines[index]),
+            PrimitiveKind::MonochromeSprite => {
+                Primitive::MonochromeSprite(self.monochrome_sprites[index])
+            }
+            PrimitiveKind::SubpixelSprite => {
+                Primitive::SubpixelSprite(self.subpixel_sprites[index])
+            }
+            PrimitiveKind::PolychromeSprite => {
+                Primitive::PolychromeSprite(self.polychrome_sprites[index])
+            }
+            PrimitiveKind::Surface => Primitive::Surface(self.surfaces[index].clone()),
+            PrimitiveKind::Mesh => Primitive::Mesh(self.meshes[index].clone()),
+            PrimitiveKind::BackdropFilter => {
+                Primitive::BackdropFilter(self.backdrop_filters[index].clone())
+            }
+            PrimitiveKind::FilterBoundaryStart | PrimitiveKind::FilterBoundaryEnd => {
+                Primitive::FilterBoundary(self.filter_boundaries[index].clone())
+            }
+        }
+    }
+
     pub fn finish(&mut self) {
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.surfaces.sort_by_key(|surface| surface.order);
-        self.meshes.sort_by_key(|mesh| mesh.order);
-        self.backdrop_filters.sort_by_key(|filter| filter.order);
-        // Markers normally get distinct, monotonically-increasing orders (children overlap
-        // their group bounds and so sort strictly between the start and end). The `!is_start`
-        // tiebreak only matters for a degenerate empty group whose start and end tie: it keeps
-        // the start (false = 0) ahead of the end (true = 1) so the pair stays well-formed.
-        self.filter_boundaries
-            .sort_by_key(|boundary| (boundary.order, !boundary.is_start));
+        // Group scratch by typed storage in one pass over the replay log.
+        // Each entry records its current vector position and owning operation.
+        let counts = [
+            self.shadows.len(),
+            self.quads.len(),
+            self.paths.len(),
+            self.underlines.len(),
+            self.monochrome_sprites.len(),
+            self.subpixel_sprites.len(),
+            self.polychrome_sprites.len(),
+            self.surfaces.len(),
+            self.meshes.len(),
+            self.backdrop_filters.len(),
+            self.filter_boundaries.len(),
+        ];
+        let mut offsets = [0; 12];
+        self.sort_scratch.clear();
+        for (kind, count) in counts.into_iter().enumerate() {
+            offsets[kind + 1] = offsets[kind] + count;
+            self.sort_scratch.extend((0..count).map(|index| SortEntry {
+                index,
+                operation: usize::MAX,
+            }));
+        }
+        for (operation, op) in self.paint_operations.iter().enumerate() {
+            if let PaintOperation::Primitive { kind, index } = op {
+                self.sort_scratch[offsets[kind.storage_index()] + index].operation = operation;
+            }
+        }
+
+        macro_rules! sort {
+            ($field:ident, $kind:expr, $key:expr) => {
+                sort_primitives(
+                    &mut self.$field,
+                    &mut self.paint_operations,
+                    &mut self.sort_scratch[offsets[$kind]..offsets[$kind + 1]],
+                    $key,
+                );
+            };
+        }
+        sort!(shadows, 0, |shadow| shadow.order);
+        sort!(quads, 1, |quad| quad.order);
+        sort!(paths, 2, |path| path.order);
+        sort!(underlines, 3, |underline| underline.order);
+        sort!(monochrome_sprites, 4, |sprite| (
+            sprite.order,
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id
+        ));
+        sort!(subpixel_sprites, 5, |sprite| (
+            sprite.order,
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id
+        ));
+        sort!(polychrome_sprites, 6, |sprite| (
+            sprite.order,
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id
+        ));
+        sort!(surfaces, 7, |surface| surface.order);
+        sort!(meshes, 8, |mesh| mesh.order);
+        sort!(backdrop_filters, 9, |filter| filter.order);
+        // A degenerate group whose markers tie must still open before closing.
+        sort!(filter_boundaries, 10, |boundary| (
+            boundary.order,
+            !boundary.is_start
+        ));
     }
 
     #[cfg_attr(
@@ -320,9 +425,71 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
-    Primitive(Primitive),
+    Primitive { kind: PrimitiveKind, index: usize },
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+}
+
+impl PrimitiveKind {
+    fn storage_index(self) -> usize {
+        match self {
+            Self::Shadow => 0,
+            Self::Quad => 1,
+            Self::Path => 2,
+            Self::Underline => 3,
+            Self::MonochromeSprite => 4,
+            Self::SubpixelSprite => 5,
+            Self::PolychromeSprite => 6,
+            Self::Surface => 7,
+            Self::Mesh => 8,
+            Self::BackdropFilter => 9,
+            Self::FilterBoundaryStart | Self::FilterBoundaryEnd => 10,
+        }
+    }
+}
+
+struct SortEntry {
+    index: usize,
+    operation: usize,
+}
+
+fn sort_primitives<T, K: Ord>(
+    primitives: &mut [T],
+    operations: &mut [PaintOperation],
+    scratch: &mut [SortEntry],
+    key: impl Fn(&T) -> K,
+) {
+    // The original index breaks ties, matching stable sorting while avoiding
+    // the stable sort's temporary allocation for every primitive kind.
+    scratch.sort_unstable_by(|a, b| {
+        key(&primitives[a.index])
+            .cmp(&key(&primitives[b.index]))
+            .then_with(|| a.index.cmp(&b.index))
+    });
+    for (index, entry) in scratch.iter().enumerate() {
+        if entry.operation != usize::MAX
+            && let PaintOperation::Primitive {
+                index: recorded, ..
+            } = &mut operations[entry.operation]
+        {
+            *recorded = index;
+        }
+    }
+    // The operation mapping is no longer needed. Reuse that column for the
+    // inverse permutation and move the typed values into place with swaps.
+    for index in 0..scratch.len() {
+        let original = scratch[index].index;
+        scratch[original].operation = index;
+    }
+    for index in 0..scratch.len() {
+        while scratch[index].operation != index {
+            let destination = scratch[index].operation;
+            primitives.swap(index, destination);
+            let next = scratch[destination].operation;
+            scratch[destination].operation = destination;
+            scratch[index].operation = next;
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1392,5 +1559,279 @@ mod tests {
         scene.insert_primitive(quad());
 
         assert_eq!(batch_kinds(&mut scene), vec!["quad", "backdrop", "quad"]);
+    }
+
+    #[test]
+    fn compact_sort_preserves_stable_ties_and_every_replay_reference() {
+        for count in 0..80 {
+            for seed in 0..12 {
+                let mut values = (0..count)
+                    .map(|index| ((index * 37 + seed * 13) % 11, index))
+                    .collect::<Vec<_>>();
+                let mut expected = values.clone();
+                expected.sort_by_key(|value| value.0);
+                let mut operations = (0..count)
+                    .map(|index| PaintOperation::Primitive {
+                        kind: PrimitiveKind::Quad,
+                        index,
+                    })
+                    .collect::<Vec<_>>();
+                let mut scratch = (0..count)
+                    .map(|index| SortEntry {
+                        index,
+                        operation: index,
+                    })
+                    .collect::<Vec<_>>();
+
+                sort_primitives(&mut values, &mut operations, &mut scratch, |value| value.0);
+                assert_eq!(values, expected);
+                for (original, op) in operations.iter().enumerate() {
+                    let PaintOperation::Primitive { index, .. } = op else {
+                        unreachable!()
+                    };
+                    assert_eq!(values[*index].1, original);
+                }
+            }
+        }
+    }
+
+    fn sprite(tile: u32, marker: f32) -> MonochromeSprite {
+        MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: full_bounds(),
+            content_mask: mask(),
+            color: SceneHsla {
+                l: marker,
+                ..Default::default()
+            },
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: crate::AtlasTextureKind::Monochrome,
+                },
+                tile_id: crate::TileId(tile),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+            transformation: TransformationMatrix::default(),
+        }
+    }
+
+    fn recorded_sprites(scene: &Scene) -> Vec<(u32, f32)> {
+        scene
+            .paint_operations
+            .iter()
+            .filter_map(|op| {
+                let PaintOperation::Primitive {
+                    kind: PrimitiveKind::MonochromeSprite,
+                    index,
+                } = op
+                else {
+                    return None;
+                };
+                let sprite = &scene.monochrome_sprites[*index];
+                Some((sprite.tile.tile_id.0, sprite.color.l))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sprite_pages_batch_together_without_changing_cached_replay() {
+        use crate::AtlasTextureKind;
+
+        fn recorded(scene: &Scene) -> Vec<(u32, u32, f32)> {
+            scene
+                .paint_operations
+                .iter()
+                .map(|operation| {
+                    let PaintOperation::Primitive { kind, index } = operation else {
+                        unreachable!();
+                    };
+                    let (tile, bounds) = match scene.primitive_at(*kind, *index) {
+                        Primitive::MonochromeSprite(sprite) => (sprite.tile, sprite.bounds),
+                        Primitive::SubpixelSprite(sprite) => (sprite.tile, sprite.bounds),
+                        Primitive::PolychromeSprite(sprite) => (sprite.tile, sprite.bounds),
+                        _ => unreachable!(),
+                    };
+                    (tile.texture_id.index, tile.tile_id.0, bounds.origin.x.0)
+                })
+                .collect()
+        }
+
+        for kind in [
+            AtlasTextureKind::Monochrome,
+            AtlasTextureKind::Subpixel,
+            AtlasTextureKind::Polychrome,
+        ] {
+            let mut scene = Scene::default();
+            for (i, (page, tile)) in [(1, 0), (0, 0), (1, 1), (0, 1), (1, 0)]
+                .into_iter()
+                .enumerate()
+            {
+                let mut sprite = sprite(tile, i as f32);
+                sprite.bounds.origin.x = sp(i as f32 * 20.0);
+                sprite.bounds.size.width = sp(10.0);
+                sprite.tile.texture_id = AtlasTextureId { index: page, kind };
+                match kind {
+                    AtlasTextureKind::Monochrome => scene.insert_primitive(sprite),
+                    AtlasTextureKind::Subpixel => scene.insert_primitive(SubpixelSprite {
+                        order: 0,
+                        pad: 0,
+                        bounds: sprite.bounds,
+                        content_mask: sprite.content_mask,
+                        color: sprite.color,
+                        tile: sprite.tile,
+                        transformation: sprite.transformation,
+                    }),
+                    AtlasTextureKind::Polychrome => scene.insert_primitive(PolychromeSprite {
+                        order: 0,
+                        pad: 0,
+                        grayscale: false.into(),
+                        opacity: 1.0,
+                        bounds: sprite.bounds,
+                        content_mask: sprite.content_mask,
+                        corner_radii: Corners::default(),
+                        tile: sprite.tile,
+                    }),
+                }
+            }
+            let expected = recorded(&scene);
+            scene.finish();
+            scene.finish();
+            assert_eq!(recorded(&scene), expected);
+            let batches = scene
+                .batches()
+                .map(|batch| match batch {
+                    PrimitiveBatch::MonochromeSprites { texture_id, range }
+                    | PrimitiveBatch::SubpixelSprites { texture_id, range }
+                    | PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                        (texture_id.index, range.len())
+                    }
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(batches, vec![(0, 2), (1, 3)]);
+
+            let mut replay = Scene::default();
+            replay.replay(1..4, &scene);
+            replay.finish();
+            assert_eq!(recorded(&replay), expected[1..4]);
+        }
+    }
+
+    #[test]
+    fn sprite_page_sort_keeps_overlapping_draws_in_paint_order() {
+        let mut scene = Scene::default();
+        let mut back = sprite(0, 0.0);
+        back.tile.texture_id.index = 1;
+        scene.insert_primitive(back);
+        scene.insert_primitive(sprite(0, 1.0));
+        scene.finish();
+
+        assert_eq!(scene.monochrome_sprites[0].tile.texture_id.index, 1);
+        assert_eq!(scene.monochrome_sprites[1].tile.texture_id.index, 0);
+        assert!(scene.monochrome_sprites[0].order < scene.monochrome_sprites[1].order);
+        assert_eq!(scene.batches().count(), 2);
+    }
+
+    #[test]
+    fn cached_replay_survives_tile_sort_repeated_finish_and_append() {
+        let mut scene = Scene::default();
+        scene.push_layer(full_bounds());
+        for (tile, marker) in [(3, 0.), (1, 1.), (1, 2.), (2, 3.)] {
+            scene.insert_primitive(sprite(tile, marker));
+        }
+        scene.pop_layer();
+        let expected = recorded_sprites(&scene);
+        scene.finish();
+        scene.finish();
+        assert_eq!(recorded_sprites(&scene), expected);
+        assert_eq!(
+            scene
+                .monochrome_sprites
+                .iter()
+                .map(|sprite| sprite.color.l)
+                .collect::<Vec<_>>(),
+            vec![1., 2., 3., 0.]
+        );
+
+        // Replay a cached subrange, not only the entire sorted scene.
+        let mut partial = Scene::default();
+        partial.push_layer(full_bounds());
+        partial.replay(2..4, &scene);
+        partial.pop_layer();
+        partial.finish();
+        assert_eq!(recorded_sprites(&partial), expected[1..3]);
+
+        scene.insert_primitive(sprite(0, 4.));
+        scene.finish();
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        replay.finish();
+        assert_eq!(
+            recorded_sprites(&replay),
+            vec![(3, 0.), (1, 1.), (1, 2.), (2, 3.), (0, 4.)]
+        );
+        assert!(replay.layer_stack.is_empty());
+        let capacity = replay.sort_scratch.capacity();
+        replay.clear();
+        replay.insert_primitive(sprite(9, 5.));
+        replay.finish();
+        assert_eq!(recorded_sprites(&replay), vec![(9, 5.)]);
+        assert_eq!(replay.sort_scratch.capacity(), capacity);
+    }
+
+    #[test]
+    fn path_replay_assigns_fresh_ids_after_order_sort() {
+        let mut scene = Scene::default();
+        for marker in 0..3 {
+            let mut path = Path::new(point(crate::px(marker as f32), crate::px(0.))).scale(1.);
+            path.bounds = if marker == 2 {
+                detached_quad().bounds
+            } else {
+                full_bounds()
+            };
+            path.content_mask = ContentMask {
+                bounds: path.bounds,
+            };
+            scene.insert_primitive(path);
+        }
+        scene.finish();
+        let mut replay = Scene::default();
+        replay.replay(1..3, &scene);
+        assert_eq!(
+            replay
+                .paths
+                .iter()
+                .map(|path| path.id.0)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(
+            replay
+                .paths
+                .iter()
+                .map(|path| path.start.x.0)
+                .collect::<Vec<_>>(),
+            vec![1., 2.]
+        );
+    }
+
+    #[test]
+    fn filter_and_layer_replay_preserves_batch_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad());
+        scene.insert_primitive(boundary(true));
+        scene.push_layer(full_bounds());
+        scene.insert_primitive(quad());
+        scene.insert_primitive(backdrop());
+        scene.pop_layer();
+        scene.insert_primitive(boundary(false));
+        scene.insert_primitive(detached_quad());
+        let expected = batch_kinds(&mut scene);
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        assert_eq!(batch_kinds(&mut replay), expected);
     }
 }

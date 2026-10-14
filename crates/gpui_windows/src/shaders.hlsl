@@ -14,6 +14,11 @@ cbuffer BatchParams: register(b1) {
     uint3 batch_pad;
 };
 
+cbuffer PathParams: register(b4) {
+    float2 path_texture_origin;
+    float2 path_texture_size;
+};
+
 Texture2D<float4> t_sprite: register(t0);
 SamplerState s_sprite: register(s0);
 
@@ -125,14 +130,23 @@ float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds bounds, Bo
     return distance_from_clip_rect_impl(transformed, clip_bounds);
 }
 
-// Convert linear RGB to sRGB
-float3 linear_to_srgb(float3 color) {
-    return pow(color, float3(2.2, 2.2, 2.2));
+float linear_to_srgb_component(float value) {
+    return value < 0.0031308 ? value * 12.92 : 1.055 * pow(value, 1.0 / 2.4) - 0.055;
 }
 
-// Convert sRGB to linear RGB
+// Every target stores encoded sRGB bytes in a non-sRGB UNORM format.
+float3 linear_to_srgb(float3 color) {
+    return float3(linear_to_srgb_component(color.r), linear_to_srgb_component(color.g),
+                  linear_to_srgb_component(color.b));
+}
+
+float srgb_to_linear_component(float value) {
+    return value < 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4);
+}
+
 float3 srgb_to_linear(float3 color) {
-    return pow(color, float3(1.0 / 2.2, 1.0 / 2.2, 1.0 / 2.2));
+    return float3(srgb_to_linear_component(color.r), srgb_to_linear_component(color.g),
+                  srgb_to_linear_component(color.b));
 }
 
 /// Hsla to linear RGBA conversion.
@@ -223,7 +237,7 @@ float4 oklab_to_srgb(float4 color) {
     );
 
     // Convert linear sRGB to non-linear sRGB
-    return float4(linear_to_srgb(linear_rgb), color.a);
+    return float4(linear_to_srgb(saturate(linear_rgb)), color.a);
 }
 
 // This approximates the error function, needed for the gaussian integral
@@ -340,6 +354,19 @@ float2x2 rotate2d(float angle) {
     return float2x2(c, -s, s, c);
 }
 
+// Same ordered dither as the WGPU shader: less than half an 8-bit code,
+// identical across RGB channels, without changing alpha.
+float gradient_dither(float2 position) {
+    int x = int(floor(position.x)) & 3;
+    int y = int(floor(position.y)) & 3;
+    int qx = (x >> 1) & 1;
+    int qy = (y >> 1) & 1;
+    int lx = x & 1;
+    int ly = y & 1;
+    int threshold = 4 * (2 * (lx ^ ly) + ly) + 2 * (qx ^ qy) + qy;
+    return (float(threshold) + 0.5) / 16.0 - 0.5;
+}
+
 float4 gradient_color(Background background,
                       float2 position,
                       Bounds bounds,
@@ -392,17 +419,8 @@ float4 gradient_color(Background background,
                 }
             }
 
-            // Dither to reduce banding in gradients (especially dark/alpha).
-            // Triangular-distributed noise breaks up 8-bit quantization steps.
-            // ±2/255 for RGB (enough for dark-on-dark compositing),
-            // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
-            {
-                float2 seed = position * 0.6180339887; // golden ratio spread
-                float r1 = frac(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-                float r2 = frac(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
-                float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
-                color.rgb += tri * 2.0 / 255.0;
-                color.a   += tri * 3.0 / 255.0;
+            if (!all(color0 == color1)) {
+                color.rgb += gradient_dither(position) / 255.0;
             }
 
             break;
@@ -948,6 +966,12 @@ float4 shadow_fragment(ShadowFragmentInput input): SV_TARGET {
         float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
                                           shadow.element_corner_radii);
         alpha *= saturate(0.5 - element_distance);
+    } else {
+        // A drop shadow belongs outside the element's original rounded bounds.
+        // Keep its white edge highlight out of the translucent panel and backdrop.
+        float element_distance = quad_sdf(input.position.xy, shadow.element_bounds,
+                                          shadow.element_corner_radii);
+        alpha *= saturate(0.5 + element_distance);
     }
 
     return input.color * float4(1., 1., 1., alpha);
@@ -985,7 +1009,8 @@ PathVertexOutput path_rasterization_vertex(uint vertex_id: SV_VertexID) {
     PathRasterizationSprite sprite = path_rasterization_sprites[vertex_id];
 
     PathVertexOutput output;
-    output.position = to_device_position_impl(sprite.xy_position);
+    float2 local_position = sprite.xy_position - path_texture_origin;
+    output.position = float4(local_position / path_texture_size * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
     output.st_position = sprite.st_position;
     output.vertex_id = vertex_id;
     output.clip_distance = distance_from_clip_rect_impl(sprite.xy_position, sprite.bounds);
@@ -1014,7 +1039,7 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
     GradientColor gradient = prepare_gradient_color(
         background.tag, background.color_space, background.solid, background.colors);
 
-    float4 color = gradient_color(background, input.position.xy, bounds,
+    float4 color = gradient_color(background, input.position.xy + path_texture_origin, bounds,
         gradient.solid, gradient.color0, gradient.color1);
     return float4(color.rgb * color.a * alpha, alpha * color.a);
 }
@@ -1031,7 +1056,6 @@ struct PathSprite {
 
 struct PathSpriteVertexOutput {
     float4 position: SV_Position;
-    float2 texture_coords: TEXCOORD0;
 };
 
 StructuredBuffer<PathSprite> path_sprites: register(t1);
@@ -1043,17 +1067,15 @@ PathSpriteVertexOutput path_sprite_vertex(uint vertex_id: SV_VertexID, uint spri
     // Don't apply content mask because it was already accounted for when rasterizing the path
     float4 device_position = to_device_position(unit_vertex, sprite.bounds);
 
-    float2 screen_position = sprite.bounds.origin + unit_vertex * sprite.bounds.size;
-    float2 texture_coords = screen_position / global_viewport_size;
-
     PathSpriteVertexOutput output;
     output.position = device_position;
-    output.texture_coords = texture_coords;
     return output;
 }
 
 float4 path_sprite_fragment(PathSpriteVertexOutput input): SV_Target {
-    return t_sprite.Sample(s_sprite, input.texture_coords);
+    // The resolve target is pixel-aligned with the screen. Integer fetches preserve
+    // its four-sample coverage without normalized-coordinate interpolation error.
+    return t_sprite.Load(int3(input.position.xy - path_texture_origin, 0));
 }
 
 /*

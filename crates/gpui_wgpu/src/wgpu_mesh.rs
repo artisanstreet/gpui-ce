@@ -1,8 +1,8 @@
 //! Draws [`PaintMesh`] primitives: lit triangle meshes with a depth buffer.
 //!
 //! Each frame, before the main pass, every mesh in the scene renders into its
-//! own offscreen target: 4× multisampled color and depth, resolved into a
-//! single-sample texture the size of the mesh's bounds in device pixels.
+//! own resolved texture, using shared 4× multisampled color and depth scratch
+//! textures for meshes with the same device-pixel dimensions.
 //! In the main pass, a [`PrimitiveBatch::Meshes`] batch composites those
 //! textures like images (content mask, rounded corners, opacity), so meshes
 //! keep the scene's 2D draw order and never need a depth buffer there.
@@ -19,7 +19,6 @@ use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
 use gpui::{MeshId, PaintMesh};
-use wgpu::util::DeviceExt as _;
 
 /// The mesh pass, standalone.
 const MESH_SHADERS: &str = include_str!("shaders_mesh.wgsl");
@@ -48,6 +47,16 @@ const EDGE_HALF_WIDTH: f32 = 0.6;
 
 /// Floats per vertex: position, normal, color.
 const VERTEX_FLOATS: usize = 3 + 3 + 4;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct MeshMemoryStats {
+    pub targets: usize,
+    pub scratch_targets: usize,
+    pub target_bytes: u64,
+    pub geometries: usize,
+    pub vertex_buffer_bytes: u64,
+    pub uniform_buffer_bytes: u64,
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -78,13 +87,18 @@ struct CachedGeometry {
 /// The offscreen target of one mesh in the scene.
 struct Target {
     size: (u32, u32),
-    msaa_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
     resolve_view: wgpu::TextureView,
     mesh_uniforms: wgpu::Buffer,
     mesh_bind_group: wgpu::BindGroup,
     composite_uniforms: wgpu::Buffer,
     composite_bind_group: wgpu::BindGroup,
+}
+
+/// Each pass clears these attachments and resolves before another mesh uses them.
+struct ScratchTarget {
+    msaa_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    last_used: u64,
 }
 
 /// Pipelines, cached geometry, and pooled targets for meshes.
@@ -98,6 +112,7 @@ pub(crate) struct MeshRenderer {
     scene_format: wgpu::TextureFormat,
     geometry: HashMap<MeshId, CachedGeometry>,
     targets: Vec<Target>,
+    scratch_targets: HashMap<(u32, u32), ScratchTarget>,
     frame: u64,
 }
 
@@ -278,6 +293,7 @@ impl MeshRenderer {
             scene_format,
             geometry: HashMap::new(),
             targets: Vec::new(),
+            scratch_targets: HashMap::new(),
             frame: 0,
         }
     }
@@ -285,6 +301,42 @@ impl MeshRenderer {
     /// The format the composite pipeline was built for.
     pub(crate) fn scene_format(&self) -> wgpu::TextureFormat {
         self.scene_format
+    }
+
+    /// Release model data when the window no longer paints any meshes. Keep the pipelines
+    /// so reopening a model only needs its geometry and render targets uploaded again.
+    pub(crate) fn clear(&mut self) {
+        self.targets.clear();
+        self.scratch_targets.clear();
+        self.geometry.clear();
+    }
+
+    pub(crate) fn memory_stats(&self) -> MeshMemoryStats {
+        use crate::wgpu_renderer::diagnostics::texture_bytes;
+        MeshMemoryStats {
+            targets: self.targets.len(),
+            scratch_targets: self.scratch_targets.len(),
+            target_bytes: self
+                .targets
+                .iter()
+                .map(|target| texture_bytes(target.resolve_view.texture()))
+                .chain(self.scratch_targets.values().map(|scratch| {
+                    texture_bytes(scratch.msaa_view.texture())
+                        + texture_bytes(scratch.depth_view.texture())
+                }))
+                .sum(),
+            geometries: self.geometry.len(),
+            vertex_buffer_bytes: self
+                .geometry
+                .values()
+                .map(|geometry| geometry.buffer.size())
+                .sum(),
+            uniform_buffer_bytes: self
+                .targets
+                .iter()
+                .map(|target| target.mesh_uniforms.size() + target.composite_uniforms.size())
+                .sum(),
+        }
     }
 
     /// Renders every mesh into its offscreen target. Call once per frame
@@ -321,6 +373,29 @@ impl MeshRenderer {
                 }
             }
             let frame = self.frame;
+            let scratch = self
+                .scratch_targets
+                .entry(size)
+                .or_insert_with(|| ScratchTarget {
+                    msaa_view: target_view(
+                        device,
+                        size,
+                        "mesh_msaa",
+                        COLOR_FORMAT,
+                        SAMPLE_COUNT,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    ),
+                    depth_view: target_view(
+                        device,
+                        size,
+                        "mesh_depth",
+                        DEPTH_FORMAT,
+                        SAMPLE_COUNT,
+                        wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    ),
+                    last_used: frame,
+                });
+            scratch.last_used = frame;
             let geometry = self
                 .geometry
                 .entry(paint.mesh.id())
@@ -362,7 +437,7 @@ impl MeshRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mesh_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &target.msaa_view,
+                    view: &scratch.msaa_view,
                     resolve_target: Some(&target.resolve_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
@@ -371,7 +446,7 @@ impl MeshRenderer {
                     depth_slice: None,
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &target.depth_view,
+                    view: &scratch.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Discard,
@@ -382,10 +457,14 @@ impl MeshRenderer {
             });
             pass.set_pipeline(&self.mesh_pipeline);
             pass.set_bind_group(0, &target.mesh_bind_group, &[]);
-            pass.set_vertex_buffer(0, geometry.buffer.slice(..));
-            pass.draw(0..geometry.vertex_count, 0..1);
+            if geometry.vertex_count > 0 {
+                pass.set_vertex_buffer(0, geometry.buffer.slice(..));
+                pass.draw(0..geometry.vertex_count, 0..1);
+            }
         }
         let frame = self.frame;
+        self.scratch_targets
+            .retain(|_, scratch| scratch.last_used == frame);
         self.geometry
             .retain(|_, geometry| frame - geometry.last_painted <= EVICT_AFTER_FRAMES);
     }
@@ -406,42 +485,14 @@ impl MeshRenderer {
     }
 
     fn create_target(&self, device: &wgpu::Device, size: (u32, u32)) -> Target {
-        let texture = |label: &str, format: wgpu::TextureFormat, samples: u32, usage| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width: size.0,
-                    height: size.1,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: samples,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage,
-                view_formats: &[],
-            })
-        };
-        let view =
-            |texture: wgpu::Texture| texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let msaa_view = view(texture(
-            "mesh_msaa",
-            COLOR_FORMAT,
-            SAMPLE_COUNT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        ));
-        let depth_view = view(texture(
-            "mesh_depth",
-            DEPTH_FORMAT,
-            SAMPLE_COUNT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT,
-        ));
-        let resolve_view = view(texture(
+        let resolve_view = target_view(
+            device,
+            size,
             "mesh_resolve",
             COLOR_FORMAT,
             1,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-        ));
+        );
         let uniform_buffer = |label: &str, size: usize| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
@@ -483,8 +534,6 @@ impl MeshRenderer {
         });
         Target {
             size,
-            msaa_view,
-            depth_view,
             resolve_view,
             mesh_uniforms,
             mesh_bind_group,
@@ -494,23 +543,57 @@ impl MeshRenderer {
     }
 }
 
+fn target_view(
+    device: &wgpu::Device,
+    size: (u32, u32),
+    label: &str,
+    format: wgpu::TextureFormat,
+    samples: u32,
+    usage: wgpu::TextureUsages,
+) -> wgpu::TextureView {
+    device
+        .create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage,
+            view_formats: &[],
+        })
+        .create_view(&wgpu::TextureViewDescriptor::default())
+}
+
 /// Uploads a mesh's vertices as one interleaved vertex buffer.
 fn upload(device: &wgpu::Device, paint: &PaintMesh) -> CachedGeometry {
     let vertices = paint.mesh.vertices();
-    let data: Vec<f32> = vertices
-        .iter()
-        .flat_map(|vertex| {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("mesh_vertices"),
+        size: (vertices.len() as u64) * (VERTEX_FLOATS as u64) * 4,
+        usage: wgpu::BufferUsages::VERTEX,
+        mapped_at_creation: !vertices.is_empty(),
+    });
+    if !vertices.is_empty() {
+        let mut mapping = buffer.slice(..).get_mapped_range_mut();
+        let mut destination = mapping.slice(..);
+        for (index, vertex) in vertices.iter().enumerate() {
             let [px, py, pz] = vertex.position;
             let [nx, ny, nz] = vertex.normal;
             let [r, g, b, a] = vertex.color;
-            [px, py, pz, nx, ny, nz, r, g, b, a]
-        })
-        .collect();
-    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("mesh_vertices"),
-        contents: bytemuck::cast_slice(&data),
-        usage: wgpu::BufferUsages::VERTEX,
-    });
+            let data = [px, py, pz, nx, ny, nz, r, g, b, a];
+            let start = index * VERTEX_FLOATS * 4;
+            destination
+                .slice(start..start + VERTEX_FLOATS * 4)
+                .copy_from_slice(bytemuck::bytes_of(&data));
+        }
+        drop(mapping);
+        buffer.unmap();
+    }
     CachedGeometry {
         buffer,
         vertex_count: u32::try_from(vertices.len()).unwrap_or(u32::MAX),

@@ -3,7 +3,7 @@ use crate::{
     Element, ElementId, Entity, GlobalElementId, Hitbox, Image, ImageCache, InspectorElementId,
     InteractiveElement, Interactivity, IntoElement, LayoutId, Length, ObjectFit, Pixels,
     RenderImage, Resource, SharedString, SharedUri, StyleRefinement, Styled, Task, Window,
-    decode_static_image, decode_static_image_from_decoder, px,
+    decode_static_image_from_decoder, px,
 };
 use anyhow::Result;
 
@@ -210,10 +210,10 @@ pub fn img(source: impl Into<ImageSource>) -> Img {
 impl Img {
     /// A list of all format extensions currently supported by this img element
     pub fn extensions() -> &'static [&'static str] {
-        // This is the list in [image::ImageFormat::from_extension] + `svg`
+        // Keep this aligned with the image codecs enabled by the workspace.
         &[
-            "avif", "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "tga", "dds", "bmp", "ico",
-            "hdr", "exr", "pbm", "pam", "ppm", "pgm", "ff", "farbfeld", "qoi", "svg",
+            "jpg", "jpeg", "png", "gif", "webp", "tif", "tiff", "bmp", "ico", "pbm", "pam", "ppm",
+            "pgm", "svg",
         ]
     }
 
@@ -726,10 +726,17 @@ impl Asset for ImageAssetLoader {
 
                             frames
                         } else {
-                            decode_static_image_from_decoder(decoder)?
+                            let frames = decode_static_image_from_decoder(decoder)?;
+                            return Ok(Arc::new(RenderImage::from_static_frames(
+                                frames, &bytes, format,
+                            )));
                         }
                     }
-                    _ => decode_static_image(&bytes, format)?,
+                    _ => {
+                        return RenderImage::from_static_encoded(&bytes, format)
+                            .map(Arc::new)
+                            .map_err(Into::into);
+                    }
                 };
 
                 Ok(Arc::new(RenderImage::new(data)))
@@ -813,7 +820,7 @@ mod tests {
 
     fn test_image_with_size(width: u32, height: u32) -> Arc<RenderImage> {
         let frame = Frame::new(ImageBuffer::from_pixel(width, height, Rgba([0, 0, 0, 0])));
-        Arc::new(RenderImage::new(SmallVec::from_elem(frame, 1)))
+        Arc::new(RenderImage::new(SmallVec::from_buf([frame])))
     }
 
     /// Overwrites the cached `frame_index` of the sibling `img` during paint.

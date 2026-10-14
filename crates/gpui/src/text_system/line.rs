@@ -46,7 +46,7 @@ pub struct ShapedLine {
     pub(crate) layout: Arc<LineLayout>,
     /// The text that was shaped for this line.
     pub text: SharedString,
-    pub(crate) decoration_runs: SmallVec<[DecorationRun; 32]>,
+    pub(crate) decoration_runs: SmallVec<[DecorationRun; 1]>,
 }
 
 impl ShapedLine {
@@ -270,7 +270,7 @@ pub struct WrappedLine {
     pub(crate) layout: Arc<WrappedLineLayout>,
     /// The text that was shaped for this line.
     pub text: SharedString,
-    pub(crate) decoration_runs: Vec<DecorationRun>,
+    pub(crate) decoration_runs: SmallVec<[DecorationRun; 1]>,
 }
 
 impl WrappedLine {

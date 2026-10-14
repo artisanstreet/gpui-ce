@@ -585,9 +585,11 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn show_system_notification(&self, notification: gpui::SystemNotification) {
         self.inner.with_common(|common| {
-            common
-                .system_notifications
-                .show(common.app_name.as_deref(), notification)
+            common.system_notifications.show(
+                &common.background_executor,
+                common.app_name.as_deref(),
+                notification,
+            )
         });
     }
 

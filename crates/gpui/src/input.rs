@@ -288,9 +288,52 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, FocusHandle, InteractiveElement as _, IntoElement,
-        ParentElement as _, Render, Styled as _, TestAppContext, TextInputAction,
-        TextInputStateChange, canvas, div,
+        ParentElement as _, PlatformWindow as _, Render, Styled as _, TestAppContext,
+        TextInputAction, TextInputStateChange, canvas, div,
     };
+
+    #[gpui::test]
+    fn closing_window_releases_input_entity_before_native_state(cx: &mut TestAppContext) {
+        focused_input_entity_releases_with_window(cx, false);
+    }
+
+    #[gpui::test]
+    fn shutdown_releases_input_entity_before_native_state(cx: &mut TestAppContext) {
+        focused_input_entity_releases_with_window(cx, true);
+    }
+
+    fn focused_input_entity_releases_with_window(cx: &mut TestAppContext, shutdown: bool) {
+        let window = cx.add_window(|_, cx| ConfigurationTestView {
+            focus_handle: cx.focus_handle(),
+            configuration: TextInputConfiguration::default(),
+        });
+        let view = window.root(cx).unwrap();
+        let weak_view = view.downgrade();
+        // Native platforms can keep window state alive for deferred destruction.
+        // Retain that state here without retaining the GPUI Window itself.
+        let mut native_window = cx.test_window(window.into());
+        cx.update_window(window.into(), |_, window, cx| {
+            let focus_handle = view.read(cx).focus_handle.clone();
+            window.focus(&focus_handle, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        drop(view);
+        assert!(weak_view.upgrade().is_some());
+
+        if shutdown {
+            cx.update(|cx| cx.shutdown());
+        } else {
+            cx.update_window(window.into(), |_, window, _| window.remove_window())
+                .unwrap();
+        }
+
+        assert!(
+            weak_view.upgrade().is_none(),
+            "native window state must not retain the focused input entity"
+        );
+        assert!(native_window.take_input_handler().is_none());
+    }
 
     #[gpui::test]
     fn text_input_configuration_and_focus_state_are_forwarded_on_change(cx: &mut TestAppContext) {

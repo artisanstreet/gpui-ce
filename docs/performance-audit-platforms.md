@@ -1,0 +1,106 @@
+# Platform performance audit
+
+Date: 2026-10-13. Scope: `gpui_ce_linux` and `gpui_ce_windows` source at the local `artisan/performance` branch. Artisan uses the Windows wgpu path; Linux supports Wayland and X11. This is a review ledger, not a claim that every possible optimization is exhausted. Large event-handler files were checked along scheduling, allocation, and resource-ownership paths. Files excluded by the product feature set were checked for their exclusion rather than rewritten.
+
+## Completed changes and checks
+
+- Windows and X11 frame scheduling now parks without recurring idle wakeups. Pure tests cover demand coalescing, close/wake races, idle deadlines, animation cadence, and delayed idle resumes. Windows DirectManipulation now explicitly requests frames while interaction or inertia is active. Native touchpad and compositor integration still need real-device regression checks.
+- The Windows scheduler received an independent race review. WM_DESTROY closes the frame clock before the close callback. Native HWND invalidation is asynchronous while the delivery lock is held.
+- Wayland icon upload now writes pixels before creating protocol objects, destroys each SHM pool after its buffer is created, then destroys the assigned icon before its buffers. Local file handles no longer remain in WindowState. The installed Wayland protocol XML explicitly permits these lifetimes. `wl_shm_pool.create_buffer` says buffers retain their pool storage; `xdg_toplevel_icon_manager_v1.set_icon` permits immediate icon destruction; icon buffers must survive until icon destruction. Runtime compositor validation remains outstanding.
+- Windows toast storage now releases entries on activation, dismissal, or failure. Callbacks hold weak map references. A generation guard prevents a delayed event from retiring a newer toast with the same tag. No native operation or COM release occurs under the map lock. Two standalone extracted-helper tests pass for stale replacement events and release exactly once outside the lock. Coordinating Windows release builds compile this change; native notification integration remains outstanding.
+- Linux notification waits now run as async D-Bus futures on the existing background executor, removing one blocked native thread per outstanding toast. Typed response tests cover body/button activation, arbitrary caller action IDs, and dismissal. Minimum notify-rust version is 4.18, matching the resolved dependency. The Linux unit tests pass; native D-Bus integration remains outstanding.
+- The coordinating round-five build reports all 375 GPUI core tests, 54 Linux tests, and 73 GPU/text tests passing, including scene replay, sprite page ordering, and injected spring-clock coverage. ASCII shaping tests also pass. Runtime results and fixture comparability are recorded separately under Editor `.dist/performance`; this ledger does not infer memory savings from source changes alone.
+- Native Windows tests at checkpoint `3f17269` pass all three FrameSignal tests and both toast ownership tests, plus restart-argument and click tests. The unchanged keyboard test expects US Shift+4 `$`, while the host's Norwegian layout produces `¤`; this is a host-layout mismatch. The clipboard test was excluded to preserve the user's clipboard. Artifacts are under Editor `.dist/performance/windows-platform-library-tests/`. Native toast delivery and physical touchpad gestures still need integration checks.
+- Wayland clipboard cancellation now compares the source's full `ObjectId` before releasing its item. The Wayland backend guarantees identity across reused wire IDs. A late cancellation cannot erase a newer copy, and pending sends own their byte buffers independently. Sending consumes the owned text String into bytes rather than cloning it again. The pure cancellation test covers stale, current and repeated cancellations; native compositor delivery remains untested.
+- X11 now stores the metadata-rich item with its wire data in one selection payload. Ownership writes and cancellation share the payload lock. A `SelectionClear` handler queries the current server owner while holding that lock and ignores a stale event after reacquisition. Actual loss releases both copies. An owner-query error preserves the payload. This adds one synchronous X-server round trip per populated selection-loss event, without app callbacks, UI waits or polling. Three pure regressions cover stale/current loss, failures and PRIMARY isolation; all 385 core, 58 Linux and 80 GPU/text tests pass. Strict Clippy passes for these libraries and tests. Real clipboard operations are excluded; an isolated Xvfb server is not installed, so native ownership integration remains unverified. Logs: Editor `.dist/performance/x11-clipboard-full-tests.log` and `.dist/performance/x11-clipboard-clippy-strict.log`.
+
+## Remaining actionable candidates
+
+A separate native D3D11 diagnostic found a rendering defect outside Artisan's production wgpu path. `dx_blur_pass` binds `BlurParams` to vertex constant-buffer slot b1; subsequent normal draws update `BatchParams` but do not rebind that slot. Every normal batch-indexed vertex shader then reads the blur buffer as its batch offset. Rebinding `BatchParams` in `update_batch_start` covers quads, shadows, underlines and all sprite kinds. Path shaders use direct indices and do not read b1. The isolated Windows run restored text, and numerical image crops matched the wgpu reference for the checked controls. Longer native sampling and mixed-text checks are separate validation; no production backend switch follows from this finding.
+
+1. Linux platform notification dismiss remains a no-op. Adding tag-based dismissal requires tracking native handles independently of the async response futures; this is a functional addition outside the thread-retention fix.
+2. Linux starts one GPUI worker per available logical CPU, minimum two, plus Timer. The observed Linux fixture had eight workers. Reducing this may trade background throughput for a modest resident stack reduction; reserved stack address space is not resident RAM. Attribute it and test workloads before selecting a cap.
+3. Wayland serial tracking is a HashMap for a fixed five-element enum. An inline array removes one small allocation and hashing in input dispatch. Low absolute benefit; retained as a later cleanup candidate.
+4. X11 creates temporary event Vec and exposed-window HashSet per drain pass, and frame pings temporarily collect window ids. These are active-event costs. Reusing storage must preserve reentrant callbacks and is not justified by the current idle measurements.
+
+## Native Windows followup
+
+The native D3D11 path now shares the demand-driven per-window display clock
+with WGPU. The former unconditional native loop is removed. Device recovery
+has a separate coalescing signal that parks until a draw or resize reports a
+failure. Requests received during recovery remain pending. Window destruction
+closes its frame signal before callbacks, and platform teardown closes the
+recovery signal. Resize, restore and successful device recreation request a
+forced redraw so cached atlas references cannot survive a replaced device.
+
+The `cosmic-text` feature uses the same text system as WGPU and excludes the
+unused DirectWrite owner and recovery callback. Existing native DirectWrite
+builds remain available without that feature. The native/Cosmic, native
+DirectWrite, WGPU and combined-feature configurations all compile.
+
+The current native Windows library passes 18 graphics tests and strict Cosmic
+Clippy. Its wider non-clipboard run passes 29 tests, with the previously
+documented Norwegian keyboard-layout mismatch. Full Editor hardware captures
+preserve conversation/input/palette and mesh-control appearance; resize and
+minimize/restore return identical transcript/composer pixels. Physical GPU
+removal during teardown and real touchpad inertia remain unverified. The
+pre-existing synchronous device-recovery message path still warrants a
+separate shutdown-race investigation.
+
+## File coverage
+
+| File | Review depth/status | Result |
+| --- | --- | --- |
+| [crates/gpui_linux/src/gpui_linux.rs](../crates/gpui_linux/src/gpui_linux.rs) | Inspected | Target gate and re-export only. |
+| [crates/gpui_linux/src/linux/dispatcher.rs](../crates/gpui_linux/src/linux/dispatcher.rs) | Inspected; attribution candidate | Eager worker count equals max(available_parallelism, 2), plus timer thread. Idle workers block; timer thread is event-driven. Do not cap without throughput evidence. |
+| [crates/gpui_linux/src/linux/headless/client.rs](../crates/gpui_linux/src/linux/headless/client.rs) | Inspected; outside measured UI | Blocking calloop event loop. No recurring rendering. |
+| [crates/gpui_linux/src/linux/headless/window.rs](../crates/gpui_linux/src/linux/headless/window.rs) | Pattern/ownership screen; outside measured UI | No-op window and lightweight atlas map; no native renderer. Not used by visible Editor workload. |
+| [crates/gpui_linux/src/linux/headless.rs](../crates/gpui_linux/src/linux/headless.rs) | Inspected | Module wiring only. |
+| [crates/gpui_linux/src/linux/keyboard.rs](../crates/gpui_linux/src/linux/keyboard.rs) | Inspected | One SharedString layout name. |
+| [crates/gpui_linux/src/linux/platform.rs](../crates/gpui_linux/src/linux/platform.rs) | Inspected | Platform setup, dialogs, keyring, wake subscription and bounded-time pipe reads. Wake subscription is event-driven, not polling. |
+| [crates/gpui_linux/src/linux/system_notifications.rs](../crates/gpui_linux/src/linux/system_notifications.rs) | Changed; regression tests | Uses existing background executor and async D-Bus waits. Typed responses preserve body/button activation and ignore closed notifications. |
+| [crates/gpui_linux/src/linux/text_system.rs](../crates/gpui_linux/src/linux/text_system.rs) | Inspected | Re-export of CosmicTextSystem; shaping audited in gpui_wgpu separately. |
+| [crates/gpui_linux/src/linux/wayland/client.rs](../crates/gpui_linux/src/linux/wayland/client.rs) | Changed; inspected | Frame retry timer is one-shot, key-repeat exists only while key held, data-offer list bounded to two. Selection source identity is registered before publication and passed to cancellation. |
+| [crates/gpui_linux/src/linux/wayland/clipboard.rs](../crates/gpui_linux/src/linux/wayland/clipboard.rs) | Changed; inspected | Read cache clears on offer change; matching cancellation releases owned items. Writes remain readiness-driven and reuse the owned text allocation. |
+| [crates/gpui_linux/src/linux/wayland/cursor.rs](../crates/gpui_linux/src/linux/wayland/cursor.rs) | Inspected | One loaded theme retained; theme/scale equality avoids reload. Native cursor-shape path preferred where compositor supports it. |
+| [crates/gpui_linux/src/linux/wayland/display.rs](../crates/gpui_linux/src/linux/wayland/display.rs) | Inspected | Output metadata and display conversions; no independent history or periodic work. |
+| [crates/gpui_linux/src/linux/wayland/layer_shell.rs](../crates/gpui_linux/src/linux/wayland/layer_shell.rs) | Inspected | Enum/bitflag conversion only. |
+| [crates/gpui_linux/src/linux/wayland/popup.rs](../crates/gpui_linux/src/linux/wayland/popup.rs) | Inspected | Enum/bitflag conversion only. |
+| [crates/gpui_linux/src/linux/wayland/scroll.rs](../crates/gpui_linux/src/linux/wayland/scroll.rs) | Inspected | Velocity history bounded by 150 ms, active kinetic scroll clears on finish/cancel; no independent idle timer. |
+| [crates/gpui_linux/src/linux/wayland/serial.rs](../crates/gpui_linux/src/linux/wayland/serial.rs) | Inspected; small candidate | Five-key HashMap could be inline array; low absolute savings. Selection serial rollover tests already exist. |
+| [crates/gpui_linux/src/linux/wayland/window.rs](../crates/gpui_linux/src/linux/wayland/window.rs) | Changed; inspected | Existing compositor-driven frame state machine parks idle. New icon cleanup destroys SHM pool, icon, and buffers and drops local file handles. |
+| [crates/gpui_linux/src/linux/wayland.rs](../crates/gpui_linux/src/linux/wayland.rs) | Inspected | Module wiring and cursor-shape conversion only. |
+| [crates/gpui_linux/src/linux/x11/client.rs](../crates/gpui_linux/src/linux/x11/client.rs) | Changed; inspected | One-shot frame timer armed by shared ping; hidden windows park demand. Expose path still requests presentation. Original clipboard items now belong to the clipboard service. |
+| [crates/gpui_linux/src/linux/x11/clipboard.rs](../crates/gpui_linux/src/linux/x11/clipboard.rs) | Changed; focused tests added | Clipboard server blocks on X events. Wire data and metadata release together after current ownership is checked under the payload lock; late old clears preserve newer copies. |
+| [crates/gpui_linux/src/linux/x11/display.rs](../crates/gpui_linux/src/linux/x11/display.rs) | Inspected | Display metadata/conversion; no recurring work or persistent history. |
+| [crates/gpui_linux/src/linux/x11/event.rs](../crates/gpui_linux/src/linux/x11/event.rs) | Inspected | Pure input conversions and bit-count operations; no persistent allocation. |
+| [crates/gpui_linux/src/linux/x11/frame_schedule.rs](../crates/gpui_linux/src/linux/x11/frame_schedule.rs) | Changed; unit-tested | Idle has no timer deadline; requests coalesce and preserve animation cadence without catch-up bursts. |
+| [crates/gpui_linux/src/linux/x11/window.rs](../crates/gpui_linux/src/linux/x11/window.rs) | Changed; inspected | frame_waker and schedule_frame reach X11 demand signal; device recovery and renderer retry demand wake clock. |
+| [crates/gpui_linux/src/linux/x11/xim_handler.rs](../crates/gpui_linux/src/linux/x11/xim_handler.rs) | Inspected | Single last-callback event and IME state; allocations correspond to active input text. |
+| [crates/gpui_linux/src/linux/x11.rs](../crates/gpui_linux/src/linux/x11.rs) | Changed; reviewed | Registers pure frame scheduling module. |
+| [crates/gpui_linux/src/linux/xdg_desktop_portal.rs](../crates/gpui_linux/src/linux/xdg_desktop_portal.rs) | Inspected | Settings watchers await D-Bus streams. No periodic polling found. |
+| [crates/gpui_linux/src/linux.rs](../crates/gpui_linux/src/linux.rs) | Inspected | Chooses one platform backend at runtime; both compiled does not mean both initialized. |
+| [crates/gpui_windows/src/alpha_correction.hlsl](../crates/gpui_windows/src/alpha_correction.hlsl) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/clipboard.rs](../crates/gpui_windows/src/clipboard.rs) | Inspected | On-demand clipboard conversion; small fixed format map. Image conversion allocates by input size, not at idle. |
+| [crates/gpui_windows/src/color_text_raster.hlsl](../crates/gpui_windows/src/color_text_raster.hlsl) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/destination_list.rs](../crates/gpui_windows/src/destination_list.rs) | Inspected | Jump-list rebuild is on demand; recent-workspace storage is Arc-backed. No recurring work or unbounded independent history found. |
+| [crates/gpui_windows/src/direct_manipulation.rs](../crates/gpui_windows/src/direct_manipulation.rs) | Changed; reviewed | Manual-update touchpad demand follows interaction BEGIN/END and viewport RUNNING/INERTIA; hardware regression remains outstanding. |
+| [crates/gpui_windows/src/direct_write.rs](../crates/gpui_windows/src/direct_write.rs) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/directx_atlas.rs](../crates/gpui_windows/src/directx_atlas.rs) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/directx_devices.rs](../crates/gpui_windows/src/directx_devices.rs) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/directx_renderer.rs](../crates/gpui_windows/src/directx_renderer.rs) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/dispatcher.rs](../crates/gpui_windows/src/dispatcher.rs) | Inspected | Native threadpool work and one-shot timers; no recurring idle timer. Failed native task/timer submission can leave a runnable pending, a separate error-path concern. |
+| [crates/gpui_windows/src/display.rs](../crates/gpui_windows/src/display.rs) | Inspected | On-demand monitor enumeration; SmallVec for usual monitor counts. |
+| [crates/gpui_windows/src/events.rs](../crates/gpui_windows/src/events.rs) | Changed; reviewed | Paint, resize, restore, destruction, device recovery, and active touchpad manipulation rearm or close clock as needed. |
+| [crates/gpui_windows/src/frame_signal.rs](../crates/gpui_windows/src/frame_signal.rs) | Changed; unit-tested | Coalesced demand signal blocks indefinitely while idle; close suppresses late delivery. |
+| [crates/gpui_windows/src/gpui_windows.rs](../crates/gpui_windows/src/gpui_windows.rs) | Changed; reviewed | Legacy DirectX/DirectWrite modules and HLSL are excluded by Artisan wgpu feature. |
+| [crates/gpui_windows/src/keyboard.rs](../crates/gpui_windows/src/keyboard.rs) | Inspected | Finite keyboard-layout lookup maps built on layout change; no history growth. |
+| [crates/gpui_windows/src/monitor_vsync.rs](../crates/gpui_windows/src/monitor_vsync.rs) | Changed; reviewed | Per-window vblank worker wakes on demand; hidden windows do not poll. Locked visibility check preserves restore wakes. |
+| [crates/gpui_windows/src/platform.rs](../crates/gpui_windows/src/platform.rs) | Changed; reviewed | Stores RAII frame clock. Main queue coalesces wakes and drains with a 10 ms responsiveness budget; no idle poll in wgpu path. |
+| [crates/gpui_windows/src/shaders.hlsl](../crates/gpui_windows/src/shaders.hlsl) | Feature-gate screened; excluded from Artisan | Compiled only without Windows wgpu. Legacy renderer/resource tuning would not reduce the current Editor footprint; retained for compatibility pending a separate removal decision. |
+| [crates/gpui_windows/src/system_notifications.rs](../crates/gpui_windows/src/system_notifications.rs) | Changed; regression tests | Terminal native events release retained toast; generation guard protects replacement; weak callbacks avoid ownership cycle. |
+| [crates/gpui_windows/src/system_settings.rs](../crates/gpui_windows/src/system_settings.rs) | Inspected | Two cached scroll-setting integers, refreshed on OS settings messages. |
+| [crates/gpui_windows/src/util.rs](../crates/gpui_windows/src/util.rs) | Inspected | Fixed lazy native cursor cache and on-demand utility calls. |
+| Former `crates/gpui_windows/src/vsync.rs` | Removed in native followup | Replaced by the shared demand-driven per-window clock and separate device-recovery signal. |
+| [crates/gpui_windows/src/window.rs](../crates/gpui_windows/src/window.rs) | Changed; reviewed | All GPUI frame wakes reach demand clock. Drop closes the clock before HWND destruction; native callbacks remain lazy. |
+| [crates/gpui_windows/src/wrapper.rs](../crates/gpui_windows/src/wrapper.rs) | Inspected | Copy native-handle wrappers; no owning allocation. |

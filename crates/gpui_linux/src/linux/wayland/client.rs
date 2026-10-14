@@ -1252,6 +1252,7 @@ impl LinuxClient for WaylandClient {
                 return;
             };
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
+            state.clipboard.set_primary_source(data_source.id());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
             }
@@ -1278,6 +1279,7 @@ impl LinuxClient for WaylandClient {
             };
             let data_source = data_device_manager
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
+            state.clipboard.set_source(data_source.id());
             for mime_type in TEXT_MIME_TYPES {
                 data_source.offer(mime_type.to_string());
             }
@@ -2877,6 +2879,7 @@ impl Dispatch<wl_data_source::WlDataSource, DataSourceKind> for WaylandClientSta
                 state.clipboard.send(mime_type, fd);
             }
             (DataSourceKind::Clipboard, wl_data_source::Event::Cancelled) => {
+                state.clipboard.cancel_source(&data_source.id());
                 data_source.destroy();
             }
             (DataSourceKind::Drag, wl_data_source::Event::Send { fd, .. }) => {
@@ -2976,13 +2979,16 @@ impl Dispatch<zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1, ()>
         _: &QueueHandle<Self>,
     ) {
         let client = this.get_client();
-        let state = client.borrow_mut();
+        let mut state = client.borrow_mut();
 
         match event {
             zwp_primary_selection_source_v1::Event::Send { mime_type, fd } => {
                 state.clipboard.send_primary(mime_type, fd);
             }
             zwp_primary_selection_source_v1::Event::Cancelled => {
+                state
+                    .clipboard
+                    .cancel_primary_source(&selection_source.id());
                 selection_source.destroy();
             }
             _ => {}

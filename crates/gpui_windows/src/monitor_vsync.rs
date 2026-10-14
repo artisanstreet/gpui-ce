@@ -1,5 +1,5 @@
-//! One display clock per wgpu window. Monitor changes are checked before
-//! every wait, so mixed-refresh displays never share the primary DWM clock.
+//! One demand-driven display clock per window. Idle clocks sleep until
+//! invalidation or animation requests a frame.
 
 use std::{
     sync::{
@@ -19,41 +19,55 @@ use windows::Win32::{
     UI::WindowsAndMessaging::{IsIconic, IsWindow, IsWindowVisible},
 };
 
-use crate::SafeHwnd;
+use crate::{SafeHwnd, frame_signal::FrameSignal};
 
-pub(crate) fn start(
-    hwnd: SafeHwnd,
-    ready: &Arc<AtomicBool>,
-    enabled: Arc<AtomicBool>,
-) -> std::io::Result<()> {
-    let ready = Arc::downgrade(ready);
+pub(crate) struct FrameClock {
+    signal: Arc<FrameSignal>,
+}
+
+impl FrameClock {
+    pub(crate) fn request(&self) {
+        self.signal.request();
+    }
+}
+
+impl Drop for FrameClock {
+    fn drop(&mut self) {
+        self.signal.close();
+    }
+}
+
+pub(crate) fn start(hwnd: SafeHwnd, ready: Arc<AtomicBool>) -> std::io::Result<FrameClock> {
+    let signal = Arc::new(FrameSignal::default());
+    let worker_signal = signal.clone();
     std::thread::Builder::new()
         .name("WindowVSync".into())
         .spawn(move || {
             let mut clock = MonitorClock::default();
-            while let Some(ready) = ready.upgrade() {
+            while worker_signal.wait() {
                 let hwnd = hwnd.as_raw();
                 if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
                     break;
                 }
-                if unsafe { IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() } {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
+                if unsafe { !IsIconic(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() } {
+                    clock.wait(hwnd);
                 }
-                if !enabled.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(100));
-                    continue;
-                }
-                clock.wait(hwnd);
-                // A bool coalesces missed vblanks. Never queue a burst of catch-up
-                // frames when the UI thread was busy or the window moved monitors.
-                ready.store(true, Ordering::Release);
-                unsafe {
-                    let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE);
+                if !worker_signal.deliver(|| {
+                    unsafe {
+                        // Check visibility while holding the signal lock. A
+                        // concurrent restore request must either join this
+                        // redraw or wake the worker after this request clears.
+                        if !IsIconic(hwnd).as_bool() && IsWindowVisible(hwnd).as_bool() {
+                            ready.store(true, Ordering::Release);
+                            let _ = RedrawWindow(Some(hwnd), None, None, RDW_INVALIDATE);
+                        }
+                    }
+                }) {
+                    break;
                 }
             }
         })
-        .map(|_| ())
+        .map(|_| FrameClock { signal })
 }
 
 #[derive(Default)]

@@ -20,6 +20,7 @@ test-support = [
   "gpui/test-support",
   "gpui_macos/test-support",
   "gpui_windows/test-support",
+  "gpui_linux/test-support",
 ]
 screen-capture = [
   "gpui/screen-capture",
@@ -30,6 +31,7 @@ screen-capture = [
 runtime_shaders = ["gpui_macos/runtime_shaders"]
 wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
+cosmic-text = ["gpui_windows/cosmic-text"]
 wgpu = ["gpui_windows/wgpu"]
 
 [dependencies]

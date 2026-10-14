@@ -270,7 +270,7 @@ impl<E: IntoElement + 'static> Element for SpringAnimationElement<E> {
         cx: &mut App,
     ) -> (crate::LayoutId, Self::RequestLayoutState) {
         window.with_element_state(global_id.unwrap(), |state, window| {
-            let now = Instant::now();
+            let now = cx.background_executor().now();
             let initial = self.initial.unwrap_or(self.target);
             let mut state = state.unwrap_or_else(|| SpringElementState {
                 spring: SpringState {
@@ -713,6 +713,37 @@ mod tests {
                 |element, value| element.left(value),
             )
             .child(div());
+    }
+
+    #[gpui::test]
+    fn test_spring_animation_uses_executor_clock(cx: &mut TestAppContext) {
+        let rendered_values = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.open_window(size(px(100.0), px(100.0)), {
+            let rendered_values = rendered_values.clone();
+            move |_, _| SpringAnimationTestView {
+                target: px(100.0),
+                initial: Some(px(0.0)),
+                playback: SpringPlayback::Running,
+                rendered_values,
+            }
+        });
+        cx.run_until_parked();
+        assert!(simulate_next_frame(&window, cx) > 0);
+        assert_eq!(*rendered_values.borrow().last().unwrap(), px(0.0));
+
+        cx.executor().advance_clock(Duration::from_millis(50));
+        assert!(simulate_next_frame(&window, cx) > 0);
+        let expected = SpringConfig::new(100.0, 2.0, 1.0)
+            .step(
+                SpringState {
+                    position: 0.0,
+                    velocity: 0.0,
+                },
+                100.0,
+                0.05,
+            )
+            .position;
+        assert!((rendered_values.borrow().last().unwrap().0 - expected).abs() < 0.0001);
     }
 
     #[gpui::test]

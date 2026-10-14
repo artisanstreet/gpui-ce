@@ -156,17 +156,15 @@ impl DirectXAtlasState {
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
     ) -> Option<&mut DirectXAtlasTexture> {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(1024),
-            height: DevicePixels(1024),
-        };
         // Max texture size for DirectX. See:
         // https://learn.microsoft.com/en-us/windows/win32/direct3d11/overviews-direct3d-11-resources-limits
-        const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
-            width: DevicePixels(16384),
-            height: DevicePixels(16384),
+        const MAX_ATLAS_SIZE: u32 = 16384;
+        let texture_list = match kind {
+            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
+            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
+            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
+        let size = texture_list.next_texture_size(min_size, MAX_ATLAS_SIZE)?;
         let pixel_format;
         let bind_flag;
         let bytes_per_pixel;
@@ -182,7 +180,12 @@ impl DirectXAtlasState {
                 bytes_per_pixel = 4;
             }
             AtlasTextureKind::Subpixel => {
-                pixel_format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                // Cosmic returns BGRA coverage; DirectWrite returns RGBA.
+                pixel_format = if cfg!(feature = "cosmic-text") {
+                    DXGI_FORMAT_B8G8R8A8_UNORM
+                } else {
+                    DXGI_FORMAT_R8G8B8A8_UNORM
+                };
                 bind_flag = D3D11_BIND_SHADER_RESOURCE;
                 bytes_per_pixel = 4;
             }
@@ -212,11 +215,6 @@ impl DirectXAtlasState {
         }
         let texture = texture.unwrap();
 
-        let texture_list = match kind {
-            AtlasTextureKind::Monochrome => &mut self.monochrome_textures,
-            AtlasTextureKind::Polychrome => &mut self.polychrome_textures,
-            AtlasTextureKind::Subpixel => &mut self.subpixel_textures,
-        };
         let index = texture_list.free_list.pop();
         let view = unsafe {
             let mut view = None;
@@ -400,8 +398,10 @@ mod tests {
             height: DevicePixels(64),
         };
         let big = Size {
-            width: DevicePixels(700),
-            height: DevicePixels(700),
+            // The keeper and one large tile fill the first 256-square page.
+            // A second large tile fits only after the first is deallocated.
+            width: DevicePixels(192),
+            height: DevicePixels(192),
         };
 
         let keeper_key = make_image_key(1);

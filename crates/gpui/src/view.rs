@@ -293,6 +293,7 @@ struct ViewElementCacheKey {
     bounds: Bounds<Pixels>,
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
+    inherited_opacity: f32,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -382,11 +383,13 @@ impl<V: View> Element for ViewElement<V> {
                     |element_state, window| {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
+                        let inherited_opacity = window.element_opacity();
 
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
+                            && element_state.cache_key.inherited_opacity == inherited_opacity
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
@@ -427,6 +430,7 @@ impl<V: View> Element for ViewElement<V> {
                                     bounds,
                                     content_mask,
                                     text_style,
+                                    inherited_opacity,
                                 },
                             },
                         )
@@ -503,5 +507,115 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppContext as _, ParentElement as _, Styled as _, TestAppContext, div};
+    use std::{cell::Cell, rc::Rc};
+
+    struct CachedOpacityChild(Rc<Cell<usize>>);
+
+    const CHILD_COLOR: crate::Hsla = crate::hsla(0.36, 0.8, 0.5, 1.0);
+
+    impl Render for CachedOpacityChild {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            div().size_full().bg(CHILD_COLOR)
+        }
+    }
+
+    struct OpacityParent {
+        outer_opacity: f32,
+        inner_opacity: f32,
+        child: Entity<CachedOpacityChild>,
+    }
+
+    impl Render for OpacityParent {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().opacity(self.outer_opacity).child(
+                div().size_full().opacity(self.inner_opacity).child(
+                    self.child
+                        .clone()
+                        .cached(StyleRefinement::default().size_full()),
+                ),
+            )
+        }
+    }
+
+    fn assert_cached_child_opacity_changes(
+        cx: &mut TestAppContext,
+        initial: (f32, f32),
+        changed: (f32, f32),
+    ) {
+        let renders = Rc::new(Cell::new(0));
+        let window = cx.add_window({
+            let renders = renders.clone();
+            move |_, cx| OpacityParent {
+                outer_opacity: initial.0,
+                inner_opacity: initial.1,
+                child: cx.new(|_| CachedOpacityChild(renders)),
+            }
+        });
+        cx.run_until_parked();
+        let assert_alpha = |cx: &mut TestAppContext, expected: f32| {
+            let child_color: crate::SceneHsla = CHILD_COLOR.into();
+            window
+                .update(cx, |_, window, _| {
+                    let quads = window
+                        .painted_quads()
+                        .into_iter()
+                        .filter(|quad| {
+                            let color = quad.background.solid;
+                            color.h == child_color.h
+                                && color.s == child_color.s
+                                && color.l == child_color.l
+                        })
+                        .collect::<Vec<_>>();
+                    // A transparent fill may be split into border strips;
+                    // every recorded part still carries the child color.
+                    assert!(!quads.is_empty());
+                    for quad in quads {
+                        assert_eq!(quad.background.solid.a, expected);
+                    }
+                })
+                .unwrap();
+        };
+        assert_alpha(cx, initial.0 * initial.1);
+        let initial_renders = renders.get();
+
+        window
+            .update(cx, |parent, _, cx| {
+                parent.outer_opacity = changed.0;
+                parent.inner_opacity = changed.1;
+                cx.notify();
+            })
+            .unwrap();
+        cx.run_until_parked();
+        assert_alpha(cx, changed.0 * changed.1);
+        assert_eq!(renders.get(), initial_renders + 1);
+
+        // Parent invalidation with identical inherited opacity should retain
+        // the cached child, even after several successive scene replays.
+        for _ in 0..3 {
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            cx.run_until_parked();
+            assert_alpha(cx, changed.0 * changed.1);
+            assert_eq!(renders.get(), initial_renders + 1);
+        }
+    }
+
+    #[gpui::test]
+    fn cached_child_repaints_when_inherited_opacity_reveals_it(cx: &mut TestAppContext) {
+        assert_cached_child_opacity_changes(cx, (0.0, 1.0), (1.0, 1.0));
+    }
+
+    #[gpui::test]
+    fn cached_child_tracks_nested_inherited_opacity_without_invalidating_unchanged_frames(
+        cx: &mut TestAppContext,
+    ) {
+        assert_cached_child_opacity_changes(cx, (0.5, 0.5), (0.75, 0.25));
     }
 }

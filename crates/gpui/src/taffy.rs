@@ -30,6 +30,7 @@ struct NodeContext {
 }
 pub struct TaffyLayoutEngine {
     taffy: TaffyTree<NodeContext>,
+    measured_nodes: Vec<NodeId>,
     absolute_layout_bounds: FxHashMap<LayoutId, Bounds<Pixels>>,
     /// Unrounded absolute border-box top-left per-node coordinate in device pixels.
     absolute_outer_origins: FxHashMap<LayoutId, Point<f32>>,
@@ -45,6 +46,7 @@ impl TaffyLayoutEngine {
         taffy.disable_rounding();
         TaffyLayoutEngine {
             taffy,
+            measured_nodes: Vec::new(),
             absolute_layout_bounds: FxHashMap::default(),
             absolute_outer_origins: FxHashMap::default(),
             computed_layouts: FxHashSet::default(),
@@ -53,6 +55,14 @@ impl TaffyLayoutEngine {
     }
 
     pub fn clear(&mut self) {
+        // Taffy 0.13 clears nodes but retains their secondary-map contexts.
+        // Drop frame-owned measurement closures before invalidating their IDs,
+        // or old text/layout data survives until a measured slot is reused.
+        for node in self.measured_nodes.drain(..) {
+            self.taffy
+                .set_node_context(node, None)
+                .expect(EXPECT_MESSAGE);
+        }
         self.taffy.clear();
         self.absolute_layout_bounds.clear();
         self.absolute_outer_origins.clear();
@@ -100,10 +110,12 @@ impl TaffyLayoutEngine {
         #[cfg(feature = "stacker")]
         let measure = StackSafe::new(measure);
 
-        self.taffy
+        let node = self
+            .taffy
             .new_leaf_with_context(taffy_style, NodeContext { measure })
-            .expect(EXPECT_MESSAGE)
-            .into()
+            .expect(EXPECT_MESSAGE);
+        self.measured_nodes.push(node);
+        node.into()
     }
 
     /// Treats any `auto` dimension of the given node's style as filling `size`.
@@ -208,13 +220,7 @@ impl TaffyLayoutEngine {
             while let Some(id) = stack.pop() {
                 self.absolute_layout_bounds.remove(&id);
                 self.absolute_outer_origins.remove(&id);
-                stack.extend(
-                    self.taffy
-                        .children(id.into())
-                        .expect(EXPECT_MESSAGE)
-                        .into_iter()
-                        .map(LayoutId::from),
-                );
+                stack.extend(self.taffy.child_ids(id.into()).map(LayoutId::from));
             }
         }
 
@@ -835,6 +841,81 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clear_drops_measured_contexts_before_nodes_are_reused() {
+        use std::{cell::Cell, rc::Rc};
+
+        struct DropCounter(Rc<Cell<usize>>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+
+        let dropped = Rc::new(Cell::new(0));
+        let mut engine = TaffyLayoutEngine::new();
+        for _ in 0..3 {
+            let capture = DropCounter(dropped.clone());
+            engine.request_measured_layout(
+                Style::default(),
+                Pixels(16.0),
+                1.0,
+                move |_, _, _, _| {
+                    let _ = &capture;
+                    size(Pixels(10.0), Pixels(10.0))
+                },
+            );
+        }
+        assert_eq!(
+            dropped.get(),
+            0,
+            "contexts must survive throughout their frame"
+        );
+        engine.clear();
+        assert_eq!(dropped.get(), 3);
+
+        // An ordinary leaf may occupy an old context's slot next frame. It
+        // must not retain the old capture, or make cleanup use a stale ID.
+        engine.request_layout(Style::default(), Pixels(16.0), 1.0, &[]);
+        engine.clear();
+        assert_eq!(dropped.get(), 3);
+        let capture = DropCounter(dropped.clone());
+        engine.request_measured_layout(Style::default(), Pixels(16.0), 1.0, move |_, _, _, _| {
+            let _ = &capture;
+            size(Pixels(20.0), Pixels(20.0))
+        });
+        assert_eq!(dropped.get(), 3);
+        engine.clear();
+        assert_eq!(dropped.get(), 4);
+        engine.clear();
+        drop(engine);
+        assert_eq!(dropped.get(), 4, "each capture drops exactly once");
+    }
+
+    #[test]
+    fn clearing_one_layout_engine_preserves_another_engines_contexts() {
+        use std::rc::Rc;
+        let captures = [Rc::new(()), Rc::new(())];
+        let mut engines = [TaffyLayoutEngine::new(), TaffyLayoutEngine::new()];
+        for (engine, capture) in engines.iter_mut().zip(&captures) {
+            let capture = capture.clone();
+            engine.request_measured_layout(
+                Style::default(),
+                Pixels(16.0),
+                1.0,
+                move |_, _, _, _| {
+                    let _ = &capture;
+                    Size::default()
+                },
+            );
+        }
+        engines[0].clear();
+        assert_eq!(Rc::strong_count(&captures[0]), 1);
+        assert_eq!(Rc::strong_count(&captures[1]), 2);
+        engines[1].clear();
+        assert_eq!(Rc::strong_count(&captures[1]), 1);
+    }
 
     #[test]
     fn auto_sized_axes_snap_padding_proportionally() {

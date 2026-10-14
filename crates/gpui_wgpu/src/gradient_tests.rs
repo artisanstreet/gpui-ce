@@ -25,8 +25,8 @@
 //! (`modules/ui/src/theme.rs`: `Oklch::to_srgb`, then `srgb_to_hsla`).
 use super::*;
 use gpui::{
-    BorderStyle, ColorSpace, ContentMask, Corners, Edges, block_on, hsla,
-    linear_color_stop, linear_gradient, point, size, solid_background,
+    BorderStyle, ColorSpace, ContentMask, Corners, Edges, block_on, hsla, linear_color_stop,
+    linear_gradient, point, size, solid_background,
 };
 use std::{sync::mpsc, time::Duration};
 use wgpu::util::DeviceExt as _;
@@ -78,9 +78,8 @@ fn dark_oklab_ramp_matches_reference_with_zero_mean_dither() -> Result<()> {
             } else {
                 0.0
             };
-            *value =
-                (linear_to_srgb(linear[i].clamp(0.0, 1.0)) + dither / 255.0).clamp(0.0, 1.0)
-                    * 255.0;
+            *value = (linear_to_srgb(linear[i].clamp(0.0, 1.0)) + dither / 255.0).clamp(0.0, 1.0)
+                * 255.0;
         }
         out
     };
@@ -340,10 +339,7 @@ fn transparent_gradient_edge_blends_monotonically_in_both_alpha_modes() -> Resul
     // by coverage with the same bytes.
     let modes = [
         (wgpu::BlendState::ALPHA_BLENDING, 0u32),
-        (
-            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING,
-            1u32,
-        ),
+        (wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING, 1u32),
     ];
     let srgb = hsla_to_srgb(h as f64, s as f64, l as f64);
     for (blend, premultiplied) in modes {

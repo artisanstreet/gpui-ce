@@ -4,16 +4,19 @@ use std::cell::RefCell;
 use std::collections::{HashMap, hash_map::DefaultHasher};
 use std::hash::{Hash as _, Hasher as _};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{
     ForegroundExecutor, SharedString, SystemNotification, SystemNotificationResponse, Task,
 };
+use parking_lot::Mutex;
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::Foundation::TypedEventHandler;
 use windows::UI::Notifications::{
-    ToastActivatedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier,
+    ToastActivatedEventArgs, ToastDismissedEventArgs, ToastFailedEventArgs, ToastNotification,
+    ToastNotificationManager, ToastNotifier,
 };
 use windows::core::{IInspectable, Interface as _, h};
 
@@ -21,7 +24,8 @@ type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationRespon
 
 pub(crate) struct SystemNotificationState {
     notifier: Option<ToastNotifier>,
-    active_toasts: HashMap<SharedString, ToastNotification>,
+    active_toasts: Arc<Mutex<HashMap<SharedString, (u64, ToastNotification)>>>,
+    next_generation: u64,
     response_sender: mpsc::UnboundedSender<SystemNotificationResponse>,
     response_receiver: Option<mpsc::UnboundedReceiver<SystemNotificationResponse>>,
     callback: ResponseCallback,
@@ -33,7 +37,8 @@ impl SystemNotificationState {
         let (response_sender, response_receiver) = mpsc::unbounded();
         Self {
             notifier: None,
-            active_toasts: HashMap::new(),
+            active_toasts: Arc::new(Mutex::new(HashMap::new())),
+            next_generation: 0,
             response_sender,
             response_receiver: Some(response_receiver),
             callback: Rc::new(RefCell::new(None)),
@@ -53,6 +58,8 @@ impl SystemNotificationState {
 
         let document = toast_document(&notification)?;
         let toast = ToastNotification::CreateToastNotification(&document)?;
+        let generation = self.next_generation;
+        self.next_generation += 1;
         // Windows caps toast tags at 64 characters (post-Creators Update),
         // so hash the arbitrary GPUI tag down to a fixed-width value.
         let tag = {
@@ -64,8 +71,12 @@ impl SystemNotificationState {
 
         let sender = self.response_sender.clone();
         let response_tag = notification.tag.clone();
+        let active_toasts = Arc::downgrade(&self.active_toasts);
         toast.Activated(&TypedEventHandler::<ToastNotification, IInspectable>::new(
             move |_sender, arguments| {
+                if let Some(active_toasts) = active_toasts.upgrade() {
+                    remove_current_toast(&active_toasts, &response_tag, generation);
+                }
                 let action_id = arguments
                     .as_ref()
                     .and_then(|arguments| arguments.cast::<ToastActivatedEventArgs>().ok())
@@ -82,16 +93,48 @@ impl SystemNotificationState {
             },
         ))?;
 
-        if let Some(previous) = self.active_toasts.remove(&notification.tag) {
+        let active_toasts = Arc::downgrade(&self.active_toasts);
+        let dismissed_tag = notification.tag.clone();
+        toast.Dismissed(&TypedEventHandler::<
+            ToastNotification,
+            ToastDismissedEventArgs,
+        >::new(move |_, _| {
+            if let Some(active_toasts) = active_toasts.upgrade() {
+                remove_current_toast(&active_toasts, &dismissed_tag, generation);
+            }
+            Ok(())
+        }))?;
+
+        let active_toasts = Arc::downgrade(&self.active_toasts);
+        let failed_tag = notification.tag.clone();
+        toast.Failed(
+            &TypedEventHandler::<ToastNotification, ToastFailedEventArgs>::new(move |_, _| {
+                if let Some(active_toasts) = active_toasts.upgrade() {
+                    remove_current_toast(&active_toasts, &failed_tag, generation);
+                }
+                Ok(())
+            }),
+        )?;
+
+        // Never hold the map lock across native calls, which may deliver an event.
+        let previous = self.active_toasts.lock().remove(&notification.tag);
+        if let Some((_, previous)) = previous {
             notifier.Hide(&previous)?;
         }
-        notifier.Show(&toast)?;
-        self.active_toasts.insert(notification.tag, toast);
+        // Register before Show: an immediate native failure/dismissal must be able
+        // to remove this entry. Late events from the previous toast use its generation.
+        self.active_toasts
+            .lock()
+            .insert(notification.tag.clone(), (generation, toast.clone()));
+        if let Err(error) = notifier.Show(&toast) {
+            remove_current_toast(&self.active_toasts, &notification.tag, generation);
+            return Err(error);
+        }
         Ok(())
     }
 
     pub(crate) fn dismiss(&mut self, tag: &str) {
-        let Some(toast) = self.active_toasts.remove(tag) else {
+        let Some((_, toast)) = self.active_toasts.lock().remove(tag) else {
             return;
         };
         let Some(notifier) = &self.notifier else {
@@ -154,6 +197,27 @@ impl SystemNotificationState {
     }
 }
 
+/// Native events may arrive after the same tag has already been replaced.
+fn remove_current_toast<T>(
+    toasts: &Mutex<HashMap<SharedString, (u64, T)>>,
+    tag: &str,
+    generation: u64,
+) {
+    let removed = {
+        let mut toasts = toasts.lock();
+        if toasts
+            .get(tag)
+            .is_some_and(|(current, _)| *current == generation)
+        {
+            toasts.remove(tag)
+        } else {
+            None
+        }
+    };
+    // Releasing the COM object can call native code too.
+    drop(removed);
+}
+
 fn toast_document(notification: &SystemNotification) -> windows::core::Result<XmlDocument> {
     let document = XmlDocument::new()?;
     let toast = document.CreateElement(h!("toast"))?;
@@ -194,5 +258,59 @@ fn register_app_user_model_id(app_identifier: &str, app_name: &str) {
         .and_then(|key| key.set_string("DisplayName", app_name));
     if let Err(error) = result {
         log::warn!("failed to register AppUserModelID; notifications may not display: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Weak,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn late_toast_event_does_not_remove_replacement() {
+        let toasts = Mutex::new(HashMap::from([("thread".into(), (2, "replacement"))]));
+        remove_current_toast(&toasts, "thread", 1);
+        assert_eq!(toasts.lock().get("thread"), Some(&(2, "replacement")));
+
+        remove_current_toast(&toasts, "thread", 2);
+        assert!(toasts.lock().is_empty());
+        remove_current_toast(&toasts, "thread", 2);
+        assert!(toasts.lock().is_empty());
+    }
+
+    struct DropProbe {
+        toasts: Weak<Mutex<HashMap<SharedString, (u64, DropProbe)>>>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            // Native toast release can re-enter an event callback.
+            assert!(self.toasts.upgrade().unwrap().try_lock().is_some());
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn finished_toast_is_released_once_outside_the_registry_lock() {
+        let toasts = Arc::new(Mutex::new(HashMap::new()));
+        let drops = Arc::new(AtomicUsize::new(0));
+        toasts.lock().insert(
+            "thread".into(),
+            (
+                7,
+                DropProbe {
+                    toasts: Arc::downgrade(&toasts),
+                    drops: drops.clone(),
+                },
+            ),
+        );
+
+        remove_current_toast(&toasts, "thread", 7);
+        remove_current_toast(&toasts, "thread", 7);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

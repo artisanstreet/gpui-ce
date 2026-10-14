@@ -11,7 +11,7 @@
 //! opacity, and draw order behave as they do for every other primitive. The
 //! background stays transparent.
 //!
-//! Only the wgpu renderer draws meshes; check [`crate::Window::supports_meshes`]
+//! The wgpu and native Windows renderers draw meshes; check [`crate::Window::supports_meshes`]
 //! before relying on one, and draw a fallback otherwise.
 
 use std::sync::atomic::{AtomicUsize, Ordering};

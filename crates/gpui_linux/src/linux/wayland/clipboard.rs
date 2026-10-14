@@ -7,7 +7,7 @@ use std::{
 use calloop::{LoopHandle, PostAction};
 use filedescriptor::Pipe;
 use strum::IntoEnumIterator;
-use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
+use wayland_client::{Connection, backend::ObjectId, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
 use crate::linux::{
@@ -32,6 +32,8 @@ pub(crate) struct Clipboard {
     // Internal clipboard
     contents: Option<ClipboardItem>,
     primary_contents: Option<ClipboardItem>,
+    source_id: Option<ObjectId>,
+    primary_source_id: Option<ObjectId>,
 
     // External clipboard
     cached_read: Option<ClipboardItem>,
@@ -150,6 +152,8 @@ impl Clipboard {
 
             contents: None,
             primary_contents: None,
+            source_id: None,
+            primary_source_id: None,
 
             cached_read: None,
             current_offer: None,
@@ -164,6 +168,26 @@ impl Clipboard {
 
     pub fn set_primary(&mut self, item: ClipboardItem) {
         self.primary_contents = Some(item);
+    }
+
+    pub fn set_source(&mut self, source: ObjectId) {
+        self.source_id = Some(source);
+    }
+
+    pub fn set_primary_source(&mut self, source: ObjectId) {
+        self.primary_source_id = Some(source);
+    }
+
+    pub fn cancel_source(&mut self, source: &ObjectId) {
+        release_cancelled_selection(&mut self.source_id, source, &mut self.contents);
+    }
+
+    pub fn cancel_primary_source(&mut self, source: &ObjectId) {
+        release_cancelled_selection(
+            &mut self.primary_source_id,
+            source,
+            &mut self.primary_contents,
+        );
     }
 
     pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
@@ -182,7 +206,7 @@ impl Clipboard {
 
     pub fn send(&self, _mime_type: String, fd: OwnedFd) {
         if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, text.into_bytes());
         }
     }
 
@@ -192,7 +216,7 @@ impl Clipboard {
             .as_ref()
             .and_then(|contents| contents.text())
         {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+            self.send_bytes(fd, text.into_bytes());
         }
     }
 
@@ -259,5 +283,42 @@ impl Clipboard {
                 },
             )
             .unwrap();
+    }
+}
+
+fn release_cancelled_selection<Id: PartialEq>(
+    active_source: &mut Option<Id>,
+    cancelled_source: &Id,
+    contents: &mut Option<ClipboardItem>,
+) {
+    // A prior source can be cancelled after the application has copied again.
+    if active_source.as_ref() == Some(cancelled_source) {
+        *active_source = None;
+        *contents = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_source_releases_contents_without_clearing_a_new_copy() {
+        let mut source = Some(1);
+        let mut contents = Some(ClipboardItem::new_string("old".into()));
+        source.replace(2);
+        contents.replace(ClipboardItem::new_string("new".into()));
+        release_cancelled_selection(&mut source, &1, &mut contents);
+        assert_eq!(
+            contents.as_ref().and_then(ClipboardItem::text).as_deref(),
+            Some("new")
+        );
+        assert_eq!(source, Some(2));
+
+        release_cancelled_selection(&mut source, &2, &mut contents);
+        assert!(source.is_none());
+        assert!(contents.is_none());
+        release_cancelled_selection(&mut source, &2, &mut contents);
+        assert!(contents.is_none());
     }
 }

@@ -264,6 +264,7 @@ impl WindowsWindowInner {
         }
 
         self.handle_size_change(new_size, scale_factor, should_resize_renderer);
+        self.request_frame();
         Some(0)
     }
 
@@ -282,9 +283,7 @@ impl WindowsWindowInner {
                 && let Err(e) = self.state.renderer.borrow_mut().resize(device_size)
             {
                 log::error!("Failed to resize renderer, invalidating devices: {}", e);
-                self.state
-                    .invalidate_devices
-                    .store(true, std::sync::atomic::Ordering::Release);
+                self.state.device_recovery.invalidate();
             }
         }
         #[cfg(feature = "wgpu")]
@@ -358,6 +357,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.frame_clock.borrow_mut().take();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -967,6 +967,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_display_change_msg(&self, handle: HWND) -> Option<isize> {
+        #[cfg(not(feature = "wgpu"))]
+        self.state.device_recovery.request_check();
+        self.request_frame();
         let new_monitor = unsafe { MonitorFromWindow(handle, MONITOR_DEFAULTTONULL) };
         if new_monitor.is_invalid() {
             log::error!("No monitor detected!");
@@ -1317,6 +1320,7 @@ impl WindowsWindowInner {
         // between) is treated as a forced render so it both clears
         // `skip_draws` and bypasses the view cache.
         self.state.force_render_pending.set(true);
+        self.request_frame();
         Some(0)
     }
 
@@ -1334,15 +1338,13 @@ impl WindowsWindowInner {
             }
             // Validate the region so a nested message pump doesn't keep
             // re-dispatching WM_PAINT for the still-invalid region in a busy
-            // loop until the in-progress draw unwinds. The vsync thread
-            // re-invalidates every window on each vsync (see
-            // `begin_vsync_thread`), so the deferred frame still gets drawn,
-            // at most one vsync late.
+            // loop until the in-progress draw unwinds. Re-arm the display
+            // clock so the deferred frame still gets drawn.
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            self.request_frame();
             return Some(0);
         };
-        #[cfg(feature = "wgpu")]
-        if self.state.frame_paced.get()
+        if self.state.frame_clock.borrow().is_some()
             && self.state.vsync_enabled.load(Ordering::Acquire)
             && !self.state.frame_ready.swap(false, Ordering::AcqRel)
         {
@@ -1350,6 +1352,7 @@ impl WindowsWindowInner {
                 self.state.force_render_pending.set(true);
             }
             unsafe { ValidateRect(Some(handle), None).ok().log_err() };
+            self.request_frame();
             return Some(0);
         }
         // Consume this paint before drawing. Invalidations raised by next-frame
@@ -1384,6 +1387,9 @@ impl WindowsWindowInner {
 
         self.state.callbacks.request_frame.set(Some(request_frame));
         self.update_ime_enabled(handle);
+        if self.state.direct_manipulation.needs_update() {
+            self.request_frame();
+        }
 
         Some(0)
     }
