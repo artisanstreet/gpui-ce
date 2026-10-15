@@ -1170,6 +1170,28 @@ impl App {
         }
     }
 
+    /// Makes `window` track `entities` too, as a frame that redrew part of it
+    /// in place read them.
+    pub(crate) fn track_entities(
+        &mut self,
+        window_handle: AnyWindowHandle,
+        invalidator: WindowInvalidator,
+        entities: &FxHashSet<EntityId>,
+    ) {
+        for entity in entities {
+            self.window_invalidators_by_entity
+                .entry(*entity)
+                .or_default()
+                .insert(window_handle.id, invalidator.clone());
+            self.current_window_by_entity
+                .insert(*entity, window_handle.id);
+        }
+        self.tracked_entities
+            .entry(window_handle.id)
+            .or_default()
+            .extend(entities.iter().copied());
+    }
+
     pub(crate) fn record_entities_accessed(
         &mut self,
         window_handle: AnyWindowHandle,

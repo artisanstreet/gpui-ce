@@ -3,11 +3,10 @@ use crate::{
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
     Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle, WeakEntity,
 };
-use crate::{CachedViewContext, Empty, QuadPulse, Window};
+use crate::{CachedViewContext, Empty, QuadPulse, Window, scene::RepaintId};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::{any::TypeId, fmt, ops::Range};
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
@@ -302,6 +301,8 @@ pub(crate) struct ViewElementState {
     /// the ambient state its subtree was drawn in.
     pub(crate) view: AnyView,
     pub(crate) context: CachedViewContext,
+    /// The scene region it paints into while it is a live layer.
+    pub(crate) layer: Option<RepaintId>,
 }
 
 pub(crate) struct ViewElementCacheKey {
@@ -404,6 +405,7 @@ impl<V: View> Element for ViewElement<V> {
                         let inherited_opacity = window.element_opacity();
                         let inherited_pulse = window.element_pulse;
 
+                        let layer = element_state.as_ref().and_then(|state| state.layer);
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
@@ -424,22 +426,11 @@ impl<V: View> Element for ViewElement<V> {
                         }
 
                         let context = window.cached_view_context();
-                        let refreshing = mem::replace(&mut window.refreshing, true);
                         let prepaint_start = window.prepaint_index();
-                        let (mut element, reads) = cx.detect_accessed_entities(|cx| {
-                            let mut element = self
-                                .view
-                                .take()
-                                .unwrap()
-                                .render(window, cx)
-                                .into_any_element();
-                            element.layout_as_root(bounds.size.into(), window, cx);
-                            element.prepaint_at(bounds.origin, window, cx);
-                            element
-                        });
-
+                        let live = window.is_live_layer(entity_id);
+                        let (element, reads) =
+                            window.prepaint_cached_contents(&cached_view, bounds, live, cx);
                         let prepaint_end = window.prepaint_index();
-                        window.refreshing = refreshing;
 
                         (
                             Some(element),
@@ -457,6 +448,7 @@ impl<V: View> Element for ViewElement<V> {
                                 },
                                 view: cached_view,
                                 context,
+                                layer,
                             },
                         )
                     },
@@ -497,12 +489,8 @@ impl<V: View> Element for ViewElement<V> {
                             let paint_start = window.paint_index();
 
                             if let Some(element) = element {
-                                let refreshing = mem::replace(&mut window.refreshing, true);
-                                let ((), reads) =
-                                    cx.detect_accessed_entities(|cx| element.paint(window, cx));
-                                element_state.direct_reads.extend(reads.direct);
-                                element_state.accessed_entities.extend(reads.total);
-                                window.refreshing = refreshing;
+                                let live = window.is_live_layer(entity_id);
+                                window.paint_cached_contents(element, &mut element_state, live, cx);
                             } else {
                                 window.reuse_paint(element_state.paint_range.clone());
                             }

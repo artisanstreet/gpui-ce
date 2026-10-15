@@ -485,6 +485,14 @@ pub(crate) struct LineLayoutIndex {
 }
 
 impl LineLayoutIndex {
+    /// How many layouts the frame used, of every kind.
+    pub(crate) fn total(&self) -> usize {
+        self.lines_index
+            + self.wrapped_lines_index
+            + self.lines_by_hash_index
+            + self.wrapped_lines_by_hash_index
+    }
+
     /// This index moved as far as `from` moved to `to`.
     pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
         Self {

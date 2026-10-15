@@ -68,8 +68,10 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod contained;
+mod live_layer;
 mod prompts;
 mod repaint;
+mod verify;
 
 pub use a11y::A11ySubtreeBuilder;
 pub(crate) use contained::CachedViewContext;
@@ -763,6 +765,11 @@ pub enum WindowControlArea {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
 
+impl HitboxId {
+    /// The id of the empty hitboxes holding a live layer's slots.
+    pub(crate) const TOMBSTONE: Self = Self(u64::MAX);
+}
+
 #[cfg(feature = "test-support")]
 impl HitboxId {
     /// A placeholder HitboxId exclusively for integration testing API's that
@@ -1275,6 +1282,27 @@ pub struct Window {
     rendered_scene_presented: bool,
     /// The rendered scene's damage, kept until it is presented.
     damage_since_present: Option<Damage>,
+    /// The rendered scene's changed primitive ranges, kept until presented.
+    changed_since_present: Option<crate::PrimitiveRanges>,
+    /// Whether a retained paint closure is painting, so closures can't nest.
+    painting_retained: bool,
+    /// Cached views drawn so they can be redrawn in place, with the scene
+    /// generation they last re-rendered in.
+    live_layers: FxHashMap<EntityId, u64>,
+    /// Damage from holes redrawn in place by a frame that then had to take
+    /// another path for the rest.
+    pub(crate) in_place_damage: Option<Damage>,
+    /// The rendered frame's slot of the input handler lent to the platform.
+    pub(crate) taken_input_handler: Option<usize>,
+    /// Whether partial frames are checked against full draws (see
+    /// [`verify`]).
+    verify_frames: bool,
+    /// Whether the draw in progress is such a check.
+    drawing_full_for_verification: bool,
+    /// What contained and in-place frames copied, so tests can show it
+    /// doesn't grow with the window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) frame_work: FrameWork,
     /// The composed paint transform of the element being drawn.
     element_transform: ScreenTransform,
     pub(crate) text_color_map: Option<TextColorMap>,
@@ -1384,6 +1412,15 @@ struct PendingInput {
     focus: Option<FocusId>,
     timer: Option<Task<()>>,
     needs_timeout: bool,
+}
+
+/// Counts of the work frames did, for tests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameWork {
+    /// Stream items (hitboxes, dispatch nodes, listeners, ...) copied from
+    /// the previous frame or written into a live layer's slots.
+    pub(crate) copied: usize,
 }
 
 pub(crate) struct ElementStateBox {
@@ -2029,6 +2066,15 @@ impl Window {
             rendered_viewport: None,
             rendered_scene_presented: false,
             damage_since_present: None,
+            changed_since_present: None,
+            painting_retained: false,
+            live_layers: FxHashMap::default(),
+            in_place_damage: None,
+            taken_input_handler: None,
+            verify_frames: Self::verify_frames_from_env(),
+            drawing_full_for_verification: false,
+            #[cfg(any(test, feature = "test-support"))]
+            frame_work: FrameWork::default(),
             element_transform: ScreenTransform::IDENTITY,
             text_color_map: None,
             requested_autoscroll: None,
@@ -3140,30 +3186,93 @@ impl Window {
 
         // Notified views render inside their nearest cached views when they
         // can; otherwise every notified view dirties its ancestors.
-        let contained = self.take_invalidated_views(cx);
+        let mut contained = self.take_invalidated_views(cx);
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
 
-        // Restore the previously-used input handler.
-        // Place it back into a None slot (left by a previous .take()) so that
-        // cached paint_range indices in reuse_paint find the handler at the
-        // expected position.
+        // Live layers redraw in place, leaving the rest of the frame (and
+        // the platform's input handler) where it is.
+        if let Some(plan) = contained.take() {
+            match self.redraw_in_place(plan, cx) {
+                live_layer::InPlace::Done {
+                    mut damage,
+                    redrawn,
+                    dirty,
+                } => {
+                    self.invalidator.set_phase(DrawPhase::Paint);
+                    let unrepaintable = self.repaint_animating_regions(&mut damage, cx);
+                    #[cfg(feature = "frame-rate")]
+                    self.repaint_frame_overlay(&mut damage);
+                    self.invalidator.set_phase(DrawPhase::None);
+                    for retained in self.retained_paints.values_mut() {
+                        retained.painted_this_draw = false;
+                    }
+                    self.rendered_frame.scene.generation += 1;
+                    let changed = mem::take(&mut self.rendered_frame.scene.replaced_primitives);
+                    self.settle_damage(Some(damage), Some(changed));
+                    self.needs_present.set(true);
+                    for view in unrepaintable {
+                        cx.notify(view);
+                    }
+                    #[cfg(feature = "profiler")]
+                    {
+                        let draw_duration = self
+                            .window_profiler
+                            .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+                        self.debug_frame_overlay.record_draw(draw_duration);
+                    }
+                    #[cfg(all(feature = "frame-rate", not(feature = "profiler")))]
+                    self.debug_frame_overlay.record_draw(draw_start.elapsed());
+                    if self.verify_frames {
+                        self.verify_partial_frame("in-place", &redrawn, &dirty, cx);
+                    }
+                    return arena_scope.exit(&cx.element_arena);
+                }
+                live_layer::InPlace::Refused(dirty) => {
+                    contained = self.plan_contained_redraw(&dirty, true, cx);
+                    if contained.is_none() {
+                        for view in &dirty {
+                            self.mark_view_dirty(*view);
+                        }
+                    }
+                }
+            }
+        }
+        if contained.is_none() {
+            self.demote_idle_live_layers();
+        }
+
+        // Restore the previously-used input handler to the slot it was taken
+        // from, so that cached paint_range indices in reuse_paint find it at
+        // the expected position.
         if let Some(input_handler) = self.platform_window.take_input_handler() {
-            if let Some(slot) = self
-                .rendered_frame
-                .input_handlers
-                .iter_mut()
-                .rev()
-                .find(|h| h.is_none())
-            {
-                *slot = Some(input_handler);
-            } else {
-                self.rendered_frame.input_handlers.push(Some(input_handler));
+            match self.taken_input_handler.take() {
+                Some(index)
+                    if self
+                        .rendered_frame
+                        .input_handlers
+                        .get(index)
+                        .is_some_and(Option::is_none) =>
+                {
+                    self.rendered_frame.input_handlers[index] = Some(input_handler);
+                }
+                _ => self.rendered_frame.input_handlers.push(Some(input_handler)),
             }
         }
         let drew_contained = contained.is_some();
+        let verify = contained
+            .as_ref()
+            .filter(|_| self.verify_frames)
+            .map(|plan| {
+                let redrawn = plan
+                    .holes
+                    .iter()
+                    .map(|hole| hole.entity)
+                    .collect::<Vec<_>>();
+                (redrawn, plan.dirty.clone())
+            });
         if !cx.mode.skip_drawing() {
             let ((), reads) = cx.detect_accessed_entities(|cx| match contained {
                 Some(plan) => self.draw_contained(plan, cx),
@@ -3202,13 +3311,15 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
-        let focused_text_input_active = if let Some(mut input_handler) = self
+        let focused_text_input_active = if let Some((index, mut input_handler)) = self
             .next_frame
             .input_handlers
             .iter_mut()
+            .enumerate()
             .rev()
-            .find_map(|h| h.take())
+            .find_map(|(index, handler)| Some((index, handler.take()?)))
         {
+            self.taken_input_handler = Some(index);
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
             self.platform_window.set_input_handler(input_handler);
             accepts_text_input
@@ -3244,6 +3355,12 @@ impl Window {
                 .damage_since(&self.next_frame.scene, &mut damage);
             damage
         });
+        // Holes this frame redrew in place before taking this path.
+        if let Some(in_place) = self.in_place_damage.take()
+            && let Some(damage) = &mut damage
+        {
+            damage.merge(in_place);
+        }
         self.rendered_viewport = Some(viewport);
         self.rendered_frame.scene.generation = self.next_frame.scene.generation + 1;
         self.next_frame.clear();
@@ -3254,7 +3371,7 @@ impl Window {
             self.repaint_animating_regions(damage.as_mut().unwrap_or(&mut untracked), cx);
         self.invalidator.set_phase(DrawPhase::Focus);
         self.retain_live_paints();
-        self.rendered_frame.scene.damage = self.settle_damage(damage);
+        self.settle_damage(damage, None);
         self.rendered_scene_pulses = self
             .rendered_frame
             .scene
@@ -3332,6 +3449,10 @@ impl Window {
         #[cfg(all(feature = "frame-rate", not(feature = "profiler")))]
         self.debug_frame_overlay.record_draw(draw_start.elapsed());
 
+        if let Some((redrawn, dirty)) = verify {
+            self.verify_partial_frame("contained", &redrawn, &dirty, cx);
+        }
+
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
         arena_scope.exit(&cx.element_arena)
@@ -3356,7 +3477,11 @@ impl Window {
     /// marks them and their ancestors dirty for a full frame.
     fn take_invalidated_views(&mut self, cx: &App) -> Option<contained::ContainedRedraw> {
         let mut views = self.invalidator.take_views();
-        let contained = self.plan_contained_redraw(&views, cx);
+        let contained = if self.drawing_full_for_verification {
+            None
+        } else {
+            self.plan_contained_redraw(&views, false, cx)
+        };
         if contained.is_none() {
             for entity in views.iter() {
                 self.mark_view_dirty(*entity);
@@ -3565,13 +3690,10 @@ impl Window {
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
         for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
-            let Some(Some(tooltip_request)) = self
-                .next_frame
-                .tooltip_requests
-                .get(tooltip_request_index)
-                .cloned()
+            let Some(tooltip_request) =
+                self.next_frame.tooltip_requests[tooltip_request_index].clone()
             else {
-                log::error!("Unexpectedly absent TooltipRequest");
+                // An empty slot of a live layer.
                 continue;
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
@@ -3764,6 +3886,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.frame_work.copied += range.end.hitboxes_index - range.start.hitboxes_index
+                + range.end.dispatch_tree_index
+                - range.start.dispatch_tree_index;
+        }
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -3827,6 +3955,11 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.frame_work.copied +=
+                range.end.mouse_listeners_index - range.start.mouse_listeners_index;
+        }
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -6054,8 +6187,8 @@ impl Window {
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
         // special purposes, such as detecting events outside of a given Bounds.
-        for listener in &mut mouse_listeners {
-            let listener = listener.as_mut().unwrap();
+        // Empty slots belong to live layers.
+        for listener in mouse_listeners.iter_mut().flatten() {
             listener(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
                 break;
@@ -6064,8 +6197,7 @@ impl Window {
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {
-            for listener in mouse_listeners.iter_mut().rev() {
-                let listener = listener.as_mut().unwrap();
+            for listener in mouse_listeners.iter_mut().rev().flatten() {
                 listener(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
                     break;

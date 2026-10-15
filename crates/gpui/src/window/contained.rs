@@ -12,15 +12,19 @@
 //! can't reproduce soundly (a refresh, a dirty entity that isn't a drawn
 //! view, a view drawn outside the main tree, accessibility, the inspector,
 //! prompts, drags) takes the full path instead.
+//!
+//! A cached view rendered this way becomes a live layer (see
+//! [`super::live_layer`]): from then on it is drawn with slack, so the next
+//! contained frames can redraw it in place without rebuilding anything else.
 
 use std::{any::TypeId, mem, ops::Range};
 
 use collections::{FxHashSet, hash_map::Entry};
+use smallvec::SmallVec;
 
 use crate::{
-    AnyElement, AnyImageCache, App, DispatchNodeId, EntityId, GlobalElementId, IntoElement as _,
-    PaintIndex, Pixels, PrepaintStateIndex, TextColorMap, TextStyleRefinement, View as _,
-    ViewElementState, Window,
+    AnyElement, AnyImageCache, App, DispatchNodeId, EntityId, GlobalElementId, PaintIndex, Pixels,
+    PrepaintStateIndex, TextColorMap, TextStyleRefinement, ViewElementState, Window,
 };
 
 use super::{DrawPhase, ElementStateBox, ScreenTransform};
@@ -34,32 +38,36 @@ pub(crate) struct CachedViewContext {
     transform: ScreenTransform,
     /// Captured when the view paints.
     pub(crate) text_color_map: Option<TextColorMap>,
+    /// The tab groups open where the view paints.
+    pub(crate) tab_path: SmallVec<[isize; 6]>,
 }
 
 /// A cached view drawn in a frame: where to find its state, and the
 /// dispatch node of its element, which sits just before its ranges.
 pub(crate) struct CachedViewEntry {
-    global_id: GlobalElementId,
-    node: DispatchNodeId,
+    pub(super) global_id: GlobalElementId,
+    pub(super) node: DispatchNodeId,
     /// Whether the entity was drawn as a cached view more than once, so
     /// which one to render again is unclear.
-    ambiguous: bool,
+    pub(super) ambiguous: bool,
 }
 
 /// The cached views a contained frame renders again, and the range of the
 /// previous frame's main tree it reuses around them.
 pub(crate) struct ContainedRedraw {
-    holes: Vec<Hole>,
+    pub(super) holes: Vec<Hole>,
     root_prepaint: Range<PrepaintStateIndex>,
     root_paint: Range<PaintIndex>,
+    /// The notified entities it was planned for.
+    pub(super) dirty: FxHashSet<EntityId>,
 }
 
 /// A cached view rendered again in a contained frame, with its ranges in the
 /// previous frame and in the new one.
-struct Hole {
-    entity: EntityId,
-    global_id: GlobalElementId,
-    node: DispatchNodeId,
+pub(super) struct Hole {
+    pub(super) entity: EntityId,
+    pub(super) global_id: GlobalElementId,
+    pub(super) node: DispatchNodeId,
     old_prepaint: Range<PrepaintStateIndex>,
     old_paint: Range<PaintIndex>,
     new_node: DispatchNodeId,
@@ -69,13 +77,13 @@ struct Hole {
 }
 
 impl Hole {
-    fn state_key(&self) -> (GlobalElementId, TypeId) {
+    pub(super) fn state_key(&self) -> (GlobalElementId, TypeId) {
         (self.global_id.clone(), TypeId::of::<ViewElementState>())
     }
 }
 
 /// The ambient window state a contained frame swaps in to draw a hole.
-struct SavedAmbience {
+pub(super) struct SavedAmbience {
     text_style_stack: Vec<TextStyleRefinement>,
     image_cache_stack: Vec<AnyImageCache>,
     opacity: f32,
@@ -109,14 +117,19 @@ impl Window {
             rem_size: self.rem_size(),
             transform: self.element_transform,
             text_color_map: None,
+            tab_path: SmallVec::new(),
         }
     }
 
     /// Decides whether the views in `dirty` can render inside their cached
     /// ancestors, and if so which cached views to render again.
+    ///
+    /// With `widen` set, a cached view inside a live layer renders with the
+    /// outermost live layer around it, which a reused frame replays whole.
     pub(crate) fn plan_contained_redraw(
         &self,
         dirty: &FxHashSet<EntityId>,
+        widen: bool,
         cx: &App,
     ) -> Option<ContainedRedraw> {
         if dirty.is_empty()
@@ -169,7 +182,8 @@ impl Window {
                 .find(|view| frame.cached_views.contains_key(view))?;
             for ancestor in path {
                 if let Some(state) = state_of(&ancestor)
-                    && !state.direct_reads.is_disjoint(dirty)
+                    && (!state.direct_reads.is_disjoint(dirty)
+                        || widen && self.is_live_layer(ancestor))
                 {
                     entity = ancestor;
                 }
@@ -214,6 +228,7 @@ impl Window {
             holes,
             root_prepaint,
             root_paint,
+            dirty: dirty.clone(),
         })
     }
 
@@ -225,7 +240,11 @@ impl Window {
             mut holes,
             root_prepaint,
             root_paint,
+            ..
         } = plan;
+        for hole in &holes {
+            self.promote_live_layer(hole.entity);
+        }
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -283,6 +302,12 @@ impl Window {
         range: Range<PrepaintStateIndex>,
         remap: &impl Fn(DispatchNodeId) -> DispatchNodeId,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.frame_work.copied += range.end.hitboxes_index - range.start.hitboxes_index
+                + range.end.dispatch_tree_index
+                - range.start.dispatch_tree_index;
+        }
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -345,17 +370,11 @@ impl Window {
         self.next_frame.dispatch_tree.set_active_node(hole.new_node);
         let saved = self.enter_cached_view(&hole.global_id, state);
         let entity = hole.entity;
+        let live = self.is_live_layer(entity);
         let (element, reads) = self.with_rendered_view(entity, |window| {
-            let refreshing = mem::replace(&mut window.refreshing, true);
             hole.new_prepaint.start = window.prepaint_index();
-            let result = cx.detect_accessed_entities(|cx| {
-                let mut element = view.render(window, cx).into_any_element();
-                element.layout_as_root(bounds.size.into(), window, cx);
-                element.prepaint_at(bounds.origin, window, cx);
-                element
-            });
+            let result = window.prepaint_cached_contents(&view, bounds, live, cx);
             hole.new_prepaint.end = window.prepaint_index();
-            window.refreshing = refreshing;
             result
         });
         self.exit_cached_view(saved);
@@ -383,26 +402,21 @@ impl Window {
 
         self.next_frame.dispatch_tree.set_active_node(hole.new_node);
         let saved = self.enter_cached_view(&hole.global_id, view_state(&mut state_box));
-        let ((), reads) = self.with_rendered_view(hole.entity, |window| {
-            let refreshing = mem::replace(&mut window.refreshing, true);
+        let live = self.is_live_layer(hole.entity);
+        self.with_rendered_view(hole.entity, |window| {
             hole.new_paint.start = window.paint_index();
-            let result = cx.detect_accessed_entities(|cx| element.paint(window, cx));
+            window.paint_cached_contents(&mut element, view_state(&mut state_box), live, cx);
             hole.new_paint.end = window.paint_index();
-            window.refreshing = refreshing;
-            result
         });
         self.exit_cached_view(saved);
 
-        let state = view_state(&mut state_box);
-        state.paint_range = hole.new_paint.clone();
-        state.direct_reads.extend(reads.direct);
-        state.accessed_entities.extend(reads.total);
+        view_state(&mut state_box).paint_range = hole.new_paint.clone();
         self.next_frame.element_states.insert(key, state_box);
     }
 
     /// Swaps in the ambient state a cached view was drawn in. Contained
     /// frames draw holes from the root, where every stack is empty.
-    fn enter_cached_view(
+    pub(super) fn enter_cached_view(
         &mut self,
         global_id: &GlobalElementId,
         state: &ViewElementState,
@@ -427,7 +441,7 @@ impl Window {
         }
     }
 
-    fn exit_cached_view(&mut self, saved: SavedAmbience) {
+    pub(super) fn exit_cached_view(&mut self, saved: SavedAmbience) {
         self.element_id_stack.clear();
         self.content_mask_stack.pop();
         self.rem_size_override_stack.pop();
@@ -565,7 +579,7 @@ fn prepaint_remap<'a>(
     }
 }
 
-fn view_state(state: &mut ElementStateBox) -> &mut ViewElementState {
+pub(super) fn view_state(state: &mut ElementStateBox) -> &mut ViewElementState {
     state
         .inner
         .downcast_mut::<Option<ViewElementState>>()

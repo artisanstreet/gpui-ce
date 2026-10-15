@@ -354,6 +354,67 @@ impl DispatchTree {
         contains_focus
     }
 
+    /// Appends `count` empty nodes under the active node, holding slots a
+    /// live layer can render into later.
+    pub fn push_tombstones(&mut self, count: usize) {
+        let parent = self.node_stack.last().copied();
+        self.nodes.extend((0..count).map(|_| DispatchNode {
+            parent,
+            ..Default::default()
+        }));
+    }
+
+    /// Replaces the nodes in `slots` with those of `source`, a subtree
+    /// rendered on its own, whose roots go under `parent`; empty nodes fill
+    /// the rest. Returns `false`, changing nothing, if they don't fit.
+    pub fn replace_slots(
+        &mut self,
+        slots: Range<usize>,
+        source: &mut Self,
+        parent: DispatchNodeId,
+    ) -> bool {
+        if source.nodes.len() > slots.len() {
+            return false;
+        }
+        for (index, node) in self.nodes[slots.clone()].iter().enumerate() {
+            let node_id = DispatchNodeId(slots.start + index);
+            if let Some(focus_id) = node.focus_id
+                && self.focusable_node_ids.get(&focus_id) == Some(&node_id)
+            {
+                self.focusable_node_ids.remove(&focus_id);
+            }
+            if let Some(view_id) = node.view_id
+                && self.view_node_ids.get(&view_id) == Some(&node_id)
+            {
+                self.view_node_ids.remove(&view_id);
+            }
+        }
+        let mut source_nodes = source.nodes.drain(..);
+        for (index, slot) in self.nodes[slots.clone()].iter_mut().enumerate() {
+            let node_id = DispatchNodeId(slots.start + index);
+            *slot = match source_nodes.next() {
+                Some(mut node) => {
+                    node.parent = Some(match node.parent {
+                        Some(parent) => DispatchNodeId(slots.start + parent.0),
+                        None => parent,
+                    });
+                    if let Some(focus_id) = node.focus_id {
+                        self.focusable_node_ids.insert(focus_id, node_id);
+                    }
+                    if let Some(view_id) = node.view_id {
+                        self.view_node_ids.insert(view_id, node_id);
+                    }
+                    node
+                }
+                None => DispatchNode {
+                    parent: Some(parent),
+                    ..Default::default()
+                },
+            };
+        }
+        true
+    }
+
     pub fn truncate(&mut self, index: usize) {
         for node in &self.nodes[index..] {
             if let Some(focus_id) = node.focus_id {

@@ -9,6 +9,7 @@ use crate::{
     MeshStyle, Pixels, Point, Radians, ScaledFilter, ScaledPixels, Size, TextColorMap,
     bounds_tree::BoundsTree, point,
 };
+use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::{
     fmt::Debug,
@@ -76,12 +77,26 @@ pub struct Scene {
     /// margin, and covers the full reach of what changed: shadow blur, sprite
     /// transforms, and every backdrop or content filter whose blur samples it.
     pub damage: Option<Vec<Bounds<ScaledPixels>>>,
-    /// The regions [`crate::Window::paint_animated`] painted, which can be
-    /// repainted in place. Each takes one [`PaintOperation::Repaint`].
+    /// Per typed vector, the indices whose contents may differ from scene
+    /// `generation - 1`, and from every scene drawn since the window last
+    /// presented one: a renderer that keeps the previous instance buffers can
+    /// upload just these. Empty ranges are unchanged. `None` means any index
+    /// may have changed, and so may every vector's length.
+    pub changed_primitives: Option<PrimitiveRanges>,
+    /// The regions repainted in place: what [`crate::Window::paint_animated`]
+    /// painted, and cached views promoted to live layers. Each takes one
+    /// operation where it was painted. Regions replaced by a repaint of the
+    /// region around them stay, marked dead, so indices hold.
     pub(crate) repaint_regions: Vec<RepaintRegion>,
-    open_region: Option<OpenRegion>,
+    /// The live regions, by id.
+    pub(crate) region_indices: FxHashMap<RepaintId, usize>,
+    /// The regions being painted, innermost last.
+    open_regions: Vec<OpenRegion>,
     /// Kept between regions so opening one doesn't allocate.
-    spare_region_bounds: BoundsTree<ScaledPixels>,
+    spare_region_bounds: Vec<BoundsTree<ScaledPixels>>,
+    /// The vector ranges region replacements changed since the window last
+    /// took them.
+    pub(crate) replaced_primitives: PrimitiveRanges,
     /// While [`crate::Window::record_paint`] runs, paints land here instead
     /// of in the scene.
     pub(crate) recording: Option<Vec<RecordedPaint>>,
@@ -106,7 +121,9 @@ impl Scene {
         self.backdrop_filters.clear();
         self.filter_boundaries.clear();
         self.repaint_regions.clear();
-        self.open_region = None;
+        self.region_indices.clear();
+        self.open_regions.clear();
+        self.replaced_primitives = PrimitiveRanges::default();
         self.recording = None;
     }
 
@@ -116,7 +133,7 @@ impl Scene {
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
         debug_assert!(self.recording.is_none(), "layers cannot be recorded");
-        let order = match &mut self.open_region {
+        let order = match self.open_regions.last_mut() {
             Some(region) => {
                 self.repaint_regions[region.index]
                     .operations
@@ -135,7 +152,7 @@ impl Scene {
     pub fn pop_layer(&mut self) {
         debug_assert!(self.recording.is_none(), "layers cannot be recorded");
         self.layer_stack.pop();
-        match &self.open_region {
+        match self.open_regions.last() {
             Some(region) => self.repaint_regions[region.index]
                 .operations
                 .push(RegionOperation::EndLayer),
@@ -148,7 +165,7 @@ impl Scene {
     /// drag images) sort above the main scene — and a deferred backdrop's order can't fall inside
     /// a content-filter (`filter`) order range left behind by the main scene.
     pub fn raise_order_floor(&mut self) {
-        debug_assert!(self.open_region.is_none());
+        debug_assert!(self.open_regions.is_empty());
         let floor = self.primitive_bounds.max_order() + 1;
         self.primitive_bounds.set_order_floor(floor);
     }
@@ -180,7 +197,7 @@ impl Scene {
         }
 
         // A repaint region stacks its primitives in its own orders.
-        let bounds = match &mut self.open_region {
+        let bounds = match self.open_regions.last_mut() {
             Some(region) => &mut region.bounds,
             None => &mut self.primitive_bounds,
         };
@@ -279,7 +296,7 @@ impl Scene {
                 (kind, index)
             }
         };
-        match &self.open_region {
+        match self.open_regions.last() {
             Some(region) => {
                 let region = region.index;
                 let primitive = self.primitive_at(kind, index);
@@ -301,95 +318,168 @@ impl Scene {
                 }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::Repaint(index) => {
-                    let region = &prev_scene.repaint_regions[*index];
-                    // A recording keeps paint output, not regions: the region's
-                    // current primitives are recorded as they are.
-                    let recording = self.recording.is_some();
-                    if !recording {
-                        self.begin_repaint_region(region.id);
-                    }
-                    for operation in &region.operations {
-                        match operation {
-                            RegionOperation::Primitive(primitive) => {
-                                self.insert_primitive(primitive.clone())
-                            }
-                            RegionOperation::StartLayer(bounds) => self.push_layer(*bounds),
-                            RegionOperation::EndLayer => self.pop_layer(),
-                        }
-                    }
-                    if !recording {
-                        self.end_repaint_region();
-                    }
-                }
+                PaintOperation::Repaint(index) => self.replay_region(*index, prev_scene),
             }
         }
     }
 
-    /// Opens a repaint region stacking above everything painted so far. Until
-    /// [`Self::end_repaint_region`], primitives join the region.
-    pub(crate) fn begin_repaint_region(&mut self, id: RepaintId) {
-        let base = (self.primitive_bounds.max_order() + 1).max(self.primitive_bounds.order_floor());
-        self.begin_repaint_region_at(id, base);
+    fn replay_region(&mut self, index: usize, prev_scene: &Scene) {
+        let region = &prev_scene.repaint_regions[index];
+        // A recording keeps paint output, not regions: the region's current
+        // primitives are recorded as they are.
+        let recording = self.recording.is_some();
+        if !recording {
+            self.begin_repaint_region(region.id);
+        }
+        for operation in &region.operations {
+            match operation {
+                RegionOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
+                RegionOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                RegionOperation::EndLayer => self.pop_layer(),
+                RegionOperation::Region(index) => self.replay_region(*index, prev_scene),
+            }
+        }
+        if !recording {
+            self.end_repaint_region();
+        }
     }
 
-    /// Opens a repaint region stacking from `base`. Repaints paint a region's
-    /// replacement into an empty scene this way, at the region's own base.
+    /// Opens a repaint region stacking above everything painted so far, in
+    /// the region around it if any. Until [`Self::end_repaint_region`],
+    /// primitives join the region.
+    pub(crate) fn begin_repaint_region(&mut self, id: RepaintId) {
+        let bounds = match self.open_regions.last() {
+            Some(region) => &region.bounds,
+            None => &self.primitive_bounds,
+        };
+        let base = (bounds.max_order() + 1).max(bounds.order_floor());
+        self.open_region(id, base, true);
+    }
+
+    /// Opens a region stacking from `base`, to paint a region's replacement
+    /// into an empty scene at the region's own base. The replacement keeps
+    /// the slack the region already has rather than reserving its own.
     pub(crate) fn begin_repaint_region_at(&mut self, id: RepaintId, base: DrawOrder) {
-        assert!(self.open_region.is_none(), "repaint regions cannot nest");
-        let mut bounds = mem::take(&mut self.spare_region_bounds);
+        self.open_region(id, base, false);
+    }
+
+    fn open_region(&mut self, id: RepaintId, base: DrawOrder, slack: bool) {
+        let mut bounds = self.spare_region_bounds.pop().unwrap_or_default();
         bounds.clear();
         bounds.set_order_floor(base);
         let index = self.repaint_regions.len();
-        self.paint_operations.push(PaintOperation::Repaint(index));
+        match self.open_regions.last() {
+            Some(parent) => self.repaint_regions[parent.index]
+                .operations
+                .push(RegionOperation::Region(index)),
+            None => self.paint_operations.push(PaintOperation::Repaint(index)),
+        }
         self.repaint_regions.push(RepaintRegion {
             id,
             orders: base..base,
             painted_end: base,
             operations: Vec::new(),
+            dead: false,
         });
-        self.open_region = Some(OpenRegion {
+        self.region_indices.insert(id, index);
+        let painted = self.slack_lengths();
+        self.open_regions.push(OpenRegion {
             index,
             bounds,
             outer_layers: mem::take(&mut self.layer_stack),
+            slack: slack.then_some(painted),
         });
     }
 
-    /// Closes the open repaint region, reserving its orders: everything
-    /// painted afterwards stacks above them.
+    /// Closes the innermost open region, reserving its orders: everything
+    /// painted afterwards stacks above them. A region painted in place leaves
+    /// slack behind its primitives, so repainting it can usually overwrite its
+    /// own slots instead of moving the rest of the scene.
     pub(crate) fn end_repaint_region(&mut self) {
         let OpenRegion {
             index,
             bounds,
             outer_layers,
-        } = self.open_region.take().expect("no repaint region is open");
+            slack,
+        } = self.open_regions.pop().expect("no repaint region is open");
         debug_assert!(self.layer_stack.is_empty(), "unbalanced layer in region");
         self.layer_stack = outer_layers;
         let region = &mut self.repaint_regions[index];
-        region.painted_end = (bounds.max_order() + 1).max(region.orders.start);
+        // The floor covers the orders reserved by regions nested in it.
+        region.painted_end = (bounds.max_order() + 1)
+            .max(bounds.order_floor())
+            .max(region.orders.start);
         region.orders.end = region
             .painted_end
             .max(region.orders.start.saturating_add(REPAINT_REGION_ORDERS));
-        self.primitive_bounds.set_order_floor(region.orders.end);
-        self.spare_region_bounds = bounds;
+        let end = region.orders.end;
+        match self.open_regions.last_mut() {
+            Some(parent) => parent.bounds.set_order_floor(end),
+            None => self.primitive_bounds.set_order_floor(end),
+        }
+        self.spare_region_bounds.push(bounds);
+        if let Some(painted) = slack {
+            self.reserve_slack(painted, end - 1);
+        }
     }
 
-    /// Whether the region at `index` holds a pulsing quad.
+    /// The lengths of the vectors regions keep slack in.
+    fn slack_lengths(&self) -> [usize; 6] {
+        [
+            self.shadows.len(),
+            self.quads.len(),
+            self.underlines.len(),
+            self.monochrome_sprites.len(),
+            self.subpixel_sprites.len(),
+            self.polychrome_sprites.len(),
+        ]
+    }
+
+    /// Appends invisible primitives at `order` after what a region painted
+    /// since the vectors had lengths `painted`: half as many again plus two
+    /// in each vector the region painted into.
+    fn reserve_slack(&mut self, painted: [usize; 6], order: DrawOrder) {
+        macro_rules! reserve {
+            ($field:ident, $slot:expr) => {{
+                let count = self.$field.len() - painted[$slot];
+                if let Some(template) = self.$field.last() {
+                    if count > 0 {
+                        let tombstone = template.tombstone(order);
+                        self.$field
+                            .extend(std::iter::repeat_n(tombstone, count / 2 + 2));
+                    }
+                }
+            }};
+        }
+        reserve!(shadows, 0);
+        reserve!(quads, 1);
+        reserve!(underlines, 2);
+        reserve!(monochrome_sprites, 3);
+        reserve!(subpixel_sprites, 4);
+        reserve!(polychrome_sprites, 5);
+    }
+
+    /// Whether the region at `index`, or one nested in it, holds a pulsing
+    /// quad.
     pub(crate) fn region_pulses(&self, index: usize) -> bool {
         self.repaint_regions[index]
             .operations
             .iter()
-            .any(|operation| {
-                matches!(operation, RegionOperation::Primitive(Primitive::Quad(quad)) if quad.pulse.is_active())
+            .any(|operation| match operation {
+                RegionOperation::Primitive(Primitive::Quad(quad)) => quad.pulse.is_active(),
+                RegionOperation::Region(index) => self.region_pulses(*index),
+                _ => false,
             })
     }
 
     /// Replaces the primitives of the finished scene's region at `index` with
-    /// those `repainted` painted for its only region, from the same base
-    /// order, and adds both to `damage`. The rest of the scene stays as it is:
-    /// the region's orders are its own, so its primitives form one run in each
-    /// sorted vector. Returns `false`, changing nothing, when the replacement
-    /// stacks beyond the orders reserved for the region.
+    /// what `repainted` painted for its first region (and the regions nested
+    /// in it), from the same base order, and adds both to `damage`. The
+    /// region's orders are its own, so its primitives form one run in each
+    /// sorted vector: the replacement overwrites the run and its slack, and
+    /// only moves the rest of a vector when it outgrows the run. Returns
+    /// `false`, changing nothing, when the replacement stacks beyond the
+    /// orders reserved for the region.
     pub(crate) fn replace_repaint_region(
         &mut self,
         index: usize,
@@ -397,54 +487,85 @@ impl Scene {
         damage: &mut Damage,
     ) -> bool {
         let orders = self.repaint_regions[index].orders.clone();
-        let replacement = &repainted.repaint_regions[0];
-        debug_assert_eq!(replacement.orders.start, orders.start);
-        if replacement.painted_end > orders.end {
+        debug_assert_eq!(repainted.repaint_regions[0].orders.start, orders.start);
+        if repainted.repaint_regions[0].painted_end > orders.end {
             return false;
         }
-        self.repaint_regions[index].add_damage(damage);
-        replacement.add_damage(damage);
+        self.add_repaint_damage(index, repainted, damage);
 
         // Per storage: where the region's run ended, and how far it grew.
         let mut shifts = [(usize::MAX, 0isize); 11];
-        macro_rules! splice {
-            ($field:ident, $storage:expr, $key:expr) => {{
+        let mut changed = PrimitiveRanges::default();
+        macro_rules! replace {
+            ($field:ident, $storage:expr, $key:expr, $tombstones:expr) => {{
                 let start = self.$field.partition_point(|p| p.order < orders.start);
                 let end = self.$field.partition_point(|p| p.order < orders.end);
                 let mut run = mem::take(&mut repainted.$field);
-                run.sort_by_key($key);
-                shifts[$storage] = (end, run.len() as isize - (end - start) as isize);
-                self.$field.splice(start..end, run.drain(..));
+                let old_len = self.$field.len();
+                if run.len() <= end - start && ($tombstones || run.len() == end - start) {
+                    if run.len() < end - start {
+                        let template = run.last().unwrap_or(&self.$field[start]).clone();
+                        let tombstone = template.tombstone(orders.end - 1);
+                        run.resize(end - start, tombstone);
+                    }
+                    run.sort_by_key($key);
+                    for (slot, primitive) in self.$field[start..end].iter_mut().zip(run.drain(..)) {
+                        *slot = primitive;
+                    }
+                    changed.$field = start..end;
+                } else {
+                    run.sort_by_key($key);
+                    shifts[$storage] = (end, run.len() as isize - (end - start) as isize);
+                    self.$field.splice(start..end, run.drain(..));
+                    changed.$field = start..old_len.max(self.$field.len());
+                }
                 repainted.$field = run;
             }};
         }
-        splice!(shadows, 0, |shadow| shadow.order);
-        splice!(quads, 1, |quad| quad.order);
-        splice!(paths, 2, |path| path.order);
-        splice!(underlines, 3, |underline| underline.order);
-        splice!(monochrome_sprites, 4, |sprite| (
-            sprite.order,
-            sprite.tile.texture_id.index,
-            sprite.tile.tile_id
-        ));
-        splice!(subpixel_sprites, 5, |sprite| (
-            sprite.order,
-            sprite.tile.texture_id.index,
-            sprite.tile.tile_id
-        ));
-        splice!(polychrome_sprites, 6, |sprite| (
-            sprite.order,
-            sprite.tile.texture_id.index,
-            sprite.tile.tile_id
-        ));
-        splice!(surfaces, 7, |surface| surface.order);
-        splice!(meshes, 8, |mesh| mesh.order);
-        splice!(backdrop_filters, 9, |filter| filter.order);
-        splice!(filter_boundaries, 10, |boundary| (
-            boundary.order,
-            !boundary.is_start
-        ));
-        // Operations outside the region index past its runs.
+        replace!(shadows, 0, |shadow| shadow.order, true);
+        replace!(quads, 1, |quad| quad.order, true);
+        replace!(paths, 2, |path| path.order, false);
+        replace!(underlines, 3, |underline| underline.order, true);
+        replace!(
+            monochrome_sprites,
+            4,
+            |sprite| (
+                sprite.order,
+                sprite.tile.texture_id.index,
+                sprite.tile.tile_id
+            ),
+            true
+        );
+        replace!(
+            subpixel_sprites,
+            5,
+            |sprite| (
+                sprite.order,
+                sprite.tile.texture_id.index,
+                sprite.tile.tile_id
+            ),
+            true
+        );
+        replace!(
+            polychrome_sprites,
+            6,
+            |sprite| (
+                sprite.order,
+                sprite.tile.texture_id.index,
+                sprite.tile.tile_id
+            ),
+            true
+        );
+        replace!(surfaces, 7, |surface| surface.order, false);
+        replace!(meshes, 8, |mesh| mesh.order, false);
+        replace!(backdrop_filters, 9, |filter| filter.order, false);
+        replace!(
+            filter_boundaries,
+            10,
+            |boundary| (boundary.order, !boundary.is_start),
+            false
+        );
+        // Operations outside the region index past runs that moved.
         if shifts.iter().any(|(_, growth)| *growth != 0) {
             for operation in &mut self.paint_operations {
                 if let PaintOperation::Primitive { kind, index } = operation {
@@ -455,12 +576,197 @@ impl Scene {
                 }
             }
         }
+        self.replaced_primitives.extend(&changed);
 
-        let replacement = &mut repainted.repaint_regions[0];
+        // The regions nested in the old contents are gone; those nested in
+        // the new ones move in after the existing regions.
+        self.retire_nested_regions(index);
+        let offset = self.repaint_regions.len() - 1;
+        let remap = |operations: &mut Vec<RegionOperation>| {
+            for operation in operations {
+                if let RegionOperation::Region(nested) = operation {
+                    *nested += offset;
+                }
+            }
+        };
+        let mut regions = repainted.repaint_regions.drain(..);
+        let mut replacement = regions.next().unwrap();
+        remap(&mut replacement.operations);
+        for (position, mut nested) in regions.enumerate() {
+            remap(&mut nested.operations);
+            self.region_indices.insert(nested.id, offset + 1 + position);
+            self.repaint_regions.push(nested);
+        }
         let region = &mut self.repaint_regions[index];
         region.painted_end = replacement.painted_end;
-        region.operations = mem::take(&mut replacement.operations);
+        region.operations = replacement.operations;
         true
+    }
+
+    /// Whether `repainted`'s first region stacks within the orders reserved
+    /// for the region at `index`, so [`Self::replace_repaint_region`] can
+    /// take it.
+    pub(crate) fn fits_repaint(&self, index: usize, repainted: &Scene) -> bool {
+        repainted.repaint_regions[0].painted_end <= self.repaint_regions[index].orders.end
+    }
+
+    /// Marks every region nested in the region at `index` dead.
+    fn retire_nested_regions(&mut self, index: usize) {
+        let nested = self.repaint_regions[index]
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                RegionOperation::Region(nested) => Some(*nested),
+                _ => None,
+            })
+            .collect::<SmallVec<[usize; 4]>>();
+        for index in nested {
+            self.retire_nested_regions(index);
+            let region = &mut self.repaint_regions[index];
+            region.dead = true;
+            if self.region_indices.get(&region.id) == Some(&index) {
+                self.region_indices.remove(&region.id);
+            }
+        }
+    }
+
+    /// The ids of the regions nested in the region at `index`, at any depth.
+    pub(crate) fn nested_region_ids(&self, index: usize, ids: &mut Vec<RepaintId>) {
+        for operation in &self.repaint_regions[index].operations {
+            if let RegionOperation::Region(nested) = operation {
+                ids.push(self.repaint_regions[*nested].id);
+                self.nested_region_ids(*nested, ids);
+            }
+        }
+    }
+
+    /// Adds to `damage` where `repainted`'s first region paints differently
+    /// from the region at `index`: the primitives between their common prefix
+    /// and suffix, as [`Self::damage_since`] does for whole scenes, so a
+    /// repaint that changes one primitive damages only that one.
+    fn add_repaint_damage(&self, index: usize, repainted: &Scene, damage: &mut Damage) {
+        let mut old = Vec::new();
+        self.region_primitives(index, &mut old);
+        let mut new = Vec::new();
+        repainted.region_primitives(0, &mut new);
+        let common = old.len().min(new.len());
+        let prefix = (0..common)
+            .find(|&ix| !old[ix].paints_same_as(new[ix]))
+            .unwrap_or(common);
+        let suffix = (0..common - prefix)
+            .find(|&ix| !old[old.len() - 1 - ix].paints_same_as(new[new.len() - 1 - ix]))
+            .unwrap_or(common - prefix);
+        for primitive in old[prefix..old.len() - suffix]
+            .iter()
+            .chain(&new[prefix..new.len() - suffix])
+        {
+            damage.add(primitive.visible_bounds());
+        }
+    }
+
+    /// The primitives of the region at `index` and those nested in it, in
+    /// paint order.
+    fn region_primitives<'a>(&'a self, index: usize, primitives: &mut Vec<&'a Primitive>) {
+        for operation in &self.repaint_regions[index].operations {
+            match operation {
+                RegionOperation::Primitive(primitive) => primitives.push(primitive),
+                RegionOperation::Region(nested) => self.region_primitives(*nested, primitives),
+                RegionOperation::StartLayer(_) | RegionOperation::EndLayer => {}
+            }
+        }
+    }
+
+    fn add_region_damage(&self, index: usize, damage: &mut Damage) {
+        for operation in &self.repaint_regions[index].operations {
+            match operation {
+                RegionOperation::Primitive(primitive) => damage.add(primitive.visible_bounds()),
+                RegionOperation::Region(nested) => self.add_region_damage(*nested, damage),
+                RegionOperation::StartLayer(_) | RegionOperation::EndLayer => {}
+            }
+        }
+    }
+
+    fn region_paints_same(&self, index: usize, other: &Scene, other_index: usize) -> bool {
+        let (region, other_region) = (
+            &self.repaint_regions[index],
+            &other.repaint_regions[other_index],
+        );
+        region.orders == other_region.orders
+            && region.operations.len() == other_region.operations.len()
+            && region
+                .operations
+                .iter()
+                .zip(&other_region.operations)
+                .all(|pair| match pair {
+                    (RegionOperation::Primitive(a), RegionOperation::Primitive(b)) => {
+                        a.paints_same_as(b)
+                    }
+                    (RegionOperation::StartLayer(a), RegionOperation::StartLayer(b)) => a == b,
+                    (RegionOperation::EndLayer, RegionOperation::EndLayer) => true,
+                    (RegionOperation::Region(a), RegionOperation::Region(b)) => {
+                        self.region_paints_same(*a, other, *b)
+                    }
+                    _ => false,
+                })
+    }
+
+    /// The paint of the operations in `range`, in paint order, with orders
+    /// zeroed: what a redraw must reproduce, whatever orders and slack it
+    /// ends up with. The regions in `layers` stand in for their contents by
+    /// id, and those in `animated` anonymously, since their ids change each
+    /// time they're painted.
+    pub(crate) fn flatten(
+        &self,
+        range: Range<usize>,
+        layers: &FxHashSet<RepaintId>,
+        animated: &FxHashSet<RepaintId>,
+    ) -> Vec<FlatPaint> {
+        let mut paints = Vec::new();
+        for operation in &self.paint_operations[range] {
+            match operation {
+                PaintOperation::Primitive { kind, index } => {
+                    paints.push(FlatPaint::Primitive(flat_primitive(
+                        self.primitive_at(*kind, *index),
+                    )));
+                }
+                PaintOperation::StartLayer(bounds) => paints.push(FlatPaint::StartLayer(*bounds)),
+                PaintOperation::EndLayer => paints.push(FlatPaint::EndLayer),
+                PaintOperation::Repaint(index) => {
+                    self.flatten_region(*index, layers, animated, &mut paints)
+                }
+            }
+        }
+        paints
+    }
+
+    fn flatten_region(
+        &self,
+        index: usize,
+        layers: &FxHashSet<RepaintId>,
+        animated: &FxHashSet<RepaintId>,
+        paints: &mut Vec<FlatPaint>,
+    ) {
+        let region = &self.repaint_regions[index];
+        if layers.contains(&region.id) {
+            paints.push(FlatPaint::Region(Some(region.id)));
+            return;
+        }
+        if animated.contains(&region.id) {
+            paints.push(FlatPaint::Region(None));
+            return;
+        }
+        for operation in &region.operations {
+            match operation {
+                RegionOperation::Primitive(primitive) => {
+                    paints.push(FlatPaint::Primitive(flat_primitive(primitive.clone())));
+                }
+                RegionOperation::StartLayer(bounds) => paints.push(FlatPaint::StartLayer(*bounds)),
+                RegionOperation::EndLayer => paints.push(FlatPaint::EndLayer),
+                RegionOperation::Region(nested) => {
+                    self.flatten_region(*nested, layers, animated, paints)
+                }
+            }
+        }
     }
 
     /// Adds to `damage` everywhere this scene may paint differently from
@@ -526,14 +832,14 @@ impl Scene {
             (PaintOperation::Repaint(index), PaintOperation::Repaint(previous_index)) => {
                 // Regions own their orders, so one in the same orders matches
                 // whichever closure painted it.
-                let region = &self.repaint_regions[*index];
-                let previous_region = &previous.repaint_regions[*previous_index];
-                if region.orders != previous_region.orders {
+                if self.repaint_regions[*index].orders
+                    != previous.repaint_regions[*previous_index].orders
+                {
                     return false;
                 }
-                if !region.paints_same_as(previous_region) {
-                    region.add_damage(damage);
-                    previous_region.add_damage(damage);
+                if !self.region_paints_same(*index, previous, *previous_index) {
+                    self.add_region_damage(*index, damage);
+                    previous.add_region_damage(*previous_index, damage);
                 }
                 true
             }
@@ -579,7 +885,7 @@ impl Scene {
             PaintOperation::Primitive { kind, index } => {
                 damage.add(self.visible_bounds(*kind, *index));
             }
-            PaintOperation::Repaint(index) => self.repaint_regions[*index].add_damage(damage),
+            PaintOperation::Repaint(index) => self.add_region_damage(*index, damage),
             PaintOperation::StartLayer(_) | PaintOperation::EndLayer => {}
         }
     }
@@ -867,38 +1173,16 @@ pub(crate) struct RepaintRegion {
     /// One past the highest order the region's primitives use.
     painted_end: DrawOrder,
     operations: Vec<RegionOperation>,
-}
-
-impl RepaintRegion {
-    fn add_damage(&self, damage: &mut Damage) {
-        for operation in &self.operations {
-            if let RegionOperation::Primitive(primitive) = operation {
-                damage.add(primitive.visible_bounds());
-            }
-        }
-    }
-
-    fn paints_same_as(&self, other: &Self) -> bool {
-        self.operations.len() == other.operations.len()
-            && self
-                .operations
-                .iter()
-                .zip(&other.operations)
-                .all(|pair| match pair {
-                    (RegionOperation::Primitive(a), RegionOperation::Primitive(b)) => {
-                        a.paints_same_as(b)
-                    }
-                    (RegionOperation::StartLayer(a), RegionOperation::StartLayer(b)) => a == b,
-                    (RegionOperation::EndLayer, RegionOperation::EndLayer) => true,
-                    _ => false,
-                })
-    }
+    /// Replaced along with the region around it.
+    pub(crate) dead: bool,
 }
 
 enum RegionOperation {
     Primitive(Primitive),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    /// A region nested in this one.
+    Region(usize),
 }
 
 struct OpenRegion {
@@ -907,7 +1191,157 @@ struct OpenRegion {
     bounds: BoundsTree<ScaledPixels>,
     /// The layers open around the region, which its primitives don't join.
     outer_layers: Vec<DrawOrder>,
+    /// To reserve slack when it closes: the slack vectors' lengths when it
+    /// opened.
+    slack: Option<[usize; 6]>,
 }
+
+/// A paint in paint order, as [`Scene::flatten`] lists them.
+#[derive(Debug)]
+pub(crate) enum FlatPaint {
+    Primitive(Primitive),
+    StartLayer(Bounds<ScaledPixels>),
+    EndLayer,
+    /// A region whose contents aren't compared: a layer by id, or a retained
+    /// paint.
+    Region(Option<RepaintId>),
+}
+
+impl PartialEq for FlatPaint {
+    /// Surfaces always differ (see [`Primitive::paints_same_as`]), so they
+    /// compare by geometry here.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                FlatPaint::Primitive(Primitive::Surface(a)),
+                FlatPaint::Primitive(Primitive::Surface(b)),
+            ) => a.bounds == b.bounds && a.content_mask == b.content_mask,
+            (FlatPaint::Primitive(a), FlatPaint::Primitive(b)) => a.paints_same_as(b),
+            (FlatPaint::StartLayer(a), FlatPaint::StartLayer(b)) => a == b,
+            (FlatPaint::EndLayer, FlatPaint::EndLayer) => true,
+            (FlatPaint::Region(a), FlatPaint::Region(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// A primitive as compared across redraws: its order is the redraw's own.
+fn flat_primitive(mut primitive: Primitive) -> Primitive {
+    match &mut primitive {
+        Primitive::Shadow(shadow) => shadow.order = 0,
+        Primitive::Quad(quad) => quad.order = 0,
+        Primitive::Path(path) => {
+            path.order = 0;
+            path.id = PathId(0);
+        }
+        Primitive::Underline(underline) => underline.order = 0,
+        Primitive::MonochromeSprite(sprite) => sprite.order = 0,
+        Primitive::SubpixelSprite(sprite) => sprite.order = 0,
+        Primitive::PolychromeSprite(sprite) => sprite.order = 0,
+        Primitive::Surface(surface) => surface.order = 0,
+        Primitive::Mesh(mesh) => mesh.order = 0,
+        Primitive::BackdropFilter(filter) => filter.order = 0,
+        Primitive::FilterBoundary(boundary) => boundary.order = 0,
+    }
+    primitive
+}
+
+/// For each typed primitive vector of a [`Scene`], a range of indices.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[expect(missing_docs)]
+pub struct PrimitiveRanges {
+    pub shadows: Range<usize>,
+    pub quads: Range<usize>,
+    pub paths: Range<usize>,
+    pub underlines: Range<usize>,
+    pub monochrome_sprites: Range<usize>,
+    pub subpixel_sprites: Range<usize>,
+    pub polychrome_sprites: Range<usize>,
+    pub surfaces: Range<usize>,
+    pub meshes: Range<usize>,
+    pub backdrop_filters: Range<usize>,
+    pub filter_boundaries: Range<usize>,
+}
+
+impl PrimitiveRanges {
+    /// Widens each range to cover `other`'s too.
+    pub(crate) fn extend(&mut self, other: &Self) {
+        fn cover(range: &mut Range<usize>, other: &Range<usize>) {
+            if other.start >= other.end {
+            } else if range.start >= range.end {
+                *range = other.clone();
+            } else {
+                *range = range.start.min(other.start)..range.end.max(other.end);
+            }
+        }
+        cover(&mut self.shadows, &other.shadows);
+        cover(&mut self.quads, &other.quads);
+        cover(&mut self.paths, &other.paths);
+        cover(&mut self.underlines, &other.underlines);
+        cover(&mut self.monochrome_sprites, &other.monochrome_sprites);
+        cover(&mut self.subpixel_sprites, &other.subpixel_sprites);
+        cover(&mut self.polychrome_sprites, &other.polychrome_sprites);
+        cover(&mut self.surfaces, &other.surfaces);
+        cover(&mut self.meshes, &other.meshes);
+        cover(&mut self.backdrop_filters, &other.backdrop_filters);
+        cover(&mut self.filter_boundaries, &other.filter_boundaries);
+    }
+}
+
+/// A primitive that paints nothing, holding a slot in a region's run.
+trait Tombstone: Clone {
+    fn tombstone(&self, order: DrawOrder) -> Self;
+}
+
+macro_rules! tombstone {
+    ($type:ty $(, $field:ident = $value:expr)*) => {
+        impl Tombstone for $type {
+            fn tombstone(&self, order: DrawOrder) -> Self {
+                Self {
+                    order,
+                    bounds: Bounds::default(),
+                    content_mask: ContentMask::default(),
+                    $($field: $value,)*
+                    ..self.clone()
+                }
+            }
+        }
+    };
+}
+tombstone!(
+    Shadow,
+    blur_radius = ScaledPixels(0.),
+    element_bounds = Bounds::default()
+);
+tombstone!(Quad, pulse = QuadPulse::default());
+tombstone!(Underline);
+tombstone!(
+    MonochromeSprite,
+    transformation = TransformationMatrix::unit()
+);
+tombstone!(
+    SubpixelSprite,
+    transformation = TransformationMatrix::unit()
+);
+tombstone!(PolychromeSprite);
+
+/// Kinds without slack only ever replace their run with as many primitives.
+macro_rules! no_tombstone {
+    ($($type:ty),*) => {$(
+        impl Tombstone for $type {
+            fn tombstone(&self, _: DrawOrder) -> Self {
+                unreachable!("{} keeps no slack", stringify!($type))
+            }
+        }
+    )*};
+}
+no_tombstone!(
+    Path<ScaledPixels>,
+    PaintSurface,
+    PaintMesh,
+    BackdropFilter,
+    FilterBoundary
+);
 
 /// A paint captured by [`crate::Window::record_paint`].
 #[derive(Clone)]
@@ -1217,7 +1651,7 @@ fn sort_primitives<T, K: Ord>(
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[expect(missing_docs)]
 pub enum Primitive {
     Shadow(Shadow),
@@ -2669,6 +3103,15 @@ mod tests {
         quad.background.solid.l
     }
 
+    /// The lightness of each quad that paints, skipping a region's slack.
+    fn painted(quads: &[Quad]) -> Vec<f32> {
+        quads
+            .iter()
+            .filter(|quad| !quad.bounds.is_empty())
+            .map(lightness)
+            .collect()
+    }
+
     #[test]
     fn a_repainted_region_keeps_the_scene_around_it_in_paint_order() {
         let mut scene = Scene::default();
@@ -2680,20 +3123,32 @@ mod tests {
         scene.finish();
         let base = scene.repaint_regions[0].orders.start;
 
-        // Three quads where one was: the quad painted after the region now
-        // sits further along its vector, and its operation must follow it.
+        // Three quads where one was fill the region's slack in place: the
+        // quad painted after it stays where it is.
+        let quads = scene.quads.len();
+        let after = scene.quads.len() - 1;
         let stacked = [0.3, 0.4, 0.5].map(|l| colored(full_bounds(), l));
         let mut damage = Damage::default();
         assert!(scene.replace_repaint_region(0, &mut repainted(base, &stacked), &mut damage));
+        assert_eq!(painted(&scene.quads), vec![0.1, 0.3, 0.4, 0.5, 0.9]);
+        assert_eq!(scene.quads.len(), quads);
+        assert_eq!(lightness(&scene.quads[after]), 0.9);
+        assert_eq!(scene.replaced_primitives.quads, 1..after);
+
+        // Outgrowing the slack moves what follows, and its operation too.
+        let five = [0.3, 0.4, 0.5, 0.6, 0.7].map(|l| colored(full_bounds(), l));
+        assert!(scene.replace_repaint_region(0, &mut repainted(base, &five), &mut damage));
         assert_eq!(
-            scene.quads.iter().map(lightness).collect::<Vec<_>>(),
-            vec![0.1, 0.3, 0.4, 0.5, 0.9]
+            painted(&scene.quads),
+            vec![0.1, 0.3, 0.4, 0.5, 0.6, 0.7, 0.9]
         );
+        let stacked = [0.3, 0.4, 0.5].map(|l| colored(full_bounds(), l));
+        assert!(scene.replace_repaint_region(0, &mut repainted(base, &stacked), &mut damage));
         assert!(
             scene
                 .quads
                 .windows(2)
-                .all(|pair| pair[0].order < pair[1].order)
+                .all(|pair| pair[0].order <= pair[1].order)
         );
         assert_eq!(damage.regions().len(), 1);
 
@@ -2702,10 +3157,7 @@ mod tests {
         let mut replay = Scene::default();
         replay.replay(0..scene.len(), &scene);
         replay.finish();
-        assert_eq!(
-            replay.quads.iter().map(lightness).collect::<Vec<_>>(),
-            vec![0.1, 0.3, 0.4, 0.5, 0.9]
-        );
+        assert_eq!(painted(&replay.quads), vec![0.1, 0.3, 0.4, 0.5, 0.9]);
 
         // Shrinking back moves the later quad's operation back too.
         let single = [colored(full_bounds(), 0.6)];
@@ -2713,10 +3165,7 @@ mod tests {
         let mut replay = Scene::default();
         replay.replay(0..scene.len(), &scene);
         replay.finish();
-        assert_eq!(
-            replay.quads.iter().map(lightness).collect::<Vec<_>>(),
-            vec![0.1, 0.6, 0.9]
-        );
+        assert_eq!(painted(&replay.quads), vec![0.1, 0.6, 0.9]);
     }
 
     #[test]
@@ -2731,7 +3180,7 @@ mod tests {
         let deep = vec![quad(); REPAINT_REGION_ORDERS as usize + 1];
         let mut damage = Damage::default();
         assert!(!scene.replace_repaint_region(0, &mut repainted(base, &deep), &mut damage));
-        assert_eq!(scene.quads.len(), 1);
+        assert_eq!(painted(&scene.quads).len(), 1);
         assert!(damage.regions().is_empty());
     }
 

@@ -4,12 +4,10 @@
 
 use std::{mem, rc::Rc};
 
-use collections::FxHashSet;
-
 use crate::{
-    App, AppContext as _, Bounds, ColorExt, ContentMask, EntityId, MonochromeSprite, Pixels,
-    QuadPulse, ScaledPixels, SubpixelSprite, TextColorMap, TransformationMatrix, Window,
-    scene::{Damage, RecordedGlyph, RecordedPaint, RepaintId},
+    App, AppContext as _, ColorExt, ContentMask, EntityId, MonochromeSprite, Pixels, QuadPulse,
+    ScaledPixels, SubpixelSprite, TextColorMap, TransformationMatrix, Window,
+    scene::{Damage, PrimitiveRanges, RecordedGlyph, RecordedPaint, RepaintId},
 };
 
 use super::{DrawPhase, ScreenTransform, glyph_color_spans};
@@ -30,7 +28,7 @@ pub(crate) struct RetainedPaint {
     animating: bool,
     /// Whether it painted inline during the draw in progress, so that draw
     /// doesn't repaint it a second time.
-    painted_this_draw: bool,
+    pub(super) painted_this_draw: bool,
 }
 
 /// The paint state a retained closure was first called in, restored for
@@ -71,8 +69,9 @@ impl Window {
     ///   map, rem size) and splices the result into the rendered scene in
     ///   place. Hitboxes, listeners, input handlers, tab stops, element state,
     ///   cursor styles and deferred draws are the previous frame's, untouched;
-    ///   the cost is that of the closures, plus moving the scene's later
-    ///   primitives when a region's primitive count changes.
+    ///   the cost is that of the closures: a region keeps slack in the
+    ///   scene's vectors, so a repaint overwrites its own run, and only one
+    ///   that outgrows its slack moves the rest of a vector.
     /// - [`Scene::damage`](crate::Scene::damage) on a repaint frame lists the
     ///   repainted regions' old and new bounds, widened through any blur that
     ///   samples them. Full draws compare the new scene with the old one.
@@ -93,7 +92,8 @@ impl Window {
     /// registers is dropped. Derive the animated value inside the closure from
     /// the time or shared state, and return whether to paint again. Respect
     /// [`App::reduce_motion`] by returning `false`. Inside
-    /// [`Self::record_paint`] the closure paints once into the recording.
+    /// [`Self::record_paint`], or inside another retained closure, the
+    /// closure paints once where it is called.
     ///
     /// Anything that changes layout must still go through
     /// [`Context::notify`](crate::Context::notify) or
@@ -107,7 +107,7 @@ impl Window {
         cx: &mut App,
     ) {
         self.invalidator.debug_assert_paint();
-        if self.next_frame.scene.recording.is_some() {
+        if self.next_frame.scene.recording.is_some() || self.painting_retained {
             paint(self, cx);
             return;
         }
@@ -241,7 +241,8 @@ impl Window {
         self.repaint_frame_overlay(&mut damage);
         self.invalidator.set_phase(DrawPhase::None);
         self.rendered_frame.scene.generation += 1;
-        self.rendered_frame.scene.damage = self.settle_damage(Some(damage));
+        let changed = mem::take(&mut self.rendered_frame.scene.replaced_primitives);
+        self.settle_damage(Some(damage), Some(changed));
         self.needs_present.set(true);
         for view in unrepaintable {
             cx.notify(view);
@@ -249,6 +250,9 @@ impl Window {
         #[cfg(feature = "frame-rate")]
         self.debug_frame_overlay
             .record_draw(repaint_start.elapsed());
+        if self.verify_frames {
+            self.verify_partial_frame("repaint", &[], &Default::default(), cx);
+        }
     }
 
     /// Repaints the rendered scene's animating regions, except those the draw
@@ -263,15 +267,18 @@ impl Window {
     ) -> Vec<EntityId> {
         let mut unrepaintable = Vec::new();
         let mut pulses_changed = false;
-        for index in 0..self.rendered_frame.scene.repaint_regions.len() {
-            let region = &self.rendered_frame.scene.repaint_regions[index];
-            let (id, base) = (region.id, region.orders.start);
-            let Some(retained) = self.retained_paints.get_mut(&id) else {
-                continue;
-            };
-            if !retained.animating || retained.painted_this_draw {
-                continue;
-            }
+        let mut due = self
+            .retained_paints
+            .iter()
+            .filter(|(_, retained)| retained.animating && !retained.painted_this_draw)
+            .filter_map(|(id, _)| Some((*self.rendered_frame.scene.region_indices.get(id)?, *id)))
+            .collect::<Vec<_>>();
+        // In paint order, which region indices follow within a draw.
+        due.sort_unstable_by_key(|(index, _)| *index);
+        for (index, id) in due {
+            let base = self.rendered_frame.scene.repaint_regions[index]
+                .orders
+                .start;
             let mut retained = self.retained_paints.remove(&id).unwrap();
             self.next_frame.scene.begin_repaint_region_at(id, base);
             let RetainedPaint { paint, context, .. } = &mut retained;
@@ -302,14 +309,28 @@ impl Window {
         unrepaintable
     }
 
-    /// Completes the damage of a new rendered scene: widened through its
-    /// filters and, if the scene before it was never presented, joined with
-    /// that scene's, so it holds against the last scene presented. Returns
-    /// the regions to report.
+    /// Completes the damage and changed primitive ranges of a new rendered
+    /// scene: damage widened through its filters and, if the scene before it
+    /// was never presented, both joined with that scene's, so they hold
+    /// against the last scene presented. `changed` is `None` for a scene
+    /// built afresh.
     pub(crate) fn settle_damage(
         &mut self,
         damage: Option<Damage>,
-    ) -> Option<Vec<Bounds<ScaledPixels>>> {
+        changed: Option<PrimitiveRanges>,
+    ) {
+        let unpresented_changes = self.changed_since_present.take();
+        let changed = match (changed, unpresented_changes) {
+            (Some(changed), _) if self.rendered_scene_presented => Some(changed),
+            (Some(mut changed), Some(unpresented)) => {
+                changed.extend(&unpresented);
+                Some(changed)
+            }
+            _ => None,
+        };
+        self.rendered_frame.scene.changed_primitives = changed.clone();
+        self.changed_since_present = changed;
+
         let unpresented = self.damage_since_present.take();
         let mut damage = match (damage, unpresented) {
             (Some(damage), _) if self.rendered_scene_presented => Some(damage),
@@ -322,28 +343,18 @@ impl Window {
         if let Some(damage) = &mut damage {
             self.rendered_frame.scene.add_filter_damage(damage);
         }
-        let regions = damage.as_ref().map(Damage::regions);
+        self.rendered_frame.scene.damage = damage.as_ref().map(Damage::regions);
         self.damage_since_present = damage;
         self.rendered_scene_presented = false;
-        regions
     }
 
     /// After a draw: forgets closures whose regions left the scene, and lets
     /// those painted inline repaint from the next frame on.
     pub(crate) fn retain_live_paints(&mut self) {
-        if self.retained_paints.is_empty() {
-            return;
-        }
-        let live = self
-            .rendered_frame
-            .scene
-            .repaint_regions
-            .iter()
-            .map(|region| region.id)
-            .collect::<FxHashSet<_>>();
+        let live = &self.rendered_frame.scene.region_indices;
         self.retained_paints.retain(|id, paint| {
             paint.painted_this_draw = false;
-            live.contains(id)
+            live.contains_key(id)
         });
     }
 
@@ -353,6 +364,7 @@ impl Window {
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
         debug_assert!(self.content_mask_stack.is_empty());
+        self.painting_retained = true;
         self.content_mask_stack.push(context.content_mask);
         self.rem_size_override_stack.push(context.rem_size);
         self.rendered_entity_stack.push(context.view);
@@ -368,19 +380,16 @@ impl Window {
         self.rendered_entity_stack.pop();
         self.rem_size_override_stack.pop();
         self.content_mask_stack.pop();
+        self.painting_retained = false;
         result
     }
 
     /// Repaints the frame-rate overlay's region, so its readout stays live on
     /// repaint frames.
     #[cfg(feature = "frame-rate")]
-    fn repaint_frame_overlay(&mut self, damage: &mut Damage) {
+    pub(super) fn repaint_frame_overlay(&mut self, damage: &mut Damage) {
         let scene = &self.rendered_frame.scene;
-        let Some(index) = scene
-            .repaint_regions
-            .iter()
-            .rposition(|region| region.id == RepaintId::FRAME_OVERLAY)
-        else {
+        let Some(&index) = scene.region_indices.get(&RepaintId::FRAME_OVERLAY) else {
             return;
         };
         let base = scene.repaint_regions[index].orders.start;
@@ -1031,13 +1040,19 @@ mod tests {
             window
                 .update(cx, |_, window, _| {
                     let scene = &window.rendered_frame.scene;
+                    // Regions keep invisible slack behind what they paint.
                     (
                         scene
                             .monochrome_sprites
                             .iter()
+                            .filter(|sprite| !sprite.bounds.is_empty())
                             .map(|sprite| sprite.color.a)
                             .collect::<Vec<_>>(),
-                        scene.quads.len(),
+                        scene
+                            .quads
+                            .iter()
+                            .filter(|quad| !quad.bounds.is_empty())
+                            .count(),
                     )
                 })
                 .unwrap()
