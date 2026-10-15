@@ -1,6 +1,8 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+#[cfg(not(feature = "wgpu"))]
+mod damage;
 mod destination_list;
 #[cfg(not(feature = "wgpu"))]
 mod device_recovery;
