@@ -67,10 +67,13 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod contained;
 mod prompts;
 mod repaint;
 
 pub use a11y::A11ySubtreeBuilder;
+pub(crate) use contained::CachedViewContext;
+use contained::CachedViewEntry;
 pub use repaint::PaintRecording;
 use repaint::RetainedPaint;
 
@@ -997,6 +1000,14 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// The cached views drawn in this frame, so a notified view can render
+    /// inside its nearest one (see `Window::draw_contained`).
+    pub(crate) cached_views: FxHashMap<EntityId, CachedViewEntry>,
+    /// The ranges of the main element tree, from layout through prepaint and
+    /// through paint, which a contained frame reuses around its holes.
+    pub(crate) root_ranges: Option<(Range<PrepaintStateIndex>, Range<PaintIndex>)>,
+    /// The entities read outside every cached view while drawing.
+    pub(crate) root_reads: FxHashSet<EntityId>,
 }
 
 #[derive(Clone, Default)]
@@ -1018,6 +1029,84 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+}
+
+/// `self + (to - from)` in each stream.
+fn shift_index(index: usize, from: usize, to: usize) -> usize {
+    index - from + to
+}
+
+impl PrepaintStateIndex {
+    /// This index moved as far as `from` moved to `to`, in every stream.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            hitboxes_index: shift_index(
+                self.hitboxes_index,
+                from.hitboxes_index,
+                to.hitboxes_index,
+            ),
+            tooltips_index: shift_index(
+                self.tooltips_index,
+                from.tooltips_index,
+                to.tooltips_index,
+            ),
+            deferred_draws_index: shift_index(
+                self.deferred_draws_index,
+                from.deferred_draws_index,
+                to.deferred_draws_index,
+            ),
+            dispatch_tree_index: shift_index(
+                self.dispatch_tree_index,
+                from.dispatch_tree_index,
+                to.dispatch_tree_index,
+            ),
+            accessed_element_states_index: shift_index(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    /// This index moved as far as `from` moved to `to`, in every stream.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            scene_index: shift_index(self.scene_index, from.scene_index, to.scene_index),
+            mouse_listeners_index: shift_index(
+                self.mouse_listeners_index,
+                from.mouse_listeners_index,
+                to.mouse_listeners_index,
+            ),
+            input_handlers_index: shift_index(
+                self.input_handlers_index,
+                from.input_handlers_index,
+                to.input_handlers_index,
+            ),
+            cursor_styles_index: shift_index(
+                self.cursor_styles_index,
+                from.cursor_styles_index,
+                to.cursor_styles_index,
+            ),
+            accessed_element_states_index: shift_index(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            tab_handle_index: shift_index(
+                self.tab_handle_index,
+                from.tab_handle_index,
+                to.tab_handle_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
 }
 
 impl Frame {
@@ -1046,6 +1135,9 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            cached_views: FxHashMap::default(),
+            root_ranges: None,
+            root_reads: FxHashSet::default(),
         }
     }
 
@@ -1062,6 +1154,9 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.cached_views.clear();
+        self.root_ranges = None;
+        self.root_reads.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1182,7 +1277,7 @@ pub struct Window {
     damage_since_present: Option<Damage>,
     /// The composed paint transform of the element being drawn.
     element_transform: ScreenTransform,
-    text_color_map: Option<TextColorMap>,
+    pub(crate) text_color_map: Option<TextColorMap>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -3043,7 +3138,9 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
-        self.invalidate_entities();
+        // Notified views render inside their nearest cached views when they
+        // can; otherwise every notified view dirties its ancestors.
+        let contained = self.take_invalidated_views(cx);
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
@@ -3066,8 +3163,20 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        let drew_contained = contained.is_some();
         if !cx.mode.skip_drawing() {
-            self.draw_roots(cx);
+            let ((), reads) = cx.detect_accessed_entities(|cx| match contained {
+                Some(plan) => self.draw_contained(plan, cx),
+                None => self.draw_roots(cx),
+            });
+            // Even inside another window's draw, this window tracks all it read.
+            cx.entities.extend_accessed(&reads.total);
+            self.next_frame.root_reads = reads.direct;
+            if drew_contained {
+                // The reused tree read what it read before.
+                let previous = self.rendered_frame.root_reads.iter().copied();
+                self.next_frame.root_reads.extend(previous);
+            }
             #[cfg(feature = "frame-rate")]
             {
                 let viewport_size = self.viewport_size;
@@ -3190,6 +3299,13 @@ impl Window {
         }
 
         debug_assert!(self.rendered_entity_stack.is_empty());
+        if drew_contained {
+            // Reused views didn't render, so keep tracking what they read.
+            if let Some(tracked) = cx.tracked_entities.get(&self.handle.window_id()) {
+                let tracked = tracked.clone();
+                cx.entities.extend_accessed(&tracked);
+            }
+        }
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
@@ -3235,12 +3351,20 @@ impl Window {
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
-    fn invalidate_entities(&mut self) {
+    /// Takes the views notified since the last draw. Returns the plan for a
+    /// contained frame if they can render inside cached views; otherwise
+    /// marks them and their ancestors dirty for a full frame.
+    fn take_invalidated_views(&mut self, cx: &App) -> Option<contained::ContainedRedraw> {
         let mut views = self.invalidator.take_views();
-        for entity in views.drain() {
-            self.mark_view_dirty(entity);
+        let contained = self.plan_contained_redraw(&views, cx);
+        if contained.is_none() {
+            for entity in views.iter() {
+                self.mark_view_dirty(*entity);
+            }
         }
+        views.clear();
         self.invalidator.replace_views(views);
+        contained
     }
 
     #[profiling::function]
@@ -3348,6 +3472,7 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        let root_prepaint_start = self.prepaint_index();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
         self.layout_engine
@@ -3355,6 +3480,7 @@ impl Window {
             .unwrap()
             .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        let root_prepaint = root_prepaint_start..self.prepaint_index();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
@@ -3388,7 +3514,9 @@ impl Window {
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
+        let root_paint_start = self.paint_index();
         root_element.paint(self, cx);
+        self.next_frame.root_ranges = Some((root_prepaint, root_paint_start..self.paint_index()));
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
@@ -9006,7 +9134,7 @@ mod tests {
 /// The composed element transform in effect while drawing: a layout-space
 /// point `p` paints at `p * scale + offset`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ScreenTransform {
+pub(crate) struct ScreenTransform {
     scale: f32,
     offset: Point<Pixels>,
 }

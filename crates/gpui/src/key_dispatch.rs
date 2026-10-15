@@ -66,7 +66,7 @@ use std::{
 /// ID of a node within `DispatchTree`. Note that these are **not** stable between frames, and so a
 /// `DispatchNodeId` should only be used with the `DispatchTree` that provided it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub(crate) struct DispatchNodeId(usize);
+pub(crate) struct DispatchNodeId(pub(crate) usize);
 
 pub(crate) struct DispatchTree {
     node_stack: Vec<DispatchNodeId>,
@@ -305,6 +305,53 @@ impl DispatchTree {
             new_range,
             contains_focus,
         }
+    }
+
+    /// Moves the nodes in `old_range` of `source` here, as part of a frame
+    /// reused around re-rendered subtrees: the range need not be a subtree,
+    /// and `remap` gives the id here of each parent outside it. Returns
+    /// whether the moved nodes include `focus`.
+    pub fn reuse_segment(
+        &mut self,
+        old_range: Range<usize>,
+        source: &mut Self,
+        focus: Option<FocusId>,
+        remap: impl Fn(DispatchNodeId) -> DispatchNodeId,
+    ) -> bool {
+        while !self.node_stack.is_empty() {
+            self.pop_node();
+        }
+        let start = self.nodes.len();
+        let mut contains_focus = false;
+        for source_node in &mut source.nodes[old_range.clone()] {
+            let node_id = DispatchNodeId(self.nodes.len());
+            let parent = source_node.parent.map(|parent| {
+                if old_range.contains(&parent.0) {
+                    DispatchNodeId(start + parent.0 - old_range.start)
+                } else {
+                    remap(parent)
+                }
+            });
+            if let Some(focus_id) = source_node.focus_id {
+                self.focusable_node_ids.insert(focus_id, node_id);
+                contains_focus |= Some(focus_id) == focus;
+            }
+            if let Some(view_id) = source_node.view_id {
+                self.view_node_ids.insert(view_id, node_id);
+            }
+            self.nodes.push(DispatchNode {
+                key_listeners: mem::take(&mut source_node.key_listeners),
+                action_listeners: mem::take(&mut source_node.action_listeners),
+                modifiers_changed_listeners: mem::take(
+                    &mut source_node.modifiers_changed_listeners,
+                ),
+                context: source_node.context.clone(),
+                focus_id: source_node.focus_id,
+                view_id: source_node.view_id,
+                parent,
+            });
+        }
+        contains_focus
     }
 
     pub fn truncate(&mut self, index: usize) {

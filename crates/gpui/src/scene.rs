@@ -1110,9 +1110,13 @@ impl BackdropFilter {
 }
 
 impl FilterBoundary {
-    /// The filtered group composites only inside the group's bounds.
+    /// The filtered group's blur spreads past the group's bounds, as far as
+    /// its blur reaches.
     fn visible_bounds(&self) -> Bounds<ScaledPixels> {
-        clip(self.bounds, &self.content_mask)
+        clip(
+            self.bounds.dilate(blur_reach(&self.filters)),
+            &self.content_mask,
+        )
     }
 }
 
@@ -2802,6 +2806,45 @@ mod tests {
                 && region.top() <= reach.top()
                 && region.bottom() >= reach.bottom()),
             "{damage:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_blurred_group_damages_its_blur_ring() {
+        let group = Bounds::new(point(sp(100.), sp(100.)), Size::new(sp(20.), sp(20.)));
+        let window = Bounds::new(point(sp(0.), sp(0.)), Size::new(sp(400.), sp(400.)));
+        let marker = |is_start| FilterBoundary {
+            order: 0,
+            bounds: group,
+            content_mask: ContentMask { bounds: window },
+            corner_radii: Corners::default(),
+            filters: smallvec::smallvec![ScaledFilter::Blur(sp(8.0))],
+            opacity: 1.0,
+            is_start,
+        };
+        let mut blurred = Scene::default();
+        blurred.insert_primitive(marker(true));
+        blurred.insert_primitive(colored(group, 0.5));
+        blurred.insert_primitive(marker(false));
+        blurred.finish();
+        let mut empty = Scene::default();
+        empty.finish();
+
+        let mut damage = Damage::default();
+        empty.damage_since(&blurred, &mut damage);
+        empty.add_filter_damage(&mut damage);
+        // The blur reaches three radii past the group, clipped to its mask.
+        let ring = group.dilate(sp(24.));
+        assert!(
+            damage
+                .regions()
+                .iter()
+                .any(|region| region.left() <= ring.left()
+                    && region.top() <= ring.top()
+                    && region.right() >= ring.right()
+                    && region.bottom() >= ring.bottom()),
+            "{:?}",
+            damage.regions()
         );
     }
 }
