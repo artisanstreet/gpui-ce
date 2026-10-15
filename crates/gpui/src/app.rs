@@ -1786,6 +1786,7 @@ impl App {
                         if window.invalidator.is_dirty()
                             || window.needs_present.get()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || window.repaint_pending()
                         {
                             window.platform_window.schedule_frame();
                         }

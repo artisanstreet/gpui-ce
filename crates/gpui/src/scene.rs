@@ -5,13 +5,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Mesh, MeshStyle,
-    Pixels, Point, Radians, ScaledFilter, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Mesh,
+    MeshStyle, Pixels, Point, Radians, ScaledFilter, ScaledPixels, Size, TextColorMap,
+    bounds_tree::BoundsTree, point,
 };
 use smallvec::SmallVec;
 use std::{
     fmt::Debug,
     iter::Peekable,
+    mem,
     ops::{Add, Range, Sub},
     slice,
     sync::Arc,
@@ -65,10 +67,24 @@ pub struct Scene {
     /// tell "same content, later clock" from "new content".
     pub generation: u64,
     /// Device-pixel regions whose pixels may differ from scene
-    /// `generation - 1`. `None` means anything may have changed and the
+    /// `generation - 1`, and from every earlier scene drawn since the window
+    /// last presented one, so damage also holds against the last scene a
+    /// renderer presented. `None` means anything may have changed and the
     /// renderer must repaint the whole target. Pulsing quads are not listed:
     /// they change on every present, and renderers add their bounds themselves.
+    /// Each region is rounded out to whole device pixels plus one pixel of
+    /// margin, and covers the full reach of what changed: shadow blur, sprite
+    /// transforms, and every backdrop or content filter whose blur samples it.
     pub damage: Option<Vec<Bounds<ScaledPixels>>>,
+    /// The regions [`crate::Window::paint_animated`] painted, which can be
+    /// repainted in place. Each takes one [`PaintOperation::Repaint`].
+    pub(crate) repaint_regions: Vec<RepaintRegion>,
+    open_region: Option<OpenRegion>,
+    /// Kept between regions so opening one doesn't allocate.
+    spare_region_bounds: BoundsTree<ScaledPixels>,
+    /// While [`crate::Window::record_paint`] runs, paints land here instead
+    /// of in the scene.
+    pub(crate) recording: Option<Vec<RecordedPaint>>,
 }
 
 #[expect(missing_docs)]
@@ -89,6 +105,9 @@ impl Scene {
         self.meshes.clear();
         self.backdrop_filters.clear();
         self.filter_boundaries.clear();
+        self.repaint_regions.clear();
+        self.open_region = None;
+        self.recording = None;
     }
 
     pub fn len(&self) -> usize {
@@ -96,15 +115,32 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        let order = self.primitive_bounds.insert(bounds);
+        debug_assert!(self.recording.is_none(), "layers cannot be recorded");
+        let order = match &mut self.open_region {
+            Some(region) => {
+                self.repaint_regions[region.index]
+                    .operations
+                    .push(RegionOperation::StartLayer(bounds));
+                region.bounds.insert(bounds)
+            }
+            None => {
+                self.paint_operations
+                    .push(PaintOperation::StartLayer(bounds));
+                self.primitive_bounds.insert(bounds)
+            }
+        };
         self.layer_stack.push(order);
-        self.paint_operations
-            .push(PaintOperation::StartLayer(bounds));
     }
 
     pub fn pop_layer(&mut self) {
+        debug_assert!(self.recording.is_none(), "layers cannot be recorded");
         self.layer_stack.pop();
-        self.paint_operations.push(PaintOperation::EndLayer);
+        match &self.open_region {
+            Some(region) => self.repaint_regions[region.index]
+                .operations
+                .push(RegionOperation::EndLayer),
+            None => self.paint_operations.push(PaintOperation::EndLayer),
+        }
     }
 
     /// Raise the draw-order floor so every primitive inserted afterwards sorts above everything
@@ -112,12 +148,17 @@ impl Scene {
     /// drag images) sort above the main scene — and a deferred backdrop's order can't fall inside
     /// a content-filter (`filter`) order range left behind by the main scene.
     pub fn raise_order_floor(&mut self) {
+        debug_assert!(self.open_region.is_none());
         let floor = self.primitive_bounds.max_order() + 1;
         self.primitive_bounds.set_order_floor(floor);
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
         let primitive = primitive.into();
+        if let Some(recording) = &mut self.recording {
+            recording.push(RecordedPaint::Primitive(primitive));
+            return;
+        }
         let clipped_bounds = primitive
             .bounds()
             .intersect(&primitive.content_mask().bounds);
@@ -138,18 +179,23 @@ impl Scene {
             return;
         }
 
+        // A repaint region stacks its primitives in its own orders.
+        let bounds = match &mut self.open_region {
+            Some(region) => &mut region.bounds,
+            None => &mut self.primitive_bounds,
+        };
         let order = if is_filter_boundary {
             let order_bounds = if clipped_bounds.is_empty() {
                 *primitive.bounds()
             } else {
                 clipped_bounds
             };
-            self.primitive_bounds.insert_above_all(order_bounds)
+            bounds.insert_above_all(order_bounds)
         } else {
             self.layer_stack
                 .last()
                 .copied()
-                .unwrap_or_else(|| self.primitive_bounds.insert(clipped_bounds))
+                .unwrap_or_else(|| bounds.insert(clipped_bounds))
         };
         let (kind, index) = match primitive {
             Primitive::Shadow(mut shadow) => {
@@ -221,7 +267,7 @@ impl Scene {
                     // inside the group's order range (subsequent non-overlapping content otherwise
                     // reuses a low order). Mirrors the floor raised before deferred draws in
                     // `raise_order_floor`.
-                    self.primitive_bounds.set_order_floor(order + 1);
+                    bounds.set_order_floor(order + 1);
                 }
                 let index = self.filter_boundaries.len();
                 let kind = if boundary.is_start {
@@ -233,8 +279,18 @@ impl Scene {
                 (kind, index)
             }
         };
-        self.paint_operations
-            .push(PaintOperation::Primitive { kind, index });
+        match &self.open_region {
+            Some(region) => {
+                let region = region.index;
+                let primitive = self.primitive_at(kind, index);
+                self.repaint_regions[region]
+                    .operations
+                    .push(RegionOperation::Primitive(primitive));
+            }
+            None => self
+                .paint_operations
+                .push(PaintOperation::Primitive { kind, index }),
+        }
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
@@ -245,6 +301,340 @@ impl Scene {
                 }
                 PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
+                PaintOperation::Repaint(index) => {
+                    let region = &prev_scene.repaint_regions[*index];
+                    // A recording keeps paint output, not regions: the region's
+                    // current primitives are recorded as they are.
+                    let recording = self.recording.is_some();
+                    if !recording {
+                        self.begin_repaint_region(region.id);
+                    }
+                    for operation in &region.operations {
+                        match operation {
+                            RegionOperation::Primitive(primitive) => {
+                                self.insert_primitive(primitive.clone())
+                            }
+                            RegionOperation::StartLayer(bounds) => self.push_layer(*bounds),
+                            RegionOperation::EndLayer => self.pop_layer(),
+                        }
+                    }
+                    if !recording {
+                        self.end_repaint_region();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Opens a repaint region stacking above everything painted so far. Until
+    /// [`Self::end_repaint_region`], primitives join the region.
+    pub(crate) fn begin_repaint_region(&mut self, id: RepaintId) {
+        let base = (self.primitive_bounds.max_order() + 1).max(self.primitive_bounds.order_floor());
+        self.begin_repaint_region_at(id, base);
+    }
+
+    /// Opens a repaint region stacking from `base`. Repaints paint a region's
+    /// replacement into an empty scene this way, at the region's own base.
+    pub(crate) fn begin_repaint_region_at(&mut self, id: RepaintId, base: DrawOrder) {
+        assert!(self.open_region.is_none(), "repaint regions cannot nest");
+        let mut bounds = mem::take(&mut self.spare_region_bounds);
+        bounds.clear();
+        bounds.set_order_floor(base);
+        let index = self.repaint_regions.len();
+        self.paint_operations.push(PaintOperation::Repaint(index));
+        self.repaint_regions.push(RepaintRegion {
+            id,
+            orders: base..base,
+            painted_end: base,
+            operations: Vec::new(),
+        });
+        self.open_region = Some(OpenRegion {
+            index,
+            bounds,
+            outer_layers: mem::take(&mut self.layer_stack),
+        });
+    }
+
+    /// Closes the open repaint region, reserving its orders: everything
+    /// painted afterwards stacks above them.
+    pub(crate) fn end_repaint_region(&mut self) {
+        let OpenRegion {
+            index,
+            bounds,
+            outer_layers,
+        } = self.open_region.take().expect("no repaint region is open");
+        debug_assert!(self.layer_stack.is_empty(), "unbalanced layer in region");
+        self.layer_stack = outer_layers;
+        let region = &mut self.repaint_regions[index];
+        region.painted_end = (bounds.max_order() + 1).max(region.orders.start);
+        region.orders.end = region
+            .painted_end
+            .max(region.orders.start.saturating_add(REPAINT_REGION_ORDERS));
+        self.primitive_bounds.set_order_floor(region.orders.end);
+        self.spare_region_bounds = bounds;
+    }
+
+    /// Whether the region at `index` holds a pulsing quad.
+    pub(crate) fn region_pulses(&self, index: usize) -> bool {
+        self.repaint_regions[index]
+            .operations
+            .iter()
+            .any(|operation| {
+                matches!(operation, RegionOperation::Primitive(Primitive::Quad(quad)) if quad.pulse.is_active())
+            })
+    }
+
+    /// Replaces the primitives of the finished scene's region at `index` with
+    /// those `repainted` painted for its only region, from the same base
+    /// order, and adds both to `damage`. The rest of the scene stays as it is:
+    /// the region's orders are its own, so its primitives form one run in each
+    /// sorted vector. Returns `false`, changing nothing, when the replacement
+    /// stacks beyond the orders reserved for the region.
+    pub(crate) fn replace_repaint_region(
+        &mut self,
+        index: usize,
+        repainted: &mut Scene,
+        damage: &mut Damage,
+    ) -> bool {
+        let orders = self.repaint_regions[index].orders.clone();
+        let replacement = &repainted.repaint_regions[0];
+        debug_assert_eq!(replacement.orders.start, orders.start);
+        if replacement.painted_end > orders.end {
+            return false;
+        }
+        self.repaint_regions[index].add_damage(damage);
+        replacement.add_damage(damage);
+
+        // Per storage: where the region's run ended, and how far it grew.
+        let mut shifts = [(usize::MAX, 0isize); 11];
+        macro_rules! splice {
+            ($field:ident, $storage:expr, $key:expr) => {{
+                let start = self.$field.partition_point(|p| p.order < orders.start);
+                let end = self.$field.partition_point(|p| p.order < orders.end);
+                let mut run = mem::take(&mut repainted.$field);
+                run.sort_by_key($key);
+                shifts[$storage] = (end, run.len() as isize - (end - start) as isize);
+                self.$field.splice(start..end, run.drain(..));
+                repainted.$field = run;
+            }};
+        }
+        splice!(shadows, 0, |shadow| shadow.order);
+        splice!(quads, 1, |quad| quad.order);
+        splice!(paths, 2, |path| path.order);
+        splice!(underlines, 3, |underline| underline.order);
+        splice!(monochrome_sprites, 4, |sprite| (
+            sprite.order,
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id
+        ));
+        splice!(subpixel_sprites, 5, |sprite| (
+            sprite.order,
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id
+        ));
+        splice!(polychrome_sprites, 6, |sprite| (
+            sprite.order,
+            sprite.tile.texture_id.index,
+            sprite.tile.tile_id
+        ));
+        splice!(surfaces, 7, |surface| surface.order);
+        splice!(meshes, 8, |mesh| mesh.order);
+        splice!(backdrop_filters, 9, |filter| filter.order);
+        splice!(filter_boundaries, 10, |boundary| (
+            boundary.order,
+            !boundary.is_start
+        ));
+        // Operations outside the region index past its runs.
+        if shifts.iter().any(|(_, growth)| *growth != 0) {
+            for operation in &mut self.paint_operations {
+                if let PaintOperation::Primitive { kind, index } = operation {
+                    let (end, growth) = shifts[kind.storage_index()];
+                    if *index >= end {
+                        *index = (*index as isize + growth) as usize;
+                    }
+                }
+            }
+        }
+
+        let replacement = &mut repainted.repaint_regions[0];
+        let region = &mut self.repaint_regions[index];
+        region.painted_end = replacement.painted_end;
+        region.operations = mem::take(&mut replacement.operations);
+        true
+    }
+
+    /// Adds to `damage` everywhere this scene may paint differently from
+    /// `previous`, the scene drawn before it.
+    ///
+    /// Operations match while they paint equal primitives at equal orders, so
+    /// a common prefix and suffix of matching operations paints identically
+    /// wherever nothing between them reaches. Every primitive between them
+    /// counts, in both scenes: what disappeared must be repainted too. A
+    /// repaint region in the same orders in both matches as a whole and counts
+    /// its own primitives if they changed.
+    pub(crate) fn damage_since(&self, previous: &Scene, damage: &mut Damage) {
+        let (operations, previous_operations) =
+            (&self.paint_operations, &previous.paint_operations);
+        let common = operations.len().min(previous_operations.len());
+        let mut prefix = 0;
+        while prefix < common && self.operations_match(prefix, previous, prefix, damage) {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while prefix + suffix < common
+            && self.operations_match(
+                operations.len() - 1 - suffix,
+                previous,
+                previous_operations.len() - 1 - suffix,
+                damage,
+            )
+        {
+            suffix += 1;
+        }
+        for operation in &previous_operations[prefix..previous_operations.len() - suffix] {
+            previous.add_operation_damage(operation, damage);
+        }
+        for operation in &operations[prefix..operations.len() - suffix] {
+            self.add_operation_damage(operation, damage);
+        }
+    }
+
+    fn operations_match(
+        &self,
+        index: usize,
+        previous: &Scene,
+        previous_index: usize,
+        damage: &mut Damage,
+    ) -> bool {
+        match (
+            &self.paint_operations[index],
+            &previous.paint_operations[previous_index],
+        ) {
+            (
+                PaintOperation::Primitive { kind, index },
+                PaintOperation::Primitive {
+                    kind: previous_kind,
+                    index: previous_index,
+                },
+            ) => {
+                kind == previous_kind && self.paints_same(*kind, *index, previous, *previous_index)
+            }
+            (PaintOperation::StartLayer(bounds), PaintOperation::StartLayer(previous_bounds)) => {
+                bounds == previous_bounds
+            }
+            (PaintOperation::EndLayer, PaintOperation::EndLayer) => true,
+            (PaintOperation::Repaint(index), PaintOperation::Repaint(previous_index)) => {
+                // Regions own their orders, so one in the same orders matches
+                // whichever closure painted it.
+                let region = &self.repaint_regions[*index];
+                let previous_region = &previous.repaint_regions[*previous_index];
+                if region.orders != previous_region.orders {
+                    return false;
+                }
+                if !region.paints_same_as(previous_region) {
+                    region.add_damage(damage);
+                    previous_region.add_damage(damage);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn paints_same(
+        &self,
+        kind: PrimitiveKind,
+        index: usize,
+        other: &Scene,
+        other_index: usize,
+    ) -> bool {
+        match kind {
+            PrimitiveKind::Shadow => self.shadows[index] == other.shadows[other_index],
+            PrimitiveKind::Quad => self.quads[index] == other.quads[other_index],
+            PrimitiveKind::Path => self.paths[index].paints_same_as(&other.paths[other_index]),
+            PrimitiveKind::Underline => self.underlines[index] == other.underlines[other_index],
+            PrimitiveKind::MonochromeSprite => {
+                self.monochrome_sprites[index] == other.monochrome_sprites[other_index]
+            }
+            PrimitiveKind::SubpixelSprite => {
+                self.subpixel_sprites[index] == other.subpixel_sprites[other_index]
+            }
+            PrimitiveKind::PolychromeSprite => {
+                self.polychrome_sprites[index] == other.polychrome_sprites[other_index]
+            }
+            // A surface's texture changes without the primitive changing.
+            PrimitiveKind::Surface => false,
+            PrimitiveKind::Mesh => self.meshes[index].paints_same_as(&other.meshes[other_index]),
+            PrimitiveKind::BackdropFilter => {
+                self.backdrop_filters[index] == other.backdrop_filters[other_index]
+            }
+            PrimitiveKind::FilterBoundaryStart | PrimitiveKind::FilterBoundaryEnd => {
+                self.filter_boundaries[index] == other.filter_boundaries[other_index]
+            }
+        }
+    }
+
+    fn add_operation_damage(&self, operation: &PaintOperation, damage: &mut Damage) {
+        match operation {
+            PaintOperation::Primitive { kind, index } => {
+                damage.add(self.visible_bounds(*kind, *index));
+            }
+            PaintOperation::Repaint(index) => self.repaint_regions[*index].add_damage(damage),
+            PaintOperation::StartLayer(_) | PaintOperation::EndLayer => {}
+        }
+    }
+
+    fn visible_bounds(&self, kind: PrimitiveKind, index: usize) -> Bounds<ScaledPixels> {
+        match kind {
+            PrimitiveKind::Shadow => self.shadows[index].visible_bounds(),
+            PrimitiveKind::Quad => self.quads[index].visible_bounds(),
+            PrimitiveKind::Path => self.paths[index].visible_bounds(),
+            PrimitiveKind::Underline => self.underlines[index].visible_bounds(),
+            PrimitiveKind::MonochromeSprite => self.monochrome_sprites[index].visible_bounds(),
+            PrimitiveKind::SubpixelSprite => self.subpixel_sprites[index].visible_bounds(),
+            PrimitiveKind::PolychromeSprite => self.polychrome_sprites[index].visible_bounds(),
+            PrimitiveKind::Surface => self.surfaces[index].visible_bounds(),
+            PrimitiveKind::Mesh => self.meshes[index].visible_bounds(),
+            PrimitiveKind::BackdropFilter => self.backdrop_filters[index].visible_bounds(),
+            PrimitiveKind::FilterBoundaryStart | PrimitiveKind::FilterBoundaryEnd => {
+                self.filter_boundaries[index].visible_bounds()
+            }
+        }
+    }
+
+    /// Backdrop filters and content-filter groups blur what lies within their
+    /// reach, so damage anywhere in that reach changes all they paint. Adds
+    /// each such filter's painted bounds to `damage`, until no more apply.
+    pub(crate) fn add_filter_damage(&self, damage: &mut Damage) {
+        let filters = self
+            .backdrop_filters
+            .iter()
+            .map(|filter| (filter.bounds, &filter.filters, filter.visible_bounds()))
+            .chain(
+                self.filter_boundaries
+                    .iter()
+                    .filter(|boundary| boundary.is_start)
+                    .map(|boundary| {
+                        (
+                            boundary.bounds,
+                            &boundary.filters,
+                            boundary.visible_bounds(),
+                        )
+                    }),
+            )
+            .collect::<SmallVec<[_; 8]>>();
+        let mut added = SmallVec::<[bool; 8]>::from_elem(false, filters.len());
+        loop {
+            let mut grew = false;
+            for ((bounds, filters, visible), added) in filters.iter().zip(&mut added) {
+                if !*added && damage.intersects(&bounds.dilate(blur_reach(filters))) {
+                    damage.add(*visible);
+                    *added = true;
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
             }
         }
     }
@@ -438,9 +828,327 @@ pub(crate) enum PrimitiveKind {
 }
 
 pub(crate) enum PaintOperation {
-    Primitive { kind: PrimitiveKind, index: usize },
+    Primitive {
+        kind: PrimitiveKind,
+        index: usize,
+    },
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
+    /// The repaint region at this index of [`Scene::repaint_regions`].
+    Repaint(usize),
+}
+
+/// Identifies a repaint region across frames. The window keys the region's
+/// retained paint by it, and replaying the region keeps it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RepaintId(pub(crate) u64);
+
+impl RepaintId {
+    /// The frame-rate overlay's region, repainted by the window itself.
+    /// Retained paints number theirs from here.
+    pub(crate) const FRAME_OVERLAY: Self = Self(0);
+}
+
+/// Draw orders reserved for each repaint region. A region stacks its
+/// primitives in its own orders, above everything painted before it and below
+/// everything painted after, so a repaint restacks the region without
+/// reordering the rest of the scene, however its primitives move.
+const REPAINT_REGION_ORDERS: DrawOrder = 256;
+
+/// What a [`crate::Window::paint_animated`] closure painted. Its primitives
+/// sit in the typed vectors like any other; its operations live here instead
+/// of in [`Scene::paint_operations`], where the region takes one slot, so a
+/// repaint can change how much it paints without moving the operation indices
+/// that cached views and deferred draws hold into the scene.
+pub(crate) struct RepaintRegion {
+    pub(crate) id: RepaintId,
+    /// The orders reserved for the region. Its primitives use a prefix.
+    pub(crate) orders: Range<DrawOrder>,
+    /// One past the highest order the region's primitives use.
+    painted_end: DrawOrder,
+    operations: Vec<RegionOperation>,
+}
+
+impl RepaintRegion {
+    fn add_damage(&self, damage: &mut Damage) {
+        for operation in &self.operations {
+            if let RegionOperation::Primitive(primitive) = operation {
+                damage.add(primitive.visible_bounds());
+            }
+        }
+    }
+
+    fn paints_same_as(&self, other: &Self) -> bool {
+        self.operations.len() == other.operations.len()
+            && self
+                .operations
+                .iter()
+                .zip(&other.operations)
+                .all(|pair| match pair {
+                    (RegionOperation::Primitive(a), RegionOperation::Primitive(b)) => {
+                        a.paints_same_as(b)
+                    }
+                    (RegionOperation::StartLayer(a), RegionOperation::StartLayer(b)) => a == b,
+                    (RegionOperation::EndLayer, RegionOperation::EndLayer) => true,
+                    _ => false,
+                })
+    }
+}
+
+enum RegionOperation {
+    Primitive(Primitive),
+    StartLayer(Bounds<ScaledPixels>),
+    EndLayer,
+}
+
+struct OpenRegion {
+    index: usize,
+    /// Assigns the region's orders, starting at its base.
+    bounds: BoundsTree<ScaledPixels>,
+    /// The layers open around the region, which its primitives don't join.
+    outer_layers: Vec<DrawOrder>,
+}
+
+/// A paint captured by [`crate::Window::record_paint`].
+#[derive(Clone)]
+pub(crate) enum RecordedPaint {
+    Primitive(Primitive),
+    /// A glyph keeps its color unmapped, so replaying it under a
+    /// [`TextColorMap`] maps it afresh.
+    Glyph(RecordedGlyph),
+}
+
+#[derive(Clone)]
+pub(crate) struct RecordedGlyph {
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) content_mask: ContentMask<ScaledPixels>,
+    pub(crate) color: Hsla,
+    pub(crate) opacity: f32,
+    pub(crate) tile: AtlasTile,
+    pub(crate) subpixel: bool,
+    /// The map in effect when recorded, used when none is at replay.
+    pub(crate) color_map: Option<TextColorMap>,
+}
+
+/// Device-pixel regions that may paint differently, merged into a few
+/// rectangles. Merging only ever grows the regions.
+#[derive(Default)]
+pub(crate) struct Damage {
+    regions: SmallVec<[Bounds<ScaledPixels>; MAX_DAMAGE_REGIONS]>,
+}
+
+/// Beyond this many regions, the closest ones merge. Renderers redraw each
+/// region separately, so a few larger ones beat many slivers.
+const MAX_DAMAGE_REGIONS: usize = 16;
+
+impl Damage {
+    pub(crate) fn add(&mut self, bounds: Bounds<ScaledPixels>) {
+        let covers = |outer: &Bounds<ScaledPixels>, inner: &Bounds<ScaledPixels>| {
+            outer.left() <= inner.left()
+                && outer.top() <= inner.top()
+                && outer.right() >= inner.right()
+                && outer.bottom() >= inner.bottom()
+        };
+        if bounds.is_empty() || self.regions.iter().any(|region| covers(region, &bounds)) {
+            return;
+        }
+        self.regions.retain(|region| !covers(&bounds, region));
+        if self.regions.len() < MAX_DAMAGE_REGIONS {
+            self.regions.push(bounds);
+            return;
+        }
+        let area = |bounds: &Bounds<ScaledPixels>| bounds.size.width.0 * bounds.size.height.0;
+        if let Some(closest) = self.regions.iter_mut().min_by(|a, b| {
+            let growth =
+                |region: &Bounds<ScaledPixels>| area(&region.union(&bounds)) - area(region);
+            growth(a).total_cmp(&growth(b))
+        }) {
+            *closest = closest.union(&bounds);
+        }
+    }
+
+    pub(crate) fn intersects(&self, bounds: &Bounds<ScaledPixels>) -> bool {
+        self.regions.iter().any(|region| region.intersects(bounds))
+    }
+
+    pub(crate) fn merge(&mut self, other: Damage) {
+        for region in other.regions {
+            self.add(region);
+        }
+    }
+
+    /// The regions, rounded out to whole device pixels with a pixel of margin
+    /// for antialiasing.
+    pub(crate) fn regions(&self) -> Vec<Bounds<ScaledPixels>> {
+        self.regions
+            .iter()
+            .map(|region| {
+                Bounds::from_corners(
+                    point(
+                        ScaledPixels(region.left().0.floor() - 1.0),
+                        ScaledPixels(region.top().0.floor() - 1.0),
+                    ),
+                    point(
+                        ScaledPixels(region.right().0.ceil() + 1.0),
+                        ScaledPixels(region.bottom().0.ceil() + 1.0),
+                    ),
+                )
+            })
+            .collect()
+    }
+}
+
+/// How far a filter chain's blur reaches beyond the content it samples: three
+/// standard deviations of each blur, the extent renderers sample.
+fn blur_reach(filters: &[ScaledFilter]) -> ScaledPixels {
+    ScaledPixels(filters.iter().fold(0.0, |reach, filter| match filter {
+        ScaledFilter::Blur(radius) => reach + 3.0 * radius.0,
+    }))
+}
+
+fn clip(bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>) -> Bounds<ScaledPixels> {
+    bounds.intersect(&mask.bounds)
+}
+
+impl Shadow {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        // Outer shadows leave room for the gaussian tail; inset ones paint
+        // inside the element.
+        let reach = self
+            .bounds
+            .dilate(ScaledPixels(3.0 * self.blur_radius.0))
+            .union(&self.element_bounds);
+        clip(reach, &self.content_mask)
+    }
+}
+
+impl Quad {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+}
+
+impl Path<ScaledPixels> {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+
+    /// Like `==`, without the id, which only numbers paths within a scene.
+    fn paints_same_as(&self, other: &Self) -> bool {
+        self.order == other.order
+            && self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.color == other.color
+            && self.vertices == other.vertices
+    }
+}
+
+impl Underline {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        // A wave may swing past its box by up to its thickness.
+        let reach = if self.wavy == PaddedBool32::from(true) {
+            self.bounds.dilate(self.thickness)
+        } else {
+            self.bounds
+        };
+        clip(reach, &self.content_mask)
+    }
+}
+
+impl MonochromeSprite {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(
+            transformed_bounds(self.bounds, &self.transformation),
+            &self.content_mask,
+        )
+    }
+}
+
+impl SubpixelSprite {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(
+            transformed_bounds(self.bounds, &self.transformation),
+            &self.content_mask,
+        )
+    }
+}
+
+impl PolychromeSprite {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+}
+
+impl PaintSurface {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+}
+
+impl PaintMesh {
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+
+    /// Meshes are immutable once shared, so the same mesh paints the same.
+    fn paints_same_as(&self, other: &Self) -> bool {
+        self.order == other.order
+            && self.bounds == other.bounds
+            && self.content_mask == other.content_mask
+            && self.corner_radii == other.corner_radii
+            && self.opacity == other.opacity
+            && Arc::ptr_eq(&self.mesh, &other.mesh)
+            && self.style == other.style
+    }
+}
+
+impl BackdropFilter {
+    /// The filter paints only inside its bounds, whatever its blur samples.
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+}
+
+impl FilterBoundary {
+    /// The filtered group composites only inside the group's bounds.
+    fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        clip(self.bounds, &self.content_mask)
+    }
+}
+
+/// Where a primitive drawn at `bounds` through `transformation` lands.
+fn transformed_bounds(
+    bounds: Bounds<ScaledPixels>,
+    transformation: &TransformationMatrix,
+) -> Bounds<ScaledPixels> {
+    if *transformation == TransformationMatrix::unit() {
+        return bounds;
+    }
+    let [[a, b], [c, d]] = transformation.rotation_scale;
+    let [tx, ty] = transformation.translation;
+    let corners = [
+        bounds.origin,
+        bounds.top_right(),
+        bounds.bottom_left(),
+        bounds.bottom_right(),
+    ]
+    .map(|corner| {
+        (
+            a * corner.x.0 + b * corner.y.0 + tx,
+            c * corner.x.0 + d * corner.y.0 + ty,
+        )
+    });
+    let (mut left, mut top, mut right, mut bottom) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for (x, y) in corners {
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    Bounds::from_corners(
+        point(ScaledPixels(left), ScaledPixels(top)),
+        point(ScaledPixels(right), ScaledPixels(bottom)),
+    )
 }
 
 impl PrimitiveKind {
@@ -523,6 +1231,58 @@ pub enum Primitive {
 
 #[expect(missing_docs)]
 impl Primitive {
+    /// Where the primitive can paint pixels: its bounds, widened by blur,
+    /// shadow and transform reach, and clipped to its content mask.
+    pub(crate) fn visible_bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Primitive::Shadow(shadow) => shadow.visible_bounds(),
+            Primitive::Quad(quad) => quad.visible_bounds(),
+            Primitive::Path(path) => path.visible_bounds(),
+            Primitive::Underline(underline) => underline.visible_bounds(),
+            Primitive::MonochromeSprite(sprite) => sprite.visible_bounds(),
+            Primitive::SubpixelSprite(sprite) => sprite.visible_bounds(),
+            Primitive::PolychromeSprite(sprite) => sprite.visible_bounds(),
+            Primitive::Surface(surface) => surface.visible_bounds(),
+            Primitive::Mesh(mesh) => mesh.visible_bounds(),
+            Primitive::BackdropFilter(filter) => filter.visible_bounds(),
+            Primitive::FilterBoundary(boundary) => boundary.visible_bounds(),
+        }
+    }
+
+    /// Whether drawing `other` instead would paint the same pixels at the
+    /// same order. Surfaces never do: their texture changes underneath.
+    pub(crate) fn paints_same_as(&self, other: &Primitive) -> bool {
+        match (self, other) {
+            (Primitive::Shadow(a), Primitive::Shadow(b)) => a == b,
+            (Primitive::Quad(a), Primitive::Quad(b)) => a == b,
+            (Primitive::Path(a), Primitive::Path(b)) => a.paints_same_as(b),
+            (Primitive::Underline(a), Primitive::Underline(b)) => a == b,
+            (Primitive::MonochromeSprite(a), Primitive::MonochromeSprite(b)) => a == b,
+            (Primitive::SubpixelSprite(a), Primitive::SubpixelSprite(b)) => a == b,
+            (Primitive::PolychromeSprite(a), Primitive::PolychromeSprite(b)) => a == b,
+            (Primitive::Mesh(a), Primitive::Mesh(b)) => a.paints_same_as(b),
+            (Primitive::BackdropFilter(a), Primitive::BackdropFilter(b)) => a == b,
+            (Primitive::FilterBoundary(a), Primitive::FilterBoundary(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn content_mask_mut(&mut self) -> &mut ContentMask<ScaledPixels> {
+        match self {
+            Primitive::Shadow(shadow) => &mut shadow.content_mask,
+            Primitive::Quad(quad) => &mut quad.content_mask,
+            Primitive::Path(path) => &mut path.content_mask,
+            Primitive::Underline(underline) => &mut underline.content_mask,
+            Primitive::MonochromeSprite(sprite) => &mut sprite.content_mask,
+            Primitive::SubpixelSprite(sprite) => &mut sprite.content_mask,
+            Primitive::PolychromeSprite(sprite) => &mut sprite.content_mask,
+            Primitive::Surface(surface) => &mut surface.content_mask,
+            Primitive::Mesh(mesh) => &mut mesh.content_mask,
+            Primitive::BackdropFilter(filter) => &mut filter.content_mask,
+            Primitive::FilterBoundary(boundary) => &mut boundary.content_mask,
+        }
+    }
+
     pub fn bounds(&self) -> &Bounds<ScaledPixels> {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
@@ -898,7 +1658,7 @@ impl PrimitiveBatch {
     }
 }
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Quad {
@@ -951,7 +1711,7 @@ impl From<Quad> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Underline {
@@ -970,7 +1730,7 @@ impl From<Underline> for Primitive {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct Shadow {
@@ -996,7 +1756,7 @@ impl From<Shadow> for Primitive {
 /// A backdrop filter blurs (and may otherwise filter) the content already rendered behind
 /// `bounds`, compositing the result into a rounded rectangle — the frosted-glass effect.
 /// Emitted by [`crate::Window::paint_backdrop_filter`]; produces the CSS `backdrop-filter` effect.
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug, Clone, PartialEq)]
 #[expect(missing_docs)]
 pub struct BackdropFilter {
     pub order: DrawOrder,
@@ -1024,7 +1784,7 @@ impl From<BackdropFilter> for Primitive {
 /// subtree is painted between a matched start/end pair; the renderer redirects that span into
 /// an offscreen target, filters it, and composites it back at `bounds`. Produces the CSS
 /// `filter` effect (e.g. blurring the element and its children as a single group).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[expect(missing_docs)]
 pub struct FilterBoundary {
     pub order: DrawOrder,
@@ -1160,7 +1920,7 @@ impl Default for TransformationMatrix {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct MonochromeSprite {
@@ -1179,7 +1939,7 @@ impl From<MonochromeSprite> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct SubpixelSprite {
@@ -1198,7 +1958,7 @@ impl From<SubpixelSprite> for Primitive {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PolychromeSprite {
@@ -1420,7 +2180,7 @@ impl From<Path<ScaledPixels>> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 #[repr(C)]
 #[expect(missing_docs)]
 pub struct PathVertex<P: Clone + Debug + Default + PartialEq> {
@@ -1879,5 +2639,169 @@ mod tests {
         let mut replay = Scene::default();
         replay.replay(0..scene.len(), &scene);
         assert_eq!(batch_kinds(&mut replay), expected);
+    }
+
+    fn colored(bounds: Bounds<ScaledPixels>, lightness: f32) -> Quad {
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: crate::hsla(0.0, 0.0, lightness, 1.0).into(),
+            ..Default::default()
+        }
+    }
+
+    /// Paints `quads` stacked, as one region, into an empty scene at `base`.
+    fn repainted(base: DrawOrder, quads: &[Quad]) -> Scene {
+        let mut scene = Scene::default();
+        scene.begin_repaint_region_at(RepaintId(1), base);
+        for quad in quads {
+            scene.insert_primitive(*quad);
+        }
+        scene.end_repaint_region();
+        scene
+    }
+
+    fn lightness(quad: &Quad) -> f32 {
+        quad.background.solid.l
+    }
+
+    #[test]
+    fn a_repainted_region_keeps_the_scene_around_it_in_paint_order() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(colored(full_bounds(), 0.1));
+        scene.begin_repaint_region(RepaintId(1));
+        scene.insert_primitive(colored(full_bounds(), 0.2));
+        scene.end_repaint_region();
+        scene.insert_primitive(colored(full_bounds(), 0.9));
+        scene.finish();
+        let base = scene.repaint_regions[0].orders.start;
+
+        // Three quads where one was: the quad painted after the region now
+        // sits further along its vector, and its operation must follow it.
+        let stacked = [0.3, 0.4, 0.5].map(|l| colored(full_bounds(), l));
+        let mut damage = Damage::default();
+        assert!(scene.replace_repaint_region(0, &mut repainted(base, &stacked), &mut damage));
+        assert_eq!(
+            scene.quads.iter().map(lightness).collect::<Vec<_>>(),
+            vec![0.1, 0.3, 0.4, 0.5, 0.9]
+        );
+        assert!(
+            scene
+                .quads
+                .windows(2)
+                .all(|pair| pair[0].order < pair[1].order)
+        );
+        assert_eq!(damage.regions().len(), 1);
+
+        // Replaying the patched scene, as a reused cached view does, paints
+        // the same thing.
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        replay.finish();
+        assert_eq!(
+            replay.quads.iter().map(lightness).collect::<Vec<_>>(),
+            vec![0.1, 0.3, 0.4, 0.5, 0.9]
+        );
+
+        // Shrinking back moves the later quad's operation back too.
+        let single = [colored(full_bounds(), 0.6)];
+        assert!(scene.replace_repaint_region(0, &mut repainted(base, &single), &mut damage));
+        let mut replay = Scene::default();
+        replay.replay(0..scene.len(), &scene);
+        replay.finish();
+        assert_eq!(
+            replay.quads.iter().map(lightness).collect::<Vec<_>>(),
+            vec![0.1, 0.6, 0.9]
+        );
+    }
+
+    #[test]
+    fn a_region_too_deep_for_its_orders_is_left_alone() {
+        let mut scene = Scene::default();
+        scene.begin_repaint_region(RepaintId(1));
+        scene.insert_primitive(quad());
+        scene.end_repaint_region();
+        scene.finish();
+        let base = scene.repaint_regions[0].orders.start;
+
+        let deep = vec![quad(); REPAINT_REGION_ORDERS as usize + 1];
+        let mut damage = Damage::default();
+        assert!(!scene.replace_repaint_region(0, &mut repainted(base, &deep), &mut damage));
+        assert_eq!(scene.quads.len(), 1);
+        assert!(damage.regions().is_empty());
+    }
+
+    #[test]
+    fn damage_covers_what_changed_between_scenes() {
+        let left = Bounds::new(point(sp(0.), sp(0.)), Size::new(sp(10.), sp(10.)));
+        let right = Bounds::new(point(sp(50.), sp(0.)), Size::new(sp(10.), sp(10.)));
+        let draw = |right_lightness: f32| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(colored(left, 0.1));
+            scene.insert_primitive(colored(right, right_lightness));
+            scene.finish();
+            scene
+        };
+        let damage_between = |previous: &Scene, next: &Scene| {
+            let mut damage = Damage::default();
+            next.damage_since(previous, &mut damage);
+            next.add_filter_damage(&mut damage);
+            damage.regions()
+        };
+        let rounded = |bounds: Bounds<ScaledPixels>| {
+            Bounds::from_corners(
+                point(bounds.left() - sp(1.), bounds.top() - sp(1.)),
+                point(bounds.right() + sp(1.), bounds.bottom() + sp(1.)),
+            )
+        };
+
+        let previous = draw(0.5);
+        assert!(damage_between(&previous, &draw(0.5)).is_empty());
+        assert_eq!(damage_between(&previous, &draw(0.7)), vec![rounded(right)]);
+
+        // A backdrop blurring near the change repaints all it covers.
+        let mut blurred = draw(0.7);
+        let glass = Bounds::new(point(sp(65.), sp(0.)), Size::new(sp(30.), sp(30.)));
+        blurred.insert_primitive(BackdropFilter {
+            bounds: glass,
+            content_mask: ContentMask { bounds: glass },
+            filters: smallvec::smallvec![ScaledFilter::Blur(sp(4.0))],
+            opacity: 1.0,
+            ..Default::default()
+        });
+        blurred.finish();
+        let mut glass_before = draw(0.5);
+        glass_before.insert_primitive(blurred.backdrop_filters[0].clone());
+        glass_before.finish();
+        let damage = damage_between(&glass_before, &blurred);
+        assert!(damage.contains(&rounded(right)));
+        assert!(damage.contains(&rounded(glass)));
+
+        // A shadow's blur reaches past its box.
+        let mut shadowed = draw(0.5);
+        shadowed.insert_primitive(Shadow {
+            order: 0,
+            blur_radius: sp(2.),
+            bounds: left,
+            corner_radii: Corners::default(),
+            content_mask: ContentMask {
+                bounds: full_bounds(),
+            },
+            color: crate::hsla(0., 0., 0., 0.5).into(),
+            element_bounds: left,
+            element_corner_radii: Corners::default(),
+            inset: 0,
+            pad: 0,
+        });
+        shadowed.finish();
+        let damage = damage_between(&previous, &shadowed);
+        let reach = left.dilate(sp(6.)).intersect(&full_bounds());
+        assert!(
+            damage.iter().any(|region| region.left() <= reach.left()
+                && region.right() >= reach.right()
+                && region.top() <= reach.top()
+                && region.bottom() >= reach.bottom()),
+            "{damage:?}"
+        );
     }
 }

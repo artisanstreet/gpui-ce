@@ -18,13 +18,13 @@ use crate::{
     PromptButton, PromptLevel, Quad, QuadPulse, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, pulse_clock_ms, px, rems, size, transparent_black,
+    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, pulse_clock_ms, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -68,12 +68,16 @@ use uuid::Uuid;
 
 pub(crate) mod a11y;
 mod prompts;
+mod repaint;
 
 pub use a11y::A11ySubtreeBuilder;
+pub use repaint::PaintRecording;
+use repaint::RetainedPaint;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+use crate::scene::{Damage, RecordedGlyph, RecordedPaint, RepaintId};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -1166,6 +1170,16 @@ pub struct Window {
     /// Whether the rendered scene holds pulsing quads, so frames keep
     /// presenting it while nothing else changes.
     pub(crate) rendered_scene_pulses: bool,
+    /// The closures repainting the rendered scene's repaint regions.
+    retained_paints: FxHashMap<RepaintId, RetainedPaint>,
+    next_repaint_id: u64,
+    /// The viewport size and scale the rendered scene was drawn at. `None`
+    /// until the first draw, and when what's on screen can't be trusted, so
+    /// the next draw reports full damage.
+    rendered_viewport: Option<(Size<Pixels>, f32)>,
+    rendered_scene_presented: bool,
+    /// The rendered scene's damage, kept until it is presented.
+    damage_since_present: Option<Damage>,
     /// The composed paint transform of the element being drawn.
     element_transform: ScreenTransform,
     text_color_map: Option<TextColorMap>,
@@ -1589,13 +1603,16 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let pulses = handle
-                    .update(&mut cx, |_, window, _| window.rendered_scene_pulses)
-                    .unwrap_or(false);
+                let (pulses, repaints) = handle
+                    .update(&mut cx, |_, window, _| {
+                        (window.rendered_scene_pulses, window.repaint_pending())
+                    })
+                    .unwrap_or((false, false));
                 let min_frame_interval = if request_frame_options.require_presentation
                     || (!request_frame_options.force_render
                         && next_frame_callbacks.borrow().is_empty()
-                        && !pulses)
+                        && !pulses
+                        && !repaints)
                 {
                     None
                 } else if !active.get() && !input_activity.borrow().is_recent(Instant::now()) {
@@ -1665,12 +1682,25 @@ impl Window {
                             .update(&mut cx, |_, window, cx| {
                                 if force_render {
                                     // Bypass cached view reuse so we don't replay stale
-                                    // atlas tile references after a GPU device recovery.
+                                    // atlas tile references after a GPU device recovery,
+                                    // and repaint every pixel.
                                     window.refresh();
+                                    window.rendered_viewport = None;
                                 }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
                                 arena_clear_needed.clear(cx);
+                            })
+                            .log_err();
+                    })
+                } else if repaints {
+                    // Only retained paints animate: repaint their regions in
+                    // place, leaving the rest of the frame as it is.
+                    measure("frame duration", || {
+                        handle
+                            .update(&mut cx, |_, window, cx| {
+                                window.repaint(cx);
+                                window.present();
                             })
                             .log_err();
                     })
@@ -1686,12 +1716,14 @@ impl Window {
                         // End its cadence sample here too, or the next animation
                         // includes the intervening idle gap in its FPS readout.
                         #[cfg(feature = "frame-rate")]
-                        window
-                            .debug_frame_overlay
-                            .set_frame_demand(!window.next_frame_callbacks.borrow().is_empty());
+                        window.debug_frame_overlay.set_frame_demand(
+                            window.repaint_pending()
+                                || !window.next_frame_callbacks.borrow().is_empty(),
+                        );
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                             || window.rendered_scene_pulses
+                            || window.repaint_pending()
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -1703,10 +1735,16 @@ impl Window {
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
                 // source explicitly.
-                let pulses = handle
-                    .update(&mut cx, |_, window, _| window.rendered_scene_pulses)
-                    .unwrap_or(false);
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() || pulses {
+                let (pulses, repaints) = handle
+                    .update(&mut cx, |_, window, _| {
+                        (window.rendered_scene_pulses, window.repaint_pending())
+                    })
+                    .unwrap_or((false, false));
+                if invalidator.is_dirty()
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || pulses
+                    || repaints
+                {
                     invalidator.wake_platform();
                 }
             }
@@ -1891,6 +1929,11 @@ impl Window {
             element_opacity: 1.0,
             element_pulse: QuadPulse::default(),
             rendered_scene_pulses: false,
+            retained_paints: FxHashMap::default(),
+            next_repaint_id: RepaintId::FRAME_OVERLAY.0,
+            rendered_viewport: None,
+            rendered_scene_presented: false,
+            damage_since_present: None,
             element_transform: ScreenTransform::IDENTITY,
             text_color_map: None,
             requested_autoscroll: None,
@@ -3029,13 +3072,17 @@ impl Window {
             {
                 let viewport_size = self.viewport_size;
                 let scale_factor = self.scale_factor();
-                self.debug_frame_overlay
-                    .set_frame_demand(!self.next_frame_callbacks.borrow().is_empty());
-                self.debug_frame_overlay.paint(
-                    &mut self.next_frame.scene,
-                    viewport_size,
-                    scale_factor,
+                self.debug_frame_overlay.set_frame_demand(
+                    self.repaint_pending() || !self.next_frame_callbacks.borrow().is_empty(),
                 );
+                // A region of its own, so repaint frames refresh the readout.
+                if self.debug_frame_overlay.is_enabled() {
+                    let scene = &mut self.next_frame.scene;
+                    scene.begin_repaint_region(RepaintId::FRAME_OVERLAY);
+                    self.debug_frame_overlay
+                        .paint(scene, viewport_size, scale_factor);
+                    scene.end_repaint_region();
+                }
             }
         }
         self.dirty_views.clear();
@@ -3078,9 +3125,27 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
-        self.next_frame.clear();
+        // Damage is where the new scene differs from the one on screen,
+        // unless the viewport changed under it.
+        let viewport = (self.viewport_size, self.scale_factor);
+        let mut damage = (self.rendered_viewport == Some(viewport)).then(|| {
+            let mut damage = Damage::default();
+            self.rendered_frame
+                .scene
+                .damage_since(&self.next_frame.scene, &mut damage);
+            damage
+        });
+        self.rendered_viewport = Some(viewport);
         self.rendered_frame.scene.generation = self.next_frame.scene.generation + 1;
-        self.rendered_frame.scene.damage = None;
+        self.next_frame.clear();
+        // Regions replayed from cached views repaint now if they animate.
+        self.invalidator.set_phase(DrawPhase::Paint);
+        let mut untracked = Damage::default();
+        let unrepaintable =
+            self.repaint_animating_regions(damage.as_mut().unwrap_or(&mut untracked), cx);
+        self.invalidator.set_phase(DrawPhase::Focus);
+        self.retain_live_paints();
+        self.rendered_frame.scene.damage = self.settle_damage(damage);
         self.rendered_scene_pulses = self
             .rendered_frame
             .scene
@@ -3129,6 +3194,9 @@ impl Window {
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        for view in unrepaintable {
+            cx.notify(view);
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -3183,6 +3251,7 @@ impl Window {
         let present_start = Instant::now();
         self.rendered_frame.scene.pulse_clock_ms = pulse_clock_ms();
         self.platform_window.draw(&self.rendered_frame.scene);
+        self.rendered_scene_presented = true;
         #[cfg(feature = "frame-rate")]
         self.debug_frame_overlay.record_present();
         #[cfg(feature = "profiler")]
@@ -3822,7 +3891,7 @@ impl Window {
     /// every frame while it runs; a scene that only pulses never makes it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn awaits_next_frame(&self) -> bool {
-        !self.next_frame_callbacks.borrow().is_empty()
+        !self.next_frame_callbacks.borrow().is_empty() || self.repaint_pending()
     }
 
     /// Quads painted inside `f` breathe with `pulse` on the GPU (see
@@ -4701,36 +4770,19 @@ impl Window {
                 glyph_scale,
             );
             let content_mask = self.snapped_content_mask();
-
-            let spans = glyph_color_spans(
+            let glyph = RecordedGlyph {
                 bounds,
                 content_mask,
-                scale_factor,
                 color,
-                self.text_color_map.as_ref(),
-            );
-            for (content_mask, color) in spans {
-                if subpixel_rendering {
-                    self.next_frame.scene.insert_primitive(SubpixelSprite {
-                        order: 0,
-                        pad: 0,
-                        bounds,
-                        content_mask,
-                        color: color.opacity(element_opacity).into(),
-                        tile,
-                        transformation: TransformationMatrix::unit(),
-                    });
-                } else {
-                    self.next_frame.scene.insert_primitive(MonochromeSprite {
-                        order: 0,
-                        pad: 0,
-                        bounds,
-                        content_mask,
-                        color: color.opacity(element_opacity).into(),
-                        tile,
-                        transformation: TransformationMatrix::unit(),
-                    });
-                }
+                opacity: element_opacity,
+                tile,
+                subpixel: subpixel_rendering,
+                color_map: self.text_color_map.clone(),
+            };
+            match &mut self.next_frame.scene.recording {
+                // Recorded unsplit, so a replay can map its color afresh.
+                Some(recording) => recording.push(RecordedPaint::Glyph(glyph)),
+                None => self.insert_glyph(&glyph, content_mask, glyph.color_map.as_ref()),
             }
         }
         Ok(())
