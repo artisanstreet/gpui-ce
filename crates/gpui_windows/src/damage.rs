@@ -8,7 +8,7 @@
 //! around their bounds, so damage touching one grows to its whole footprint. Free of Direct3D
 //! types, so these rules are testable on any host.
 
-use std::collections::VecDeque;
+use std::{borrow::Cow, collections::VecDeque};
 
 /// The most rectangles a repaint is split into. Each costs the renderer a pass over the scene's
 /// batches, so beyond this the cheapest pair merges.
@@ -110,13 +110,18 @@ pub(crate) enum Repaint {
 /// The facts about a scene that one present is planned from.
 pub(crate) struct FrameDamage<'a> {
     pub generation: u64,
-    /// The scene's damage against generation `generation - 1`; `None` means anything changed.
+    /// The scene's damage against generation `generation - 1` and every scene drawn since the
+    /// last one presented, so it holds against whichever earlier generation the screen shows;
+    /// `None` means anything changed.
     pub scene: Option<&'a [DamageRect]>,
     /// Pulsing quads, which change on every present.
     pub pulses: &'a [DamageRect],
     /// Footprints of blur filters. Damage touching one grows to cover all of it: the blur reads
     /// the whole footprint and writes inside it.
     pub filters: &'a [DamageRect],
+    /// Footprints of the blur filters in the scene presented before. A new scene's damage covers
+    /// a moved or removed filter's bounds, but not the blur it spread around them.
+    pub previous_filters: &'a [DamageRect],
     pub width: i32,
     pub height: i32,
 }
@@ -169,8 +174,15 @@ impl DamageTracker {
         };
         let scene = match self.last_generation {
             Some(last) if last == frame.generation => Some(&[][..]),
-            Some(last) if last.wrapping_add(1) == frame.generation => frame.scene,
+            // Scenes drawn but never presented are part of the newer scene's damage.
+            Some(last) if last < frame.generation => frame.scene,
             _ => None,
+        };
+        // A new scene may have moved or removed filters whose blur is still on screen.
+        let filters = if self.last_generation == Some(frame.generation) {
+            Cow::Borrowed(frame.filters)
+        } else {
+            Cow::Owned([frame.filters, frame.previous_filters].concat())
         };
         let changed = scene.map(|scene| {
             settle(
@@ -179,7 +191,7 @@ impl DamageTracker {
                     .chain(frame.pulses)
                     .chain(&self.overlay)
                     .copied(),
-                frame.filters,
+                &filters,
                 target,
             )
         });
@@ -330,6 +342,7 @@ mod tests {
             scene,
             pulses,
             filters: &[],
+            previous_filters: &[],
             width: 100,
             height: 100,
         }
@@ -447,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_or_skipped_generations_repaint_everything() {
+    fn unknown_damage_or_an_older_generation_repaints_everything() {
         let pulse = rect(10, 10, 20, 20);
         let mut tracker = settled(pulse);
         assert_eq!(
@@ -457,14 +470,20 @@ mod tests {
 
         let mut tracker = settled(pulse);
         assert_eq!(
-            present(&mut tracker, &frame(3, Some(&[]), &[pulse])),
-            Repaint::Full
-        );
-
-        let mut tracker = settled(pulse);
-        assert_eq!(
             present(&mut tracker, &frame(0, Some(&[]), &[pulse])),
             Repaint::Full
+        );
+    }
+
+    #[test]
+    fn a_generation_skipped_by_the_window_still_repaints_partially() {
+        // Generation 2 was drawn but never presented; generation 3's damage includes it.
+        let pulse = rect(10, 10, 20, 20);
+        let mut tracker = settled(pulse);
+        let skipped_and_new = [rect(60, 60, 70, 70)];
+        assert_eq!(
+            present(&mut tracker, &frame(3, Some(&skipped_and_new), &[pulse])),
+            partial(&[pulse, skipped_and_new[0]])
         );
     }
 
@@ -687,6 +706,29 @@ mod tests {
         assert_eq!(
             plan.repaint,
             partial(&[rect(40, 40, 60, 60), rect(90, 90, 91, 91)])
+        );
+    }
+
+    #[test]
+    fn damage_where_a_filter_was_covers_the_blur_it_spread() {
+        let tracker = settled(rect(0, 0, 1, 1));
+        // A content blur at 40..60 bled to 30..70; the new scene removed it.
+        let plan = tracker.plan(&FrameDamage {
+            previous_filters: &[rect(30, 30, 70, 70)],
+            ..frame(2, Some(&[rect(40, 40, 60, 60)]), &[])
+        });
+        assert_eq!(
+            plan.repaint,
+            partial(&[rect(0, 0, 1, 1), rect(30, 30, 70, 70)])
+        );
+        // Pulses alone do not move filters.
+        let plan = tracker.plan(&FrameDamage {
+            previous_filters: &[rect(30, 30, 70, 70)],
+            ..frame(1, None, &[rect(45, 45, 50, 50)])
+        });
+        assert_eq!(
+            plan.repaint,
+            partial(&[rect(0, 0, 1, 1), rect(45, 45, 50, 50)])
         );
     }
 

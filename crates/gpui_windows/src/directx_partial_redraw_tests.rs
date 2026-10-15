@@ -15,13 +15,15 @@ fn rect(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
     )
 }
 
-/// A dark window with a coloured square at `changed`; with `filters`, a glass panel blurs the
-/// square's surroundings and a blurred group sits in a far corner. `extra` quads go on top.
+/// A dark window with a coloured square at `changed`; with `glass`, a glass panel blurs the
+/// square's surroundings, and with `group`, a blurred group sits in a far corner. `extra` quads
+/// go on top.
 fn scene(
     generation: u64,
     hue: f32,
     changed: Bounds<ScaledPixels>,
-    filters: bool,
+    glass: bool,
+    group: bool,
     extra: &[Quad],
 ) -> Scene {
     let full = rect(0.0, 0.0, VIEWPORT[0] as f32, VIEWPORT[1] as f32);
@@ -40,7 +42,7 @@ fn scene(
         background: hsla(hue, 1.0, 0.5, 1.0).into(),
         ..Default::default()
     });
-    if filters {
+    if glass {
         scene.insert_primitive(BackdropFilter {
             order: 2,
             bounds: rect(36.0, 20.0, 30.0, 30.0),
@@ -57,6 +59,8 @@ fn scene(
             background: hsla(0.1, 0.9, 0.8, 0.7).into(),
             ..Default::default()
         });
+    }
+    if group {
         let boundary = FilterBoundary {
             order: 4,
             bounds: rect(4.0, 80.0, 10.0, 10.0),
@@ -88,11 +92,53 @@ fn scene(
     scene
 }
 
+/// Plans presenting `scenes` in turn. Without a flip the back buffer keeps the previous render,
+/// so a single-buffer tracker plans exactly what the renderer must repaint over it.
+fn plan_presents(scenes: &[&Scene]) -> Vec<Repaint> {
+    let mut tracker = DamageTracker::new(1);
+    let mut sources = DamageSources::default();
+    scenes
+        .iter()
+        .map(|scene| {
+            sources.update(scene);
+            let plan = tracker.plan(&FrameDamage {
+                generation: scene.generation,
+                scene: sources.scene.as_deref(),
+                pulses: &sources.pulses,
+                filters: &sources.filters,
+                previous_filters: &sources.previous_filters,
+                width: VIEWPORT[0] as i32,
+                height: VIEWPORT[1] as i32,
+            });
+            let repaint = plan.repaint.clone();
+            tracker.presented(plan);
+            repaint
+        })
+        .collect()
+}
+
+/// Renders `before` whole, then `after` as `repaint`, and checks the result against rendering
+/// `after` whole.
+fn assert_partial_matches_full(before: &Scene, after: &Scene, repaint: &Repaint) -> Result<()> {
+    let background = WindowBackgroundAppearance::Transparent;
+    let mut renderer = renderer(VIEWPORT)?;
+    renderer.render_to_image(before, background)?;
+    renderer.render(after, background, repaint)?;
+    let partial = renderer.read_render_target()?;
+    let full = renderer.render_to_image(after, background)?;
+    for (x, y, pixel) in full.enumerate_pixels() {
+        assert_eq!(
+            partial.get_pixel(x, y),
+            pixel,
+            "partial repaint differs at ({x}, {y}), repaint={repaint:?}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn a_partial_repaint_over_the_previous_frame_matches_a_full_render() -> Result<()> {
-    let background = WindowBackgroundAppearance::Transparent;
     for filters in [false, true] {
-        let mut renderer = renderer(VIEWPORT)?;
         // A second change far from the first, like a sidebar dot beside a transcript line.
         let corner = |hue| Quad {
             order: 7,
@@ -108,36 +154,21 @@ fn a_partial_repaint_over_the_previous_frame_matches_a_full_render() -> Result<(
             0.0,
             rect(30.0, 30.0, 12.0, 12.0),
             filters,
+            filters,
             &[corner(0.5)],
         );
         let moved = rect(33.0, 31.0, 12.0, 12.0);
-        let mut after = scene(2, 0.33, moved, filters, &[corner(0.8)]);
+        let mut after = scene(2, 0.33, moved, filters, filters, &[corner(0.8)]);
         after.damage = Some(vec![
             rect(30.0, 30.0, 15.0, 13.0),
             rect(88.0, 84.0, 6.0, 6.0),
         ]);
 
-        // Without a flip the back buffer keeps the previous render, so a single-buffer
-        // tracker plans exactly what the renderer must repaint.
-        let mut tracker = DamageTracker::new(1);
-        let mut sources = DamageSources::default();
-        let mut plan = |scene: &Scene| {
-            sources.update(scene);
-            let plan = tracker.plan(&FrameDamage {
-                generation: scene.generation,
-                scene: sources.scene.as_deref(),
-                pulses: &sources.pulses,
-                filters: &sources.filters,
-                width: VIEWPORT[0] as i32,
-                height: VIEWPORT[1] as i32,
-            });
-            let repaint = plan.repaint.clone();
-            tracker.presented(plan);
-            repaint
+        let [first, repaint] = &plan_presents(&[&before, &after])[..] else {
+            unreachable!();
         };
-        assert_eq!(plan(&before), Repaint::Full);
-        let repaint = plan(&after);
-        let Repaint::Partial(regions) = &repaint else {
+        assert_eq!(*first, Repaint::Full);
+        let Repaint::Partial(regions) = repaint else {
             panic!("expected a partial repaint, got {repaint:?}");
         };
         assert_eq!(regions.len(), 2, "{regions:?}");
@@ -149,17 +180,7 @@ fn a_partial_repaint_over_the_previous_frame_matches_a_full_render() -> Result<(
             );
         }
 
-        renderer.render_to_image(&before, background)?;
-        renderer.render(&after, background, &repaint)?;
-        let partial = renderer.read_render_target()?;
-        let full = renderer.render_to_image(&after, background)?;
-        for (x, y, pixel) in full.enumerate_pixels() {
-            assert_eq!(
-                partial.get_pixel(x, y),
-                pixel,
-                "partial repaint differs at ({x}, {y}), filters={filters}, regions={regions:?}"
-            );
-        }
+        assert_partial_matches_full(&before, &after, repaint)?;
     }
     Ok(())
 }
@@ -183,7 +204,7 @@ fn pulse_only_presents_flip_with_the_pulse_as_their_dirty_rect() -> Result<()> {
         },
         ..Default::default()
     };
-    let mut scene = scene(1, 0.0, rect(30.0, 30.0, 12.0, 12.0), true, &[pulsing]);
+    let mut scene = scene(1, 0.0, rect(30.0, 30.0, 12.0, 12.0), true, true, &[pulsing]);
     // Every buffer of the flip chain is drawn whole once, then only the pulse.
     for frame in 0..6u32 {
         scene.pulse_clock_ms = frame * 16;
@@ -200,4 +221,19 @@ fn pulse_only_presents_flip_with_the_pulse_as_their_dirty_rect() -> Result<()> {
         }])
     );
     Ok(())
+}
+
+#[test]
+fn removing_a_blurred_group_repaints_the_blur_it_spread() -> Result<()> {
+    let square = rect(30.0, 30.0, 12.0, 12.0);
+    let before = scene(1, 0.0, square, false, true, &[]);
+    let mut after = scene(2, 0.0, square, false, false, &[]);
+    // What the window reports: the removed group and its child, padded by a pixel. The blur
+    // drew up to 3 radii past the group's bounds.
+    after.damage = Some(vec![rect(3.0, 79.0, 12.0, 12.0)]);
+    let [_, repaint] = &plan_presents(&[&before, &after])[..] else {
+        unreachable!();
+    };
+    assert!(matches!(repaint, Repaint::Partial(_)), "{repaint:?}");
+    assert_partial_matches_full(&before, &after, repaint)
 }

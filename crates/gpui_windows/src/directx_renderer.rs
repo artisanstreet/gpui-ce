@@ -72,6 +72,18 @@ fn batch_bounds(scene: &Scene, batch: PrimitiveBatch) -> Option<DamageRect> {
     fn visible(bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>) -> DamageRect {
         damage_rect(bounds.intersect(&mask.bounds))
     }
+    /// Transformed sprites land anywhere within their mask.
+    fn sprite(
+        bounds: Bounds<ScaledPixels>,
+        mask: &ContentMask<ScaledPixels>,
+        transformation: &TransformationMatrix,
+    ) -> DamageRect {
+        if *transformation == TransformationMatrix::unit() {
+            visible(bounds, mask)
+        } else {
+            damage_rect(mask.bounds)
+        }
+    }
     fn union(rects: impl Iterator<Item = DamageRect>) -> DamageRect {
         rects.fold(DamageRect::default(), DamageRect::union)
     }
@@ -103,12 +115,12 @@ fn batch_bounds(scene: &Scene, batch: PrimitiveBatch) -> Option<DamageRect> {
         PrimitiveBatch::MonochromeSprites { range, .. } => union(
             scene.monochrome_sprites[range]
                 .iter()
-                .map(|sprite| visible(sprite.bounds, &sprite.content_mask)),
+                .map(|s| sprite(s.bounds, &s.content_mask, &s.transformation)),
         ),
         PrimitiveBatch::SubpixelSprites { range, .. } => union(
             scene.subpixel_sprites[range]
                 .iter()
-                .map(|sprite| visible(sprite.bounds, &sprite.content_mask)),
+                .map(|s| sprite(s.bounds, &s.content_mask, &s.transformation)),
         ),
         PrimitiveBatch::PolychromeSprites { range, .. } => union(
             scene.polychrome_sprites[range]
@@ -219,6 +231,8 @@ struct DamageSources {
     scene: Option<Vec<DamageRect>>,
     pulses: Vec<DamageRect>,
     filters: Vec<DamageRect>,
+    /// The blur footprints of the scene before this one.
+    previous_filters: Vec<DamageRect>,
     /// [`batch_bounds`] of each of the scene's batches, in order.
     batches: Vec<Option<DamageRect>>,
 }
@@ -241,6 +255,7 @@ impl DamageSources {
                 .filter(|quad| quad.pulse.is_active())
                 .map(|quad| damage_rect(quad.bounds.intersect(&quad.content_mask.bounds))),
         );
+        std::mem::swap(&mut self.previous_filters, &mut self.filters);
         self.filters.clear();
         self.filters.extend(
             scene
@@ -821,6 +836,7 @@ impl DirectXRenderer {
             scene: self.damage_sources.scene.as_deref(),
             pulses: &self.damage_sources.pulses,
             filters: &self.damage_sources.filters,
+            previous_filters: &self.damage_sources.previous_filters,
             width: self.width as i32,
             height: self.height as i32,
         })
