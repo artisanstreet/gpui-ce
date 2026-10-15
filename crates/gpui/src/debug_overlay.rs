@@ -3,8 +3,8 @@
 //! infinitely triggering new frames).
 
 use crate::{
-    BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, ScaledPixels, Scene,
-    Size, point, rgb_to_hsla, rgba, size, transparent_black,
+    BorderStyle, Bounds, ContentMask, Corners, Edges, Hsla, Pixels, Quad, QuadPulse, ScaledPixels,
+    Scene, Size, point, rgb_to_hsla, rgba, size, transparent_black,
 };
 use std::{
     collections::VecDeque,
@@ -306,6 +306,7 @@ fn solid_quad(
         border_color: transparent_black().into(),
         corner_radii: Corners::default(),
         border_widths: Edges::default(),
+        pulse: QuadPulse::default(),
     }
 }
 
