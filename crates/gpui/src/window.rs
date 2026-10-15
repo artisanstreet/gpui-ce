@@ -15,15 +15,16 @@ use crate::{
     LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton,
     MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
-    PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage, RenderImageParams,
-    RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X,
-    SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
-    WindowParams, WindowTextSystem, point, prelude::*, px, rems, size, transparent_black,
+    PromptButton, PromptLevel, Quad, QuadPulse, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
+    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
+    prelude::*, pulse_clock_ms, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1161,6 +1162,10 @@ pub struct Window {
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     pub(crate) element_opacity: f32,
+    pub(crate) element_pulse: QuadPulse,
+    /// Whether the rendered scene holds pulsing quads, so frames keep
+    /// presenting it while nothing else changes.
+    pub(crate) rendered_scene_pulses: bool,
     /// The composed paint transform of the element being drawn.
     element_transform: ScreenTransform,
     text_color_map: Option<TextColorMap>,
@@ -1584,9 +1589,13 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
+                let pulses = handle
+                    .update(&mut cx, |_, window, _| window.rendered_scene_pulses)
+                    .unwrap_or(false);
                 let min_frame_interval = if request_frame_options.require_presentation
                     || (!request_frame_options.force_render
-                        && next_frame_callbacks.borrow().is_empty())
+                        && next_frame_callbacks.borrow().is_empty()
+                        && !pulses)
                 {
                     None
                 } else if !active.get() && !input_activity.borrow().is_recent(Instant::now()) {
@@ -1643,8 +1652,11 @@ impl Window {
                 // Respond from the first redraw-causing input, including sparse
                 // clicks and wheel events. Waiting for a high-rate burst lets the
                 // display remain underclocked at the start of interaction.
+                // Pulsing quads advance on the GPU: re-presenting the rendered
+                // scene moves them without a render, layout or paint.
                 let needs_present = request_frame_options.require_presentation
                     || needs_present.get()
+                    || pulses
                     || input_activity.borrow().is_recent(Instant::now());
 
                 if invalidator.is_dirty() || force_render {
@@ -1679,6 +1691,7 @@ impl Window {
                             .set_frame_demand(!window.next_frame_callbacks.borrow().is_empty());
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || window.rendered_scene_pulses
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -1690,7 +1703,10 @@ impl Window {
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
                 // source explicitly.
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() {
+                let pulses = handle
+                    .update(&mut cx, |_, window, _| window.rendered_scene_pulses)
+                    .unwrap_or(false);
+                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() || pulses {
                     invalidator.wake_platform();
                 }
             }
@@ -1873,6 +1889,8 @@ impl Window {
             element_offset_stack: Vec::new(),
             content_mask_stack: Vec::new(),
             element_opacity: 1.0,
+            element_pulse: QuadPulse::default(),
+            rendered_scene_pulses: false,
             element_transform: ScreenTransform::IDENTITY,
             text_color_map: None,
             requested_autoscroll: None,
@@ -3061,6 +3079,12 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.rendered_scene_pulses = self
+            .rendered_frame
+            .scene
+            .quads
+            .iter()
+            .any(|quad| quad.pulse.is_active());
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
         let mut focus_before_listeners = self.focus;
@@ -3155,6 +3179,7 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        self.rendered_frame.scene.pulse_clock_ms = pulse_clock_ms();
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "frame-rate")]
         self.debug_frame_overlay.record_present();
@@ -3788,6 +3813,26 @@ impl Window {
         self.element_opacity = previous_opacity * opacity;
         let result = f(self);
         self.element_opacity = previous_opacity;
+        result
+    }
+
+    /// Whether an animation asked for the next frame. That demand repeats
+    /// every frame while it runs; a scene that only pulses never makes it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn awaits_next_frame(&self) -> bool {
+        !self.next_frame_callbacks.borrow().is_empty()
+    }
+
+    /// Quads painted inside `f` breathe with `pulse` on the GPU (see
+    /// [`QuadPulse`]). An inactive pulse leaves the inherited one in place.
+    pub fn with_quad_pulse<R>(&mut self, pulse: QuadPulse, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.invalidator.debug_assert_paint_or_prepaint();
+        if !pulse.is_active() {
+            return f(self);
+        }
+        let previous = mem::replace(&mut self.element_pulse, pulse);
+        let result = f(self);
+        self.element_pulse = previous;
         result
     }
 
@@ -4442,6 +4487,7 @@ impl Window {
             corner_radii: quad.corner_radii.scale(self.length_scale()),
             border_widths: snapped_border_widths,
             border_style: quad.border_style,
+            pulse: self.element_pulse,
         };
 
         if !quad.background.is_transparent() {

@@ -97,9 +97,32 @@ vertex QuadVertexOutput quad_vertex(uint unit_vertex_id [[vertex_id]],
       {clip_distance.x, clip_distance.y, clip_distance.z, clip_distance.w}};
 }
 
+// The opacity factor of a pulsing quad at this present. Unsigned wrapping
+// subtraction keeps the phase exact across the clock's wrap.
+float pulse_opacity(QuadPulse pulse, uint pulse_clock_ms) {
+  if (pulse.period_ms == 0u) {
+    return 1.0;
+  }
+  float progress = float((pulse_clock_ms - pulse.start_ms) % pulse.period_ms) /
+                   float(pulse.period_ms);
+  float swing = cos(progress * 6.28318530718) * 0.5 + 0.5;
+  return pulse.min_opacity + (1.0 - pulse.min_opacity) * swing;
+}
+
+float4 quad_color(QuadFragmentInput input, constant Quad *quads);
+
 fragment float4 quad_fragment(QuadFragmentInput input [[stage_in]],
                               constant Quad *quads
-                              [[buffer(QuadInputIndex_Quads)]]) {
+                              [[buffer(QuadInputIndex_Quads)]],
+                              constant uint *pulse_clock_ms
+                              [[buffer(QuadInputIndex_PulseClock)]]) {
+  // Blending is straight alpha, so the pulse scales alpha alone.
+  float4 color = quad_color(input, quads);
+  color.a *= pulse_opacity(quads[input.quad_id].pulse, *pulse_clock_ms);
+  return color;
+}
+
+float4 quad_color(QuadFragmentInput input, constant Quad *quads) {
   Quad quad = quads[input.quad_id];
   float4 background_color = fill_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);

@@ -3,10 +3,10 @@ use crate::{
     BackgroundExecutor, BorrowAppContext, Bounds, Capslock, ClipboardItem, DrawPhase, Drawable,
     Element, Empty, EntityId, EventEmitter, ForegroundExecutor, Global, InputEvent, Keystroke,
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    Pixels, Platform, Point, Render, Result, SharedString, Size, SystemNotification,
-    SystemNotificationResponse, Task, TestDispatcher, TestPlatform, TestScreenCaptureSource,
-    TestWindow, TextSystem, VisualContext, Window, WindowBounds, WindowHandle, WindowOptions,
-    app::GpuiMode, window::ElementArenaScope,
+    Pixels, Platform, Point, Render, RequestFrameOptions, Result, SharedString, Size,
+    SystemNotification, SystemNotificationResponse, Task, TestDispatcher, TestPlatform,
+    TestScreenCaptureSource, TestWindow, TextSystem, VisualContext, Window, WindowBounds,
+    WindowHandle, WindowOptions, app::GpuiMode, window::ElementArenaScope,
 };
 use anyhow::{anyhow, bail};
 use futures::{Stream, StreamExt, channel::oneshot};
@@ -556,6 +556,13 @@ impl TestAppContext {
             window.dispatch_keystroke(keystroke, cx)
         })
         .unwrap();
+    }
+
+    /// Delivers one platform frame to `window`, as the display would: due
+    /// next-frame callbacks run, and a dirty window draws and presents.
+    pub fn simulate_frame(&self, window: AnyWindowHandle) {
+        self.test_window(window)
+            .simulate_frame_request(RequestFrameOptions::default());
     }
 
     /// Returns the `TestWindow` backing the given handle.

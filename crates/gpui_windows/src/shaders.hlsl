@@ -6,7 +6,8 @@ cbuffer GlobalParams: register(b0) {
     float grayscale_enhanced_contrast;
     float subpixel_enhanced_contrast;
     uint is_bgr;
-    uint3 global_pad;
+    uint pulse_clock_ms;
+    uint2 global_pad;
 };
 
 cbuffer BatchParams: register(b1) {
@@ -516,6 +517,14 @@ float quarter_ellipse_sdf(float2 pt, float2 radii) {
 **
 */
 
+// Mirrors `QuadPulse` in gpui's scene.rs.
+struct QuadPulse {
+    uint start_ms;
+    uint period_ms;
+    float min_opacity;
+    uint pad;
+};
+
 struct Quad {
     uint order;
     uint border_style;
@@ -525,7 +534,19 @@ struct Quad {
     Hsla border_color;
     Corners corner_radii;
     Edges border_widths;
+    QuadPulse pulse;
 };
+
+// The opacity factor of a pulsing quad at this present. Unsigned wrapping
+// subtraction keeps the phase exact across the clock's wrap.
+float pulse_opacity(QuadPulse pulse) {
+    if (pulse.period_ms == 0u) {
+        return 1.0;
+    }
+    float progress = float((pulse_clock_ms - pulse.start_ms) % pulse.period_ms) / float(pulse.period_ms);
+    float swing = cos(progress * 6.28318530718) * 0.5 + 0.5;
+    return pulse.min_opacity + (1.0 - pulse.min_opacity) * swing;
+}
 
 struct QuadVertexOutput {
     nointerpolation uint quad_id: TEXCOORD0;
@@ -574,7 +595,16 @@ QuadVertexOutput quad_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_I
     return output;
 }
 
+float4 quad_color(QuadFragmentInput input);
+
 float4 quad_fragment(QuadFragmentInput input): SV_Target {
+    // Blending is straight alpha, so the pulse scales alpha alone.
+    float4 color = quad_color(input);
+    color.a *= pulse_opacity(quads[input.quad_id].pulse);
+    return color;
+}
+
+float4 quad_color(QuadFragmentInput input) {
     Quad quad = quads[input.quad_id];
     float4 background_color = gradient_color(quad.background, input.position.xy, quad.bounds,
     input.background_solid, input.background_color0, input.background_color1);

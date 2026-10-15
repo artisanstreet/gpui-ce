@@ -25,8 +25,8 @@
 //! (`modules/ui/src/theme.rs`: `Oklch::to_srgb`, then `srgb_to_hsla`).
 use super::*;
 use gpui::{
-    BorderStyle, ColorSpace, ContentMask, Corners, Edges, block_on, hsla, linear_color_stop,
-    linear_gradient, point, size, solid_background,
+    BorderStyle, ColorSpace, ContentMask, Corners, Edges, QuadPulse, block_on, hsla,
+    linear_color_stop, linear_gradient, point, size, solid_background,
 };
 use std::{sync::mpsc, time::Duration};
 use wgpu::util::DeviceExt as _;
@@ -325,6 +325,46 @@ fn solid_fill_stays_bit_exact() -> Result<()> {
     Ok(())
 }
 
+/// A working dot breathes on the GPU: the same instance data, presented at
+/// different clock readings, comes out at the pulse's opacity, including
+/// across the clock's wrap.
+#[test]
+fn pulsing_quad_breathes_with_the_present_clock() -> Result<()> {
+    let (device, queue) = test_device()?;
+    let pipeline = quad_pipeline(&device, wgpu::BlendState::ALPHA_BLENDING);
+    let alpha_at = |start_ms: u32, clock_ms: u32| -> Result<u8> {
+        let globals = globals_group_at(&device, &pipeline, 64.0, 64.0, 0, clock_ms);
+        let quad = Quad {
+            pulse: QuadPulse {
+                start_ms,
+                period_ms: 1000,
+                min_opacity: 0.4,
+                pad: 0,
+            },
+            ..full_quad(solid_background(hsla(0.0, 1.0, 0.5, 1.0)), 64.0, 64.0)
+        };
+        let pixels = render_quad_pixels(&device, &queue, &pipeline, &globals, quad, 64, 64)?;
+        Ok(pixels[3])
+    };
+    let full = 255.0;
+    let bottom = 0.4 * 255.0;
+    let quarter = (0.4 + 0.6 * 0.5) * 255.0;
+    for (start, clock, expected, moment) in [
+        (0, 0, full, "the start"),
+        (0, 250, quarter, "a quarter breath"),
+        (0, 500, bottom, "the bottom"),
+        (0, 1000, full, "one full breath"),
+        (u32::MAX - 249, 250, bottom, "the clock's wrap"),
+    ] {
+        let alpha = f64::from(alpha_at(start, clock)?);
+        assert!(
+            (alpha - expected).abs() <= 1.5,
+            "alpha at {moment}: got {alpha}, expected {expected}"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn transparent_gradient_edge_blends_monotonically_in_both_alpha_modes() -> Result<()> {
     let (device, queue) = test_device()?;
@@ -406,6 +446,7 @@ fn full_quad(background: Background, width: f32, height: f32) -> Quad {
         border_color: hsla(0.0, 0.0, 0.0, 0.0).into(),
         corner_radii: Corners::all(ScaledPixels(0.0)),
         border_widths: Edges::default(),
+        pulse: QuadPulse::default(),
     }
 }
 
@@ -483,12 +524,23 @@ fn globals_group(
     height: f32,
     premultiplied_alpha: u32,
 ) -> wgpu::BindGroup {
+    globals_group_at(device, pipeline, width, height, premultiplied_alpha, 0)
+}
+
+fn globals_group_at(
+    device: &wgpu::Device,
+    pipeline: &wgpu::RenderPipeline,
+    width: f32,
+    height: f32,
+    premultiplied_alpha: u32,
+    pulse_clock_ms: u32,
+) -> wgpu::BindGroup {
     let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("gradient globals"),
         contents: bytemuck::bytes_of(&GlobalParams {
             viewport_size: [width, height],
             premultiplied_alpha,
-            pad: 0,
+            pulse_clock_ms,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });
