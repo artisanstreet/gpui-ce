@@ -60,6 +60,15 @@ pub struct Scene {
     /// The window stamps it on every present, so a frame that only advances
     /// pulses re-presents this scene without rebuilding it.
     pub pulse_clock_ms: u32,
+    /// Counts drawn scenes. The window bumps it each time it finishes a new
+    /// scene; a present that only advances pulses keeps it, so a renderer can
+    /// tell "same content, later clock" from "new content".
+    pub generation: u64,
+    /// Device-pixel regions whose pixels may differ from scene
+    /// `generation - 1`. `None` means anything may have changed and the
+    /// renderer must repaint the whole target. Pulsing quads are not listed:
+    /// they change on every present, and renderers add their bounds themselves.
+    pub damage: Option<Vec<Bounds<ScaledPixels>>>,
 }
 
 #[expect(missing_docs)]

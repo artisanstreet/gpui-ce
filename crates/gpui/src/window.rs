@@ -3079,6 +3079,8 @@ impl Window {
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
         self.next_frame.clear();
+        self.rendered_frame.scene.generation = self.next_frame.scene.generation + 1;
+        self.rendered_frame.scene.damage = None;
         self.rendered_scene_pulses = self
             .rendered_frame
             .scene
