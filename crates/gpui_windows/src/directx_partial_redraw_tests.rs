@@ -93,10 +93,29 @@ fn a_partial_repaint_over_the_previous_frame_matches_a_full_render() -> Result<(
     let background = WindowBackgroundAppearance::Transparent;
     for filters in [false, true] {
         let mut renderer = renderer(VIEWPORT)?;
-        let before = scene(1, 0.0, rect(30.0, 30.0, 12.0, 12.0), filters, &[]);
+        // A second change far from the first, like a sidebar dot beside a transcript line.
+        let corner = |hue| Quad {
+            order: 7,
+            bounds: rect(88.0, 84.0, 6.0, 6.0),
+            content_mask: ContentMask {
+                bounds: rect(0.0, 0.0, 96.0, 96.0),
+            },
+            background: hsla(hue, 0.8, 0.5, 1.0).into(),
+            ..Default::default()
+        };
+        let before = scene(
+            1,
+            0.0,
+            rect(30.0, 30.0, 12.0, 12.0),
+            filters,
+            &[corner(0.5)],
+        );
         let moved = rect(33.0, 31.0, 12.0, 12.0);
-        let mut after = scene(2, 0.33, moved, filters, &[]);
-        after.damage = Some(vec![rect(30.0, 30.0, 15.0, 13.0)]);
+        let mut after = scene(2, 0.33, moved, filters, &[corner(0.8)]);
+        after.damage = Some(vec![
+            rect(30.0, 30.0, 15.0, 13.0),
+            rect(88.0, 84.0, 6.0, 6.0),
+        ]);
 
         // Without a flip the back buffer keeps the previous render, so a single-buffer
         // tracker plans exactly what the renderer must repaint.
@@ -112,31 +131,33 @@ fn a_partial_repaint_over_the_previous_frame_matches_a_full_render() -> Result<(
                 width: VIEWPORT[0] as i32,
                 height: VIEWPORT[1] as i32,
             });
-            tracker.presented(&plan);
-            plan.repaint
+            let repaint = plan.repaint.clone();
+            tracker.presented(plan);
+            repaint
         };
         assert_eq!(plan(&before), Repaint::Full);
         let repaint = plan(&after);
-        let Repaint::Partial(region) = repaint else {
+        let Repaint::Partial(regions) = &repaint else {
             panic!("expected a partial repaint, got {repaint:?}");
         };
+        assert_eq!(regions.len(), 2, "{regions:?}");
         if filters {
             // The square sits under the glass panel's footprint, which repaints whole.
             assert!(
-                region.left <= 36 - 12 && region.right >= 66 + 12,
-                "{region:?}"
+                regions[0].left <= 36 - 12 && regions[0].right >= 66 + 12,
+                "{regions:?}"
             );
         }
 
         renderer.render_to_image(&before, background)?;
-        renderer.render(&after, background, repaint)?;
+        renderer.render(&after, background, &repaint)?;
         let partial = renderer.read_render_target()?;
         let full = renderer.render_to_image(&after, background)?;
         for (x, y, pixel) in full.enumerate_pixels() {
             assert_eq!(
                 partial.get_pixel(x, y),
                 pixel,
-                "partial repaint differs at ({x}, {y}), filters={filters}, region={region:?}"
+                "partial repaint differs at ({x}, {y}), filters={filters}, regions={regions:?}"
             );
         }
     }
@@ -171,12 +192,12 @@ fn pulse_only_presents_flip_with_the_pulse_as_their_dirty_rect() -> Result<()> {
     // A present that failed or reported a status would have forgotten the buffers' contents.
     assert_eq!(
         renderer.plan_frame(&scene, background).repaint,
-        Repaint::Partial(DamageRect {
+        Repaint::Partial(vec![DamageRect {
             left: 70,
             top: 74,
             right: 74,
             bottom: 82,
-        })
+        }])
     );
     Ok(())
 }

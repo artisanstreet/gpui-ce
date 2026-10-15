@@ -3,18 +3,27 @@
 //! The swap chain flips between `buffer_count` back buffers, so the buffer a frame renders into
 //! still holds the frame presented `buffer_count` presents earlier. A partial frame therefore
 //! repaints its own damage plus everything the previous `buffer_count - 1` presents changed.
-//! Blur filters read pixels around their bounds, so damage touching one grows to its whole
-//! footprint. Free of Direct3D types, so these rules are testable on any host.
+//! Damage is a short list of disjoint rectangles, so a pulse in one corner and a shimmer in the
+//! other repaint two small regions rather than the box spanning both. Blur filters read pixels
+//! around their bounds, so damage touching one grows to its whole footprint. Free of Direct3D
+//! types, so these rules are testable on any host.
 
 use std::collections::VecDeque;
 
+/// The most rectangles a repaint is split into. Each costs the renderer a pass over the scene's
+/// batches, so beyond this the cheapest pair merges.
+pub(crate) const MAX_DAMAGE_RECTS: usize = 8;
+
+/// Rectangles this close merge: the strip between them is cheaper to repaint than another pass.
+const MERGE_GAP: i32 = 4;
+
 /// A rectangle of whole device pixels, half-open: `left..right` by `top..bottom`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DamageRect {
-    pub left: i32,
     pub top: i32,
-    pub right: i32,
+    pub left: i32,
     pub bottom: i32,
+    pub right: i32,
 }
 
 impl DamageRect {
@@ -70,15 +79,30 @@ impl DamageRect {
     pub fn intersects(&self, other: &Self) -> bool {
         !self.intersect(*other).is_empty()
     }
+
+    /// The pixels merging with `other` would repaint that neither covers.
+    fn merge_cost(&self, other: &Self) -> i64 {
+        self.union(*other).area() - self.area() - other.area()
+    }
+
+    /// Whether repainting the box around both is about as cheap as repainting them apart:
+    /// they overlap, nearly touch, or their union is at most 30% larger than the two.
+    fn merges_with(&self, other: &Self) -> bool {
+        let gap_x = (other.left - self.right).max(self.left - other.right);
+        let gap_y = (other.top - self.bottom).max(self.top - other.bottom);
+        gap_x.max(gap_y) <= MERGE_GAP
+            || self.union(*other).area() * 10 <= (self.area() + other.area()) * 13
+    }
 }
 
 /// What one present repaints.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Repaint {
     /// The screen already shows this frame: no render, no present.
     Nothing,
-    /// Only this rectangle; every pixel outside it is retained from the back buffer.
-    Partial(DamageRect),
+    /// Only these disjoint rectangles, at most [`MAX_DAMAGE_RECTS`], ordered top to bottom;
+    /// every pixel outside them is retained from the back buffer.
+    Partial(Vec<DamageRect>),
     /// The whole target.
     Full,
 }
@@ -98,11 +122,11 @@ pub(crate) struct FrameDamage<'a> {
 }
 
 /// A planned present. Hand it back to [`DamageTracker::presented`] once it reached the screen.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FramePlan {
     generation: u64,
     /// The pixels that differ from the previous present; `None` means all of them.
-    changed: Option<DamageRect>,
+    changed: Option<Vec<DamageRect>>,
     pub repaint: Repaint,
 }
 
@@ -112,9 +136,9 @@ pub(crate) struct DamageTracker {
     last_generation: Option<u64>,
     /// What each of the last `buffer_count - 1` presents changed, oldest first; `None` means the
     /// whole target.
-    history: VecDeque<Option<DamageRect>>,
+    history: VecDeque<Option<Vec<DamageRect>>>,
     /// The debug tint over the last present, which the next present paints over.
-    overlay: Option<DamageRect>,
+    overlay: Vec<DamageRect>,
 }
 
 impl DamageTracker {
@@ -123,7 +147,7 @@ impl DamageTracker {
             buffer_count,
             last_generation: None,
             history: VecDeque::with_capacity(buffer_count),
-            overlay: None,
+            overlay: Vec::new(),
         }
     }
 
@@ -133,7 +157,7 @@ impl DamageTracker {
     pub fn invalidate(&mut self) {
         self.last_generation = None;
         self.history.clear();
-        self.overlay = None;
+        self.overlay.clear();
     }
 
     pub fn plan(&self, frame: &FrameDamage) -> FramePlan {
@@ -143,28 +167,24 @@ impl DamageTracker {
             right: frame.width,
             bottom: frame.height,
         };
-        let pulses = frame
-            .pulses
-            .iter()
-            .fold(DamageRect::default(), |damage, pulse| damage.union(*pulse));
-        let changed = match self.last_generation {
-            Some(last) if last == frame.generation => Some(pulses),
-            Some(last) if last.wrapping_add(1) == frame.generation => frame.scene.map(|scene| {
+        let scene = match self.last_generation {
+            Some(last) if last == frame.generation => Some(&[][..]),
+            Some(last) if last.wrapping_add(1) == frame.generation => frame.scene,
+            _ => None,
+        };
+        let changed = scene.map(|scene| {
+            settle(
                 scene
                     .iter()
-                    .fold(pulses, |damage, rect| damage.union(*rect))
-            }),
-            _ => None,
-        }
-        .map(|changed| {
-            spread(
-                changed.union(self.overlay.unwrap_or_default()),
+                    .chain(frame.pulses)
+                    .chain(&self.overlay)
+                    .copied(),
                 frame.filters,
+                target,
             )
-            .intersect(target)
         });
 
-        let repaint = match changed {
+        let repaint = match &changed {
             None => Repaint::Full,
             Some(changed) if changed.is_empty() => Repaint::Nothing,
             // The back buffer has not seen enough presents for its age to be known.
@@ -172,12 +192,15 @@ impl DamageTracker {
             Some(changed) => self
                 .history
                 .iter()
-                .try_fold(changed, |stale, earlier| {
-                    earlier.map(|earlier| stale.union(earlier))
+                .try_fold(changed.clone(), |mut stale, earlier| {
+                    stale.extend(earlier.as_ref()?);
+                    Some(stale)
                 })
-                .map(|stale| spread(stale, frame.filters).intersect(target))
+                .map(|stale| settle(stale, frame.filters, target))
                 // Past half the target, scissoring saves little and one full pass is simpler.
-                .filter(|stale| stale.area() * 2 <= target.area())
+                .filter(|stale| {
+                    stale.iter().map(DamageRect::area).sum::<i64>() * 2 <= target.area()
+                })
                 .map_or(Repaint::Full, Repaint::Partial),
         };
         FramePlan {
@@ -188,26 +211,75 @@ impl DamageTracker {
     }
 
     /// Records that `plan` reached the screen.
-    pub fn presented(&mut self, plan: &FramePlan) {
+    pub fn presented(&mut self, plan: FramePlan) {
         self.last_generation = Some(plan.generation);
         if plan.repaint == Repaint::Nothing {
             return;
         }
-        self.overlay = None;
+        self.overlay.clear();
         self.history.push_back(plan.changed);
         while self.history.len() >= self.buffer_count.max(1) {
             self.history.pop_front();
         }
     }
 
-    /// Records a debug tint drawn over `rect` of the last present. Those pixels differ from the
+    /// Records a debug tint drawn over `rects` of the last present. Those pixels differ from the
     /// scene, so the next present paints them over and later ones treat them as changed.
-    pub fn overlaid(&mut self, rect: DamageRect) {
+    pub fn overlaid(&mut self, rects: &[DamageRect]) {
         if let Some(Some(last)) = self.history.back_mut() {
-            *last = last.union(rect);
+            last.extend(rects);
         }
-        self.overlay = Some(rect);
+        self.overlay = rects.to_vec();
     }
+}
+
+/// Reduces `damage` to at most [`MAX_DAMAGE_RECTS`] disjoint rectangles within `target`, ordered
+/// top to bottom. Every filter footprint a rectangle touches lies wholly inside it, and
+/// rectangles that are cheaper to repaint together merge.
+fn settle(
+    damage: impl IntoIterator<Item = DamageRect>,
+    filters: &[DamageRect],
+    target: DamageRect,
+) -> Vec<DamageRect> {
+    let mut pending: Vec<DamageRect> = damage.into_iter().collect();
+    let mut settled: Vec<DamageRect> = Vec::with_capacity(MAX_DAMAGE_RECTS + 1);
+    // Each step drops a rectangle, settles one, or merges two into one that goes back through
+    // spreading, so the loop ends.
+    while let Some(rect) = pending.pop() {
+        let rect = spread(rect, filters).intersect(target);
+        if rect.is_empty() {
+            continue;
+        }
+        if let Some(ix) = settled.iter().position(|other| other.merges_with(&rect)) {
+            pending.push(settled.swap_remove(ix).union(rect));
+            continue;
+        }
+        settled.push(rect);
+        if settled.len() > MAX_DAMAGE_RECTS {
+            let (a, b) = cheapest_pair(&settled);
+            let second = settled.swap_remove(b.max(a));
+            let first = settled.swap_remove(b.min(a));
+            pending.push(first.union(second));
+        }
+    }
+    settled.sort_unstable();
+    settled
+}
+
+/// The indices of the two rectangles whose merge repaints the fewest extra pixels.
+fn cheapest_pair(rects: &[DamageRect]) -> (usize, usize) {
+    let mut cheapest = (0, 1);
+    let mut cost = i64::MAX;
+    for a in 0..rects.len() {
+        for b in a + 1..rects.len() {
+            let merge_cost = rects[a].merge_cost(&rects[b]);
+            if merge_cost < cost {
+                cheapest = (a, b);
+                cost = merge_cost;
+            }
+        }
+    }
+    cheapest
 }
 
 /// Grows `damage` until every filter footprint it touches lies wholly inside it.
@@ -242,6 +314,12 @@ mod tests {
         }
     }
 
+    fn partial(rects: &[DamageRect]) -> Repaint {
+        let mut rects = rects.to_vec();
+        rects.sort_unstable();
+        Repaint::Partial(rects)
+    }
+
     fn frame<'a>(
         generation: u64,
         scene: Option<&'a [DamageRect]>,
@@ -263,15 +341,16 @@ mod tests {
         for _ in 0..BUFFERS {
             let plan = tracker.plan(&frame(1, None, &[pulse]));
             assert_eq!(plan.repaint, Repaint::Full);
-            tracker.presented(&plan);
+            tracker.presented(plan);
         }
         tracker
     }
 
     fn present(tracker: &mut DamageTracker, frame: &FrameDamage) -> Repaint {
         let plan = tracker.plan(frame);
-        tracker.presented(&plan);
-        plan.repaint
+        let repaint = plan.repaint.clone();
+        tracker.presented(plan);
+        repaint
     }
 
     #[test]
@@ -305,20 +384,20 @@ mod tests {
         );
         assert_eq!(
             present(&mut tracker, &frame(1, None, &[pulse])),
-            Repaint::Partial(pulse)
+            partial(&[pulse])
         );
     }
 
     #[test]
     fn a_pulse_only_present_repaints_the_pulses() {
-        let pulses = [rect(10, 10, 20, 20), rect(30, 10, 40, 20)];
+        let pulses = [rect(10, 10, 20, 20), rect(60, 10, 70, 20)];
         let mut tracker = settled(pulses[0]);
         // The scene damage is ignored: it describes the step into this generation, which
         // earlier presents already showed.
         let scene = [rect(0, 0, 90, 90)];
         assert_eq!(
             present(&mut tracker, &frame(1, Some(&scene), &pulses)),
-            Repaint::Partial(rect(10, 10, 40, 20))
+            partial(&pulses)
         );
     }
 
@@ -342,7 +421,7 @@ mod tests {
         let moved = rect(50, 50, 60, 60);
         assert_eq!(
             present(&mut tracker, &frame(2, Some(&[moved]), &[])),
-            Repaint::Partial(pulse.union(moved))
+            partial(&[pulse, moved])
         );
         // Without a flip the history must not age.
         assert_eq!(
@@ -351,7 +430,7 @@ mod tests {
         );
         assert_eq!(
             present(&mut tracker, &frame(3, Some(&[]), &[pulse])),
-            Repaint::Partial(pulse.union(moved))
+            partial(&[pulse, moved])
         );
     }
 
@@ -359,10 +438,11 @@ mod tests {
     fn the_next_generation_repaints_scene_damage_and_pulses() {
         let pulse = rect(10, 10, 20, 20);
         let mut tracker = settled(pulse);
-        let scene = [rect(50, 50, 60, 60), rect(70, 50, 80, 55)];
+        let scene = [rect(50, 50, 60, 60), rect(62, 50, 72, 55)];
+        // The two scene rectangles nearly touch and merge; the pulse stays apart.
         assert_eq!(
             present(&mut tracker, &frame(2, Some(&scene), &[pulse])),
-            Repaint::Partial(rect(10, 10, 80, 60))
+            partial(&[pulse, rect(50, 50, 72, 60)])
         );
     }
 
@@ -389,28 +469,102 @@ mod tests {
     }
 
     #[test]
+    fn far_apart_damage_stays_apart() {
+        // A sidebar dot and a status line across the window: their bounding box is most of it.
+        let dot = rect(4, 10, 10, 16);
+        let status = rect(40, 90, 98, 96);
+        let mut tracker = settled(dot);
+        assert_eq!(
+            present(&mut tracker, &frame(2, Some(&[status]), &[dot])),
+            partial(&[dot, status])
+        );
+    }
+
+    #[test]
+    fn overlapping_or_adjoining_damage_merges() {
+        let tracker = settled(rect(0, 0, 1, 1));
+        let plan = tracker.plan(&frame(
+            2,
+            Some(&[
+                rect(10, 10, 30, 30),
+                rect(20, 20, 40, 40),
+                rect(43, 20, 50, 40),
+                rect(70, 70, 80, 80),
+            ]),
+            &[],
+        ));
+        // The first two overlap and the third lies within the merge gap; the union of the
+        // settled pulse and the first is far larger than both, so it stays apart.
+        assert_eq!(
+            plan.repaint,
+            partial(&[rect(0, 0, 1, 1), rect(10, 10, 50, 40), rect(70, 70, 80, 80)])
+        );
+    }
+
+    #[test]
+    fn damage_whose_union_is_barely_larger_merges() {
+        let tracker = settled(rect(0, 0, 1, 1));
+        // Ten pixels apart, but stacked: the union adds only the strip between them.
+        let plan = tracker.plan(&frame(
+            2,
+            Some(&[rect(20, 20, 80, 40), rect(20, 50, 80, 70)]),
+            &[],
+        ));
+        assert_eq!(
+            plan.repaint,
+            partial(&[rect(0, 0, 1, 1), rect(20, 20, 80, 70)])
+        );
+    }
+
+    #[test]
+    fn beyond_the_cap_the_cheapest_pairs_merge() {
+        let tracker = settled(rect(0, 0, 1, 1));
+        // Ten dots in a row, far apart, plus the settled pulse.
+        let dots: Vec<_> = (0..10)
+            .map(|ix| rect(ix * 10, 50, ix * 10 + 2, 52))
+            .collect();
+        let plan = tracker.plan(&frame(2, Some(&dots), &[]));
+        let Repaint::Partial(rects) = plan.repaint else {
+            panic!("expected a partial repaint");
+        };
+        assert_eq!(rects.len(), MAX_DAMAGE_RECTS);
+        for dot in &dots {
+            assert!(
+                rects.iter().any(|rect| rect.intersect(*dot) == *dot),
+                "{dot:?} lost"
+            );
+        }
+        for (ix, a) in rects.iter().enumerate() {
+            for b in &rects[ix + 1..] {
+                assert!(!a.intersects(b), "{a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
     fn each_present_repaints_what_its_back_buffer_missed() {
-        let mut tracker = settled(rect(0, 0, 1, 1));
+        let start = rect(0, 0, 1, 1);
+        let mut tracker = settled(start);
         let a = rect(10, 10, 20, 20);
         let b = rect(30, 30, 40, 40);
         let c = rect(50, 50, 60, 60);
         let d = rect(70, 70, 80, 80);
-        // Buffer ages: each back buffer last showed the frame three presents ago.
+        // Each back buffer last showed the frame three presents ago.
         assert_eq!(
             present(&mut tracker, &frame(2, Some(&[a]), &[])),
-            Repaint::Partial(rect(0, 0, 20, 20))
+            partial(&[start, a])
         );
         assert_eq!(
             present(&mut tracker, &frame(3, Some(&[b]), &[])),
-            Repaint::Partial(rect(0, 0, 40, 40))
+            partial(&[start, a, b])
         );
         assert_eq!(
             present(&mut tracker, &frame(4, Some(&[c]), &[])),
-            Repaint::Partial(rect(10, 10, 60, 60))
+            partial(&[a, b, c])
         );
         assert_eq!(
             present(&mut tracker, &frame(5, Some(&[d]), &[])),
-            Repaint::Partial(rect(30, 30, 80, 80))
+            partial(&[b, c, d])
         );
     }
 
@@ -432,7 +586,7 @@ mod tests {
         );
         assert_eq!(
             present(&mut tracker, &frame(2, None, &[pulse])),
-            Repaint::Partial(pulse)
+            partial(&[pulse])
         );
     }
 
@@ -449,7 +603,7 @@ mod tests {
         }
         assert_eq!(
             present(&mut tracker, &frame(1, None, &[pulse])),
-            Repaint::Partial(pulse)
+            partial(&[pulse])
         );
     }
 
@@ -457,11 +611,15 @@ mod tests {
     fn damage_over_most_of_the_target_repaints_everything() {
         let mut tracker = settled(rect(0, 0, 1, 1));
         assert_eq!(
-            present(&mut tracker, &frame(2, Some(&[rect(0, 0, 100, 50)]), &[])),
-            Repaint::Partial(rect(0, 0, 100, 50))
+            present(&mut tracker, &frame(2, Some(&[rect(0, 0, 100, 49)]), &[])),
+            partial(&[rect(0, 0, 100, 49)])
         );
+        // Separate rectangles count by their total area.
         assert_eq!(
-            present(&mut tracker, &frame(3, Some(&[rect(0, 0, 100, 51)]), &[])),
+            present(
+                &mut tracker,
+                &frame(3, Some(&[rect(0, 0, 100, 30), rect(0, 70, 100, 92)]), &[])
+            ),
             Repaint::Full
         );
     }
@@ -471,7 +629,7 @@ mod tests {
         let mut tracker = settled(rect(0, 0, 1, 1));
         assert_eq!(
             present(&mut tracker, &frame(2, Some(&[rect(90, -5, 120, 10)]), &[])),
-            Repaint::Partial(rect(0, 0, 100, 10))
+            partial(&[rect(0, 0, 1, 1), rect(90, 0, 100, 10)])
         );
         // Damage wholly off the target changes nothing visible.
         let mut tracker = settled(rect(0, 0, 1, 1));
@@ -495,14 +653,27 @@ mod tests {
             ..frame(1, None, &[pulse])
         });
         // The first footprint overlaps the pulse, the second the first; the third stays clear.
-        assert_eq!(plan.repaint, Repaint::Partial(rect(10, 10, 40, 40)));
+        assert_eq!(plan.repaint, partial(&[rect(10, 10, 40, 40)]));
 
         let plan = tracker.plan(&FrameDamage {
-            filters: &[rect(12, 10, 30, 30)],
+            filters: &[rect(30, 10, 40, 30)],
             ..frame(1, None, &[pulse])
         });
-        // Touching edges share no pixel.
-        assert_eq!(plan.repaint, Repaint::Partial(pulse));
+        assert_eq!(plan.repaint, partial(&[pulse]));
+    }
+
+    #[test]
+    fn rectangles_grown_into_each_other_by_a_filter_merge() {
+        let tracker = settled(rect(0, 0, 1, 1));
+        let filter = rect(30, 30, 70, 70);
+        let plan = tracker.plan(&FrameDamage {
+            filters: &[filter],
+            ..frame(2, Some(&[rect(25, 25, 32, 32), rect(68, 68, 75, 75)]), &[])
+        });
+        assert_eq!(
+            plan.repaint,
+            partial(&[rect(0, 0, 1, 1), rect(25, 25, 75, 75)])
+        );
     }
 
     #[test]
@@ -513,34 +684,37 @@ mod tests {
             filters: &[rect(40, 40, 60, 60)],
             ..frame(2, Some(&[rect(90, 90, 91, 91)]), &[])
         });
-        assert_eq!(plan.repaint, Repaint::Partial(rect(40, 40, 91, 91)));
+        assert_eq!(
+            plan.repaint,
+            partial(&[rect(40, 40, 60, 60), rect(90, 90, 91, 91)])
+        );
     }
 
     #[test]
     fn a_debug_tint_is_painted_over_by_the_next_presents() {
         let pulse = rect(10, 10, 20, 20);
         let mut tracker = settled(pulse);
-        let tint = rect(0, 0, 30, 30);
+        let tint = [rect(70, 70, 80, 80)];
         let plan = tracker.plan(&frame(1, None, &[pulse]));
-        tracker.presented(&plan);
-        tracker.overlaid(tint);
+        tracker.presented(plan);
+        tracker.overlaid(&tint);
         // The next present removes the tint even though only the pulse changed.
         assert_eq!(
             present(&mut tracker, &frame(1, None, &[pulse])),
-            Repaint::Partial(tint)
+            partial(&[pulse, tint[0]])
         );
-        // The buffer that showed the tint still needs it painted over when it comes back.
+        // The buffers that showed or missed the tint still need it painted over.
         assert_eq!(
             present(&mut tracker, &frame(1, None, &[pulse])),
-            Repaint::Partial(tint)
-        );
-        assert_eq!(
-            present(&mut tracker, &frame(1, None, &[pulse])),
-            Repaint::Partial(tint)
+            partial(&[pulse, tint[0]])
         );
         assert_eq!(
             present(&mut tracker, &frame(1, None, &[pulse])),
-            Repaint::Partial(pulse)
+            partial(&[pulse, tint[0]])
+        );
+        assert_eq!(
+            present(&mut tracker, &frame(1, None, &[pulse])),
+            partial(&[pulse])
         );
     }
 }

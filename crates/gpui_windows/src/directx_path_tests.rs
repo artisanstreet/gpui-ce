@@ -1,6 +1,6 @@
 use super::{
     BUFFER_COUNT, DamageSources, DamageTracker, DirectXAtlas, DirectXGlobalElements,
-    DirectXRenderPipelines, DirectXRenderer, DirectXResources, FontInfo, Repaint,
+    DirectXRenderPipelines, DirectXRenderer, DirectXResources, FontInfo,
     resource_tests::test_devices,
 };
 use anyhow::{Context, Result};
@@ -50,12 +50,12 @@ fn render_paths(
     origin: [u32; 2],
     size: [u32; 2],
 ) -> Result<Vec<u8>> {
-    renderer.pre_draw(&[0.0; 4], 0, Repaint::Full)?;
+    renderer.pre_draw(&[0.0; 4], 0, None)?;
     let devices = renderer.devices.as_ref().unwrap();
     let resources = renderer.resources.as_mut().unwrap();
     resources.paths = None;
     resources.ensure_paths(&devices.device, Some(size))?;
-    renderer.draw_paths_to_intermediate_at(paths, origin, Repaint::Full)?;
+    renderer.draw_paths_to_intermediate_at(paths, origin, None)?;
     renderer.draw_paths_from_intermediate(paths)?;
     let devices = renderer.devices.as_ref().unwrap();
     let resources = renderer.resources.as_ref().unwrap();

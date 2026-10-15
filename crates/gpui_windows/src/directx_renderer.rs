@@ -60,13 +60,73 @@ fn damage_rect(bounds: Bounds<ScaledPixels>) -> DamageRect {
     )
 }
 
-/// Whether `repaint` covers any pixel of `rect`.
-fn repaints(repaint: Repaint, rect: DamageRect) -> bool {
-    match repaint {
-        Repaint::Partial(damage) => damage.intersects(&rect),
-        Repaint::Nothing => false,
-        Repaint::Full => true,
+/// Whether a pass clipped to `clip` (`None`: the whole target) covers any pixel of `rect`.
+fn repaints(clip: Option<DamageRect>, rect: DamageRect) -> bool {
+    clip.is_none_or(|clip| clip.intersects(&rect))
+}
+
+/// The pixels a batch can touch, for skipping it in passes that miss them; `None` for batches
+/// every pass must run (blur filters and filter-group boundaries check their own footprints).
+/// Every primitive's shader clips it to its content mask.
+fn batch_bounds(scene: &Scene, batch: PrimitiveBatch) -> Option<DamageRect> {
+    fn visible(bounds: Bounds<ScaledPixels>, mask: &ContentMask<ScaledPixels>) -> DamageRect {
+        damage_rect(bounds.intersect(&mask.bounds))
     }
+    fn union(rects: impl Iterator<Item = DamageRect>) -> DamageRect {
+        rects.fold(DamageRect::default(), DamageRect::union)
+    }
+    Some(match batch {
+        PrimitiveBatch::Shadows(range) => union(scene.shadows[range].iter().map(|shadow| {
+            // Outer shadows reach past their bounds by the gaussian tail; inset ones fill
+            // their element.
+            let reach = shadow
+                .bounds
+                .dilate(ScaledPixels(3.0 * shadow.blur_radius.0))
+                .union(&shadow.element_bounds);
+            visible(reach, &shadow.content_mask)
+        })),
+        PrimitiveBatch::Quads(range) => union(
+            scene.quads[range]
+                .iter()
+                .map(|quad| visible(quad.bounds, &quad.content_mask)),
+        ),
+        PrimitiveBatch::Paths(range) => union(
+            scene.paths[range]
+                .iter()
+                .map(|path| damage_rect(path.clipped_bounds())),
+        ),
+        PrimitiveBatch::Underlines(range) => union(
+            scene.underlines[range]
+                .iter()
+                .map(|underline| visible(underline.bounds, &underline.content_mask)),
+        ),
+        PrimitiveBatch::MonochromeSprites { range, .. } => union(
+            scene.monochrome_sprites[range]
+                .iter()
+                .map(|sprite| visible(sprite.bounds, &sprite.content_mask)),
+        ),
+        PrimitiveBatch::SubpixelSprites { range, .. } => union(
+            scene.subpixel_sprites[range]
+                .iter()
+                .map(|sprite| visible(sprite.bounds, &sprite.content_mask)),
+        ),
+        PrimitiveBatch::PolychromeSprites { range, .. } => union(
+            scene.polychrome_sprites[range]
+                .iter()
+                .map(|sprite| visible(sprite.bounds, &sprite.content_mask)),
+        ),
+        PrimitiveBatch::Surfaces(range) => union(
+            scene.surfaces[range]
+                .iter()
+                .map(|surface| visible(surface.bounds, &surface.content_mask)),
+        ),
+        PrimitiveBatch::Meshes(range) => union(
+            scene.meshes[range]
+                .iter()
+                .map(|mesh| visible(mesh.bounds, &mesh.content_mask)),
+        ),
+        PrimitiveBatch::BackdropFilters(_) | PrimitiveBatch::FilterBoundary(_) => return None,
+    })
 }
 
 fn device_rect(rect: DamageRect) -> RECT {
@@ -159,6 +219,8 @@ struct DamageSources {
     scene: Option<Vec<DamageRect>>,
     pulses: Vec<DamageRect>,
     filters: Vec<DamageRect>,
+    /// [`batch_bounds`] of each of the scene's batches, in order.
+    batches: Vec<Option<DamageRect>>,
 }
 
 impl DamageSources {
@@ -193,6 +255,9 @@ impl DamageSources {
                 .filter(|boundary| boundary.is_start)
                 .map(|boundary| blur_footprint(boundary.bounds, &boundary.filters)),
         );
+        self.batches.clear();
+        self.batches
+            .extend(scene.batches().map(|batch| batch_bounds(scene, batch)));
     }
 }
 
@@ -502,11 +567,12 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
+    /// Starts a pass over the scene clipped to `clip` (`None`: the whole target).
     fn pre_draw(
         &self,
         clear_color: &[f32; 4],
         pulse_clock_ms: u32,
-        repaint: Repaint,
+        clip: Option<DamageRect>,
     ) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
@@ -533,14 +599,14 @@ impl DirectXRenderer {
                 .as_ref()
                 .context("missing render target view")?,
             clear_color,
-            repaint,
+            clip,
         )?;
         unsafe {
-            // Every scene draw is scissored to the repainted region. Passes with their own
+            // Every scene draw is scissored to the pass's region. Passes with their own
             // scissor (path rasterization, blur) restore this state afterwards.
-            if let Repaint::Partial(rect) = repaint {
+            if let Some(clip) = clip {
                 device_context.RSSetState(&self.pipelines.scissor_rasterizer);
-                device_context.RSSetScissorRects(Some(&[device_rect(rect)]));
+                device_context.RSSetScissorRects(Some(&[device_rect(clip)]));
             } else {
                 device_context.RSSetState(&self.pipelines.rasterizer);
             }
@@ -557,21 +623,22 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Clears `target` to `color` within `repaint`, leaving retained pixels outside it alone.
+    /// Clears `target` to `color` within `clip` (`None`: all of it), leaving retained pixels
+    /// outside it alone.
     fn clear_target(
         &self,
         target: &ID3D11RenderTargetView,
         color: &[f32; 4],
-        repaint: Repaint,
+        clip: Option<DamageRect>,
     ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
         unsafe {
-            if let Repaint::Partial(rect) = repaint {
+            if let Some(clip) = clip {
                 devices
                     .region_clear
                     .as_ref()
                     .context("partial redraw without ClearView")?
-                    .ClearView(target, color, Some(&[device_rect(rect)]));
+                    .ClearView(target, color, Some(&[device_rect(clip)]));
             } else {
                 devices.device_context.ClearRenderTargetView(target, color);
             }
@@ -579,21 +646,21 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Presents the back buffer, telling DWM which region changed on a partial repaint.
+    /// Presents the back buffer, telling DWM which regions changed on a partial repaint.
     /// Returns false when DXGI reported a status rather than plain success (an occluded window,
     /// say): the buffers may not have flipped, so their contents are no longer known.
-    fn present(&mut self, repaint: Repaint) -> Result<bool> {
+    fn present(&mut self, repaint: &Repaint) -> Result<bool> {
         let swap_chain = &self
             .resources
             .as_ref()
             .context("resources missing")?
             .swap_chain;
         let result = match repaint {
-            Repaint::Partial(rect) => {
-                let mut dirty = device_rect(rect);
+            Repaint::Partial(rects) => {
+                let mut dirty: Vec<RECT> = rects.iter().copied().map(device_rect).collect();
                 let parameters = DXGI_PRESENT_PARAMETERS {
-                    DirtyRectsCount: 1,
-                    pDirtyRects: &mut dirty,
+                    DirtyRectsCount: dirty.len() as u32,
+                    pDirtyRects: dirty.as_mut_ptr(),
                     ..Default::default()
                 };
                 unsafe { swap_chain.Present1(0, DXGI_PRESENT(0), &parameters) }
@@ -693,7 +760,7 @@ impl DirectXRenderer {
             return Ok(());
         }
         let plan = self.plan_frame(scene, background_appearance);
-        let presented = match plan.repaint {
+        let presented = match &plan.repaint {
             Repaint::Nothing => Ok(true),
             repaint => self
                 .render(scene, background_appearance, repaint)
@@ -701,11 +768,15 @@ impl DirectXRenderer {
         };
         match presented {
             Ok(true) => {
-                self.damage.presented(&plan);
-                if let Repaint::Partial(rect) = plan.repaint
-                    && self.pipelines.damage_overlay.is_some()
-                {
-                    self.damage.overlaid(rect);
+                let tinted = match &plan.repaint {
+                    Repaint::Partial(rects) if self.pipelines.damage_overlay.is_some() => {
+                        Some(rects.clone())
+                    }
+                    _ => None,
+                };
+                self.damage.presented(plan);
+                if let Some(rects) = tinted {
+                    self.damage.overlaid(&rects);
                 }
                 Ok(())
             }
@@ -759,13 +830,13 @@ impl DirectXRenderer {
     /// primitive batch of `scene` into it, without presenting. Shared by
     /// [`draw`](Self::draw) (which then presents) and
     /// [`render_to_image`](Self::render_to_image) (which reads the target back
-    /// instead), so the two cannot drift. A partial `repaint` touches only its
-    /// rectangle of every target and keeps the pixels outside it.
+    /// instead), so the two cannot drift. A partial `repaint` runs one pass per
+    /// rectangle and keeps every pixel outside them.
     fn render(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
-        repaint: Repaint,
+        repaint: &Repaint,
     ) -> Result<()> {
         // A pulse-only present re-presents the uploaded scene.
         let reuse_uploads = self.uploaded_generation.take() == Some(scene.generation);
@@ -781,14 +852,6 @@ impl DirectXRenderer {
                 (self.width, self.height),
             )?;
         }
-        self.pre_draw(
-            &match background_appearance {
-                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-                _ => [0.0f32; 4],
-            },
-            scene.pulse_clock_ms,
-            repaint,
-        )?;
         if !reuse_uploads {
             self.upload_scene_buffers(scene)?;
         }
@@ -834,6 +897,55 @@ impl DirectXRenderer {
             resources.blur = None;
         }
 
+        // D3D11 scissors with rect 0 unless a geometry shader picks another viewport, so each
+        // rectangle of a partial repaint is its own pass over the batches that can touch it.
+        let clips = match repaint {
+            Repaint::Partial(rects) => {
+                self.damage_sources.update(scene);
+                rects.iter().copied().map(Some).collect()
+            }
+            Repaint::Nothing | Repaint::Full => vec![None],
+        };
+        let batch_bounds = std::mem::take(&mut self.damage_sources.batches);
+        let result = clips.into_iter().try_for_each(|clip| {
+            self.render_pass(
+                scene,
+                background_appearance,
+                clip,
+                use_offscreen,
+                &batch_bounds,
+            )
+        });
+        self.damage_sources.batches = batch_bounds;
+        self.active_render_target = None;
+        result?;
+        if let Some(blur) = self.resources.as_mut().and_then(|r| r.blur.as_mut()) {
+            // Every blur pass and the final scene blit are now encoded. D3D11
+            // retains resource dependencies of any pending GPU commands.
+            blur.release_unused_groups(content_depth);
+        }
+        Ok(())
+    }
+
+    /// Encodes the batches of `scene` that can touch `clip` (`None`: the whole target), clipped
+    /// to it. `batch_bounds` holds [`batch_bounds`] per batch when `clip` is set.
+    fn render_pass(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+        clip: Option<DamageRect>,
+        use_offscreen: bool,
+        batch_bounds: &[Option<DamageRect>],
+    ) -> Result<()> {
+        self.pre_draw(
+            &match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+            scene.pulse_clock_ms,
+            clip,
+        )?;
+
         // Clone the views we need (AddRef) so the loop can rebind render targets without holding a
         // borrow of `self` across the `&mut self` draw_* calls.
         let (scene_rtv, scene_srv, group_rtvs, group_srvs, swapchain_rtv) = {
@@ -865,7 +977,7 @@ impl DirectXRenderer {
 
         if use_offscreen {
             if let Some(rtv) = scene_rtv.as_ref() {
-                self.clear_target(rtv, &[0.0; 4], repaint)?;
+                self.clear_target(rtv, &[0.0; 4], clip)?;
             }
             unsafe {
                 ctx.OMSetRenderTargets(Some(slice::from_ref(&scene_rtv)), None);
@@ -894,7 +1006,12 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        for batch in scene.batches() {
+        for (ix, batch) in scene.batches().enumerate() {
+            if let (Some(clip), Some(Some(bounds))) = (clip, batch_bounds.get(ix))
+                && !clip.intersects(bounds)
+            {
+                continue;
+            }
             let _annotation = annotation
                 .as_ref()
                 .map(|annotation| Annotation::new(annotation, HSTRING::from(batch.label())));
@@ -905,9 +1022,9 @@ impl DirectXRenderer {
                     let paths = &scene.paths[range];
                     if paths
                         .iter()
-                        .any(|path| repaints(repaint, damage_rect(path.clipped_bounds())))
+                        .any(|path| repaints(clip, damage_rect(path.clipped_bounds())))
                     {
-                        self.draw_paths_to_intermediate(paths, repaint)?;
+                        self.draw_paths_to_intermediate(paths, clip)?;
                         self.draw_paths_from_intermediate(paths)
                     } else {
                         Ok(())
@@ -931,7 +1048,7 @@ impl DirectXRenderer {
                 PrimitiveBatch::BackdropFilters(range) => {
                     let result = (|| {
                         for filter in &scene.backdrop_filters[range] {
-                            if !repaints(repaint, blur_footprint(filter.bounds, &filter.filters)) {
+                            if !repaints(clip, blur_footprint(filter.bounds, &filter.filters)) {
                                 continue;
                             }
                             self.dx_blur_and_composite(
@@ -967,7 +1084,7 @@ impl DirectXRenderer {
                             current_srv = group_srvs[depth].clone();
                             self.active_render_target = current_rtv.clone();
                             if let Some(rtv) = current_rtv.as_ref() {
-                                self.clear_target(rtv, &[0.0; 4], repaint)?;
+                                self.clear_target(rtv, &[0.0; 4], clip)?;
                             }
                             unsafe {
                                 ctx.OMSetRenderTargets(Some(slice::from_ref(&current_rtv)), None);
@@ -978,7 +1095,7 @@ impl DirectXRenderer {
                         Ok(())
                     } else if let Some((parent_rtv, parent_srv, isolated)) = filter_stack.pop() {
                         let result = if isolated
-                            && repaints(repaint, blur_footprint(boundary.bounds, &boundary.filters))
+                            && repaints(clip, blur_footprint(boundary.bounds, &boundary.filters))
                         {
                             self.dx_blur_and_composite(
                                 &current_srv,
@@ -1024,14 +1141,8 @@ impl DirectXRenderer {
         if use_offscreen {
             self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
-        if let Repaint::Partial(rect) = repaint {
-            self.draw_damage_overlay(rect, &swapchain_rtv, scene.pulse_clock_ms)?;
-        }
-        self.active_render_target = None;
-        if let Some(blur) = self.resources.as_mut().and_then(|r| r.blur.as_mut()) {
-            // Every blur pass and the final scene blit are now encoded. D3D11
-            // retains resource dependencies of any pending GPU commands.
-            blur.release_unused_groups(content_depth);
+        if let Some(clip) = clip {
+            self.draw_damage_overlay(clip, &swapchain_rtv, scene.pulse_clock_ms)?;
         }
         Ok(())
     }
@@ -1058,7 +1169,7 @@ impl DirectXRenderer {
         // trust the back buffer this overwrites.
         self.damage.invalidate();
         self.uploaded_generation = None;
-        let rendered = self.render(scene, background_appearance, Repaint::Full);
+        let rendered = self.render(scene, background_appearance, &Repaint::Full);
         self.uploaded_generation = None;
         rendered?;
         self.read_render_target()
@@ -1262,19 +1373,19 @@ impl DirectXRenderer {
     fn draw_paths_to_intermediate(
         &mut self,
         paths: &[Path<ScaledPixels>],
-        repaint: Repaint,
+        clip: Option<DamageRect>,
     ) -> Result<()> {
         let [x, y, _, _] = path_batch_bounds(paths, [self.width, self.height]);
-        self.draw_paths_to_intermediate_at(paths, [x, y], repaint)
+        self.draw_paths_to_intermediate_at(paths, [x, y], clip)
     }
 
-    /// Rasterizes the paths of `paths` that `repaint` touches; the rest would only be copied
-    /// outside the scissor.
+    /// Rasterizes the paths of `paths` that touch `clip`; the rest would only be copied outside
+    /// the scissor.
     fn draw_paths_to_intermediate_at(
         &mut self,
         paths: &[Path<ScaledPixels>],
         origin: [u32; 2],
-        repaint: Repaint,
+        clip: Option<DamageRect>,
     ) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
@@ -1329,7 +1440,7 @@ impl DirectXRenderer {
 
         for path in paths
             .iter()
-            .filter(|path| repaints(repaint, damage_rect(path.clipped_bounds())))
+            .filter(|path| repaints(clip, damage_rect(path.clipped_bounds())))
         {
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationSprite {
                 xy_position: v.xy_position,
