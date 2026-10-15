@@ -375,7 +375,7 @@ impl DirectXRenderer {
         self.atlas.clone()
     }
 
-    fn pre_draw(&self, clear_color: &[f32; 4]) -> Result<()> {
+    fn pre_draw(&self, clear_color: &[f32; 4], pulse_clock_ms: u32) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
         let device_context = &self
             .devices
@@ -391,7 +391,8 @@ impl DirectXRenderer {
                 grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
                 subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
                 is_bgr: self.font_info.is_bgr as u32,
-                _pad: [0; 3],
+                pulse_clock_ms,
+                _pad: [0; 2],
             }],
         )?;
         unsafe {
@@ -539,10 +540,13 @@ impl DirectXRenderer {
                 (self.width, self.height),
             )?;
         }
-        self.pre_draw(&match background_appearance {
-            WindowBackgroundAppearance::Opaque => [1.0f32; 4],
-            _ => [0.0f32; 4],
-        })?;
+        self.pre_draw(
+            &match background_appearance {
+                WindowBackgroundAppearance::Opaque => [1.0f32; 4],
+                _ => [0.0f32; 4],
+            },
+            scene.pulse_clock_ms,
+        )?;
         self.upload_scene_buffers(scene)?;
         {
             let devices = self.devices.as_ref().context("devices missing")?;
@@ -1791,7 +1795,8 @@ struct GlobalParams {
     grayscale_enhanced_contrast: f32,
     subpixel_enhanced_contrast: f32,
     is_bgr: u32,
-    _pad: [u32; 3],
+    pulse_clock_ms: u32,
+    _pad: [u32; 2],
 }
 
 /// Mirrors the `BlurParams` cbuffer (register b1) in `shaders.hlsl`. 80 bytes (a multiple of 16,

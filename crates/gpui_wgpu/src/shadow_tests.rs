@@ -72,7 +72,7 @@ fn outer_shadows_do_not_fill_translucent_panels() -> Result<()> {
         contents: bytemuck::bytes_of(&GlobalParams {
             viewport_size: [64.0, 64.0],
             premultiplied_alpha: 0,
-            pad: 0,
+            pulse_clock_ms: 0,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });

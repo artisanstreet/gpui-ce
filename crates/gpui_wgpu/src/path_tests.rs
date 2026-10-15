@@ -183,7 +183,7 @@ fn globals(
         contents: bytemuck::bytes_of(&GlobalParams {
             viewport_size: dimensions.map(|v| v as f32),
             premultiplied_alpha: 0,
-            pad: 0,
+            pulse_clock_ms: 0,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });

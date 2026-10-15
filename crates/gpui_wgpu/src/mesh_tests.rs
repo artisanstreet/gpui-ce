@@ -181,7 +181,7 @@ fn render_with_scratch_mode(
         contents: bytemuck::bytes_of(&GlobalParams {
             viewport_size: [WIDTH as f32, HEIGHT as f32],
             premultiplied_alpha: 1,
-            pad: 0,
+            pulse_clock_ms: 0,
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });

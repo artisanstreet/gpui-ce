@@ -56,6 +56,10 @@ pub struct Scene {
     pub meshes: Vec<PaintMesh>,
     pub backdrop_filters: Vec<BackdropFilter>,
     pub filter_boundaries: Vec<FilterBoundary>,
+    /// The [`pulse_clock_ms`] reading renderers evaluate [`QuadPulse`]s at.
+    /// The window stamps it on every present, so a frame that only advances
+    /// pulses re-presents this scene without rebuilding it.
+    pub pulse_clock_ms: u32,
 }
 
 #[expect(missing_docs)]
@@ -897,6 +901,39 @@ pub struct Quad {
     pub border_color: SceneHsla,
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
+    pub pulse: QuadPulse,
+}
+
+/// A repeating opacity breath the renderer evaluates on the GPU every frame:
+/// `min_opacity + (1 - min_opacity) * (cos(progress * TAU) * 0.5 + 0.5)`, where progress
+/// runs from 0 to 1 over `period_ms` starting at `start_ms`. A pulsing quad
+/// costs a present per frame, not a render, layout and paint.
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[repr(C)]
+pub struct QuadPulse {
+    /// The [`pulse_clock_ms`] reading the breath started at, so it opens at full opacity.
+    pub start_ms: u32,
+    /// One full breath. Zero means the quad does not pulse.
+    pub period_ms: u32,
+    /// The opacity factor at the bottom of the breath.
+    pub min_opacity: f32,
+    /// Keeps the struct 16 bytes, matching the shader declarations.
+    pub pad: u32,
+}
+
+impl QuadPulse {
+    /// Whether this quad breathes at all.
+    pub fn is_active(&self) -> bool {
+        self.period_ms != 0
+    }
+}
+
+/// Milliseconds on the clock pulses share, wrapping every ~49 days. Shaders
+/// subtract `start_ms` with wrapping arithmetic, so the wrap is invisible.
+pub fn pulse_clock_ms() -> u32 {
+    static EPOCH: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    EPOCH.elapsed().as_millis() as u32
 }
 
 impl From<Quad> for Primitive {

@@ -1015,6 +1015,7 @@ impl MetalRenderer {
                     instance_buffer,
                     &mut instance_offset,
                     viewport_size,
+                    scene.pulse_clock_ms,
                     command_encoder,
                 ),
                 PrimitiveBatch::Paths(range) => {
@@ -1539,6 +1540,7 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         viewport_size: Size<DevicePixels>,
+        pulse_clock_ms: u32,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
         if quads.is_empty() {
@@ -1547,6 +1549,11 @@ impl MetalRenderer {
         align_offset(instance_offset);
 
         command_encoder.set_render_pipeline_state(&self.quads_pipeline_state);
+        command_encoder.set_fragment_bytes(
+            QuadInputIndex::PulseClock as u64,
+            mem::size_of_val(&pulse_clock_ms) as u64,
+            &pulse_clock_ms as *const u32 as *const _,
+        );
         command_encoder.set_vertex_buffer(
             QuadInputIndex::Vertices as u64,
             Some(&self.unit_vertices),
@@ -2174,6 +2181,7 @@ enum QuadInputIndex {
     Vertices = 0,
     Quads = 1,
     ViewportSize = 2,
+    PulseClock = 3,
 }
 
 #[repr(C)]

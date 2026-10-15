@@ -80,7 +80,7 @@ fn apply_contrast_and_gamma_correction3(sample: vec3<f32>, color: vec3<f32>, enh
 struct GlobalParams {
     viewport_size: vec2<f32>,
     premultiplied_alpha: u32,
-    pad: u32,
+    pulse_clock_ms: u32,
 }
 
 struct GammaParams {
@@ -581,6 +581,14 @@ fn gradient_color(background: Background, position: vec2<f32>, bounds: Bounds,
 
 // --- quads --- //
 
+// Mirrors `QuadPulse` in gpui's scene.rs.
+struct QuadPulse {
+    start_ms: u32,
+    period_ms: u32,
+    min_opacity: f32,
+    pad: u32,
+}
+
 struct Quad {
     order: u32,
     border_style: u32,
@@ -590,6 +598,18 @@ struct Quad {
     border_color: Hsla,
     corner_radii: Corners,
     border_widths: Edges,
+    pulse: QuadPulse,
+}
+
+// The opacity factor of a pulsing quad at this present. Unsigned wrapping
+// subtraction keeps the phase exact across the clock's wrap.
+fn pulse_opacity(pulse: QuadPulse) -> f32 {
+    if (pulse.period_ms == 0u) {
+        return 1.0;
+    }
+    let progress = f32((globals.pulse_clock_ms - pulse.start_ms) % pulse.period_ms) / f32(pulse.period_ms);
+    let swing = cos(progress * 6.28318530718) * 0.5 + 0.5;
+    return pulse.min_opacity + (1.0 - pulse.min_opacity) * swing;
 }
 
 struct QuadVarying {
@@ -628,6 +648,14 @@ fn vs_quad(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) insta
 
 @fragment
 fn fs_quad(input: QuadVarying) -> @location(0) vec4<f32> {
+    // Premultiplied output carries alpha in its colour channels too.
+    let factor = pulse_opacity(load_quad(input.quad_id).pulse);
+    let color = quad_color(input);
+    let rgb_factor = select(1.0, factor, globals.premultiplied_alpha != 0u);
+    return vec4<f32>(color.rgb * rgb_factor, color.a * factor);
+}
+
+fn quad_color(input: QuadVarying) -> vec4<f32> {
     // Alpha clip first, since we don't have `clip_distance`.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);

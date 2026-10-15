@@ -84,7 +84,7 @@ fn least_common_multiple(left: u64, right: u64) -> u64 {
 struct GlobalParams {
     viewport_size: [f32; 2],
     premultiplied_alpha: u32,
-    pad: u32,
+    pulse_clock_ms: u32,
 }
 
 #[repr(C)]
@@ -1411,7 +1411,7 @@ impl WgpuRenderer {
             } else {
                 0
             },
-            pad: 0,
+            pulse_clock_ms: scene.pulse_clock_ms,
         };
 
         let path_globals = GlobalParams {
@@ -3657,7 +3657,7 @@ mod tests {
 
     #[test]
     fn webgl_record_sizes_match_shader_word_strides() {
-        assert_eq!(std::mem::size_of::<Quad>(), 40 * 4);
+        assert_eq!(std::mem::size_of::<Quad>(), 44 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 28 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 6 * 4);

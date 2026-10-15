@@ -3,7 +3,7 @@ use crate::{
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
     Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle, WeakEntity,
 };
-use crate::{Empty, Window};
+use crate::{Empty, QuadPulse, Window};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
@@ -294,6 +294,7 @@ struct ViewElementCacheKey {
     content_mask: ContentMask<Pixels>,
     text_style: TextStyle,
     inherited_opacity: f32,
+    inherited_pulse: QuadPulse,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -384,12 +385,14 @@ impl<V: View> Element for ViewElement<V> {
                         let content_mask = window.content_mask();
                         let text_style = window.text_style();
                         let inherited_opacity = window.element_opacity();
+                        let inherited_pulse = window.element_pulse;
 
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
                             && element_state.cache_key.text_style == text_style
                             && element_state.cache_key.inherited_opacity == inherited_opacity
+                            && element_state.cache_key.inherited_pulse == inherited_pulse
                             && !window.dirty_views.contains(&entity_id)
                             && !window.refreshing
                         {
@@ -431,6 +434,7 @@ impl<V: View> Element for ViewElement<V> {
                                     content_mask,
                                     text_style,
                                     inherited_opacity,
+                                    inherited_pulse,
                                 },
                             },
                         )
