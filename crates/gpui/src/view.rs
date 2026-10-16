@@ -3,11 +3,10 @@ use crate::{
     Entity, EntityId, GlobalElementId, InspectorElementId, IntoElement, LayoutId, PaintIndex,
     Pixels, PrepaintStateIndex, Render, RenderOnce, Style, StyleRefinement, TextStyle, WeakEntity,
 };
-use crate::{Empty, QuadPulse, Window};
+use crate::{CachedViewContext, Empty, QuadPulse, Window, scene::RepaintId};
 use anyhow::Result;
 use collections::FxHashSet;
 use refineable::Refineable;
-use std::mem;
 use std::{any::TypeId, fmt, ops::Range};
 
 /// A dynamically-typed view handle that can be downcast to a specific `Entity<V>`.
@@ -37,7 +36,8 @@ impl AnyView {
     /// [Context::notify] was called on the backing entity since it was rendered
     /// (or [Window::refresh] is called, which ignores caching).
     pub fn cached(self, style: StyleRefinement) -> ViewElement<AnyView> {
-        ViewElement::new(self).cached(style)
+        let view = self.clone();
+        ViewElement::new(self).cached(style, view)
     }
 
     /// Convert this to a weak handle.
@@ -230,7 +230,8 @@ impl<T: Render> Entity<T> {
     /// uncached case.
     #[track_caller]
     pub fn cached(self, style: StyleRefinement) -> ViewElement<Entity<T>> {
-        ViewElement::new(self).cached(style)
+        let view = self.clone().into();
+        ViewElement::new(self).cached(style, view)
     }
 }
 
@@ -241,6 +242,9 @@ pub struct ViewElement<V: View> {
     view: Option<V>,
     entity_id: Option<EntityId>,
     cached_style: Option<StyleRefinement>,
+    /// The cached view, type-erased, so the window can render it again on
+    /// its own (see [`Window::draw_contained`]).
+    cached_view: Option<AnyView>,
     #[cfg(debug_assertions)]
     source: &'static core::panic::Location<'static>,
 }
@@ -253,6 +257,7 @@ impl<V: View> ViewElement<V> {
         ViewElement {
             entity_id,
             cached_style: None,
+            cached_view: None,
             view: Some(view),
             #[cfg(debug_assertions)]
             source: core::panic::Location::caller(),
@@ -268,8 +273,9 @@ impl<V: View> ViewElement<V> {
     /// view has no such contract, so a frozen subtree could never be invalidated.
     /// Reach this through [`Entity::cached`] or [`AnyView::cached`], which are
     /// entity-backed by construction.
-    pub(crate) fn cached(mut self, style: StyleRefinement) -> Self {
+    pub(crate) fn cached(mut self, style: StyleRefinement, view: AnyView) -> Self {
         self.cached_style = Some(style);
+        self.cached_view = Some(view);
         self
     }
 }
@@ -282,19 +288,29 @@ impl<V: View> IntoElement for ViewElement<V> {
     }
 }
 
-struct ViewElementState {
-    prepaint_range: Range<PrepaintStateIndex>,
-    paint_range: Range<PaintIndex>,
-    cache_key: ViewElementCacheKey,
-    accessed_entities: FxHashSet<EntityId>,
+pub(crate) struct ViewElementState {
+    pub(crate) prepaint_range: Range<PrepaintStateIndex>,
+    pub(crate) paint_range: Range<PaintIndex>,
+    pub(crate) cache_key: ViewElementCacheKey,
+    pub(crate) accessed_entities: FxHashSet<EntityId>,
+    /// The entities the view's own subtree read while drawing, outside the
+    /// cached views nested in it: if one is notified, this view must render
+    /// again with it.
+    pub(crate) direct_reads: FxHashSet<EntityId>,
+    /// What rendering the view again in place needs: the view itself, and
+    /// the ambient state its subtree was drawn in.
+    pub(crate) view: AnyView,
+    pub(crate) context: CachedViewContext,
+    /// The scene region it paints into while it is a live layer.
+    pub(crate) layer: Option<RepaintId>,
 }
 
-struct ViewElementCacheKey {
-    bounds: Bounds<Pixels>,
-    content_mask: ContentMask<Pixels>,
-    text_style: TextStyle,
-    inherited_opacity: f32,
-    inherited_pulse: QuadPulse,
+pub(crate) struct ViewElementCacheKey {
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) content_mask: ContentMask<Pixels>,
+    pub(crate) text_style: TextStyle,
+    pub(crate) inherited_opacity: f32,
+    pub(crate) inherited_pulse: QuadPulse,
 }
 
 impl<V: View> Element for ViewElement<V> {
@@ -379,6 +395,8 @@ impl<V: View> Element for ViewElement<V> {
                     return Some(element);
                 }
 
+                let cached_view = self.cached_view.clone().unwrap();
+                window.register_cached_view(entity_id, global_id.unwrap());
                 window.with_element_state::<ViewElementState, _>(
                     global_id.unwrap(),
                     |element_state, window| {
@@ -387,6 +405,7 @@ impl<V: View> Element for ViewElement<V> {
                         let inherited_opacity = window.element_opacity();
                         let inherited_pulse = window.element_pulse;
 
+                        let layer = element_state.as_ref().and_then(|state| state.layer);
                         if let Some(mut element_state) = element_state
                             && element_state.cache_key.bounds == bounds
                             && element_state.cache_key.content_mask == content_mask
@@ -398,35 +417,26 @@ impl<V: View> Element for ViewElement<V> {
                         {
                             let prepaint_start = window.prepaint_index();
                             window.reuse_prepaint(element_state.prepaint_range.clone());
-                            cx.entities
-                                .extend_accessed(&element_state.accessed_entities);
+                            cx.extend_nested_entity_reads(&element_state.accessed_entities);
                             let prepaint_end = window.prepaint_index();
                             element_state.prepaint_range = prepaint_start..prepaint_end;
+                            element_state.view = cached_view;
 
                             return (None, element_state);
                         }
 
-                        let refreshing = mem::replace(&mut window.refreshing, true);
+                        let context = window.cached_view_context();
                         let prepaint_start = window.prepaint_index();
-                        let (mut element, accessed_entities) = cx.detect_accessed_entities(|cx| {
-                            let mut element = self
-                                .view
-                                .take()
-                                .unwrap()
-                                .render(window, cx)
-                                .into_any_element();
-                            element.layout_as_root(bounds.size.into(), window, cx);
-                            element.prepaint_at(bounds.origin, window, cx);
-                            element
-                        });
-
+                        let live = window.is_live_layer(entity_id);
+                        let (element, reads) =
+                            window.prepaint_cached_contents(&cached_view, bounds, live, cx);
                         let prepaint_end = window.prepaint_index();
-                        window.refreshing = refreshing;
 
                         (
                             Some(element),
                             ViewElementState {
-                                accessed_entities,
+                                accessed_entities: reads.total,
+                                direct_reads: reads.direct,
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
                                 cache_key: ViewElementCacheKey {
@@ -436,6 +446,9 @@ impl<V: View> Element for ViewElement<V> {
                                     inherited_opacity,
                                     inherited_pulse,
                                 },
+                                view: cached_view,
+                                context,
+                                layer,
                             },
                         )
                     },
@@ -476,15 +489,15 @@ impl<V: View> Element for ViewElement<V> {
                             let paint_start = window.paint_index();
 
                             if let Some(element) = element {
-                                let refreshing = mem::replace(&mut window.refreshing, true);
-                                element.paint(window, cx);
-                                window.refreshing = refreshing;
+                                let live = window.is_live_layer(entity_id);
+                                window.paint_cached_contents(element, &mut element_state, live, cx);
                             } else {
                                 window.reuse_paint(element_state.paint_range.clone());
                             }
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+                            element_state.context.text_color_map = window.text_color_map.clone();
 
                             ((), element_state)
                         },

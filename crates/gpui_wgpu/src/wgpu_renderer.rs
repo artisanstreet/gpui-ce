@@ -3683,3 +3683,7 @@ mod mesh_tests;
 #[cfg(all(test, not(target_family = "wasm")))]
 #[path = "path_tests.rs"]
 mod path_tests;
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "sprite_slack_tests.rs"]
+mod sprite_slack_tests;

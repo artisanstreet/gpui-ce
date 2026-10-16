@@ -484,6 +484,30 @@ pub(crate) struct LineLayoutIndex {
     wrapped_lines_by_hash_index: usize,
 }
 
+impl LineLayoutIndex {
+    /// How many layouts the frame used, of every kind.
+    pub(crate) fn total(&self) -> usize {
+        self.lines_index
+            + self.wrapped_lines_index
+            + self.lines_by_hash_index
+            + self.wrapped_lines_by_hash_index
+    }
+
+    /// This index moved as far as `from` moved to `to`.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            lines_index: self.lines_index - from.lines_index + to.lines_index,
+            wrapped_lines_index: self.wrapped_lines_index - from.wrapped_lines_index
+                + to.wrapped_lines_index,
+            lines_by_hash_index: self.lines_by_hash_index - from.lines_by_hash_index
+                + to.lines_by_hash_index,
+            wrapped_lines_by_hash_index: self.wrapped_lines_by_hash_index
+                - from.wrapped_lines_by_hash_index
+                + to.wrapped_lines_by_hash_index,
+        }
+    }
+}
+
 impl LineLayoutCache {
     pub fn new(platform_text_system: Arc<dyn PlatformTextSystem>) -> Self {
         Self {

@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{fmt::Debug, ops::Range};
 
 use ::sum_tree::SumTree;
 use collections::FxHashMap;
@@ -20,6 +20,8 @@ pub enum TabStopOperation {
     Insert(FocusHandle),
     Group(TabIndex),
     GroupEnd,
+    /// A slot a live layer can paint a tab stop into later.
+    Skip,
 }
 
 impl TabStopOperation {
@@ -184,8 +186,73 @@ impl TabStopMap {
                 TabStopOperation::Insert(focus_handle) => self.insert(focus_handle),
                 TabStopOperation::Group(tab_index) => self.begin_group(*tab_index),
                 TabStopOperation::GroupEnd => self.end_group(),
+                TabStopOperation::Skip => self.insertion_history.push(TabStopOperation::Skip),
             }
         }
+    }
+
+    /// Appends `count` empty slots.
+    pub fn skip(&mut self, count: usize) {
+        self.insertion_history
+            .extend((0..count).map(|_| TabStopOperation::Skip));
+    }
+
+    /// The tab groups open where the next operation goes.
+    pub fn current_path(&self) -> &[TabIndex] {
+        &self.current_path.0
+    }
+
+    /// Starts painting inside the tab groups `path`.
+    pub fn set_current_path(&mut self, path: &[TabIndex]) {
+        self.current_path = TabStopPath(path.iter().copied().collect());
+    }
+
+    /// Replaces the operations in `slots` with `operations`, painted inside
+    /// the tab groups `path`; empty slots fill the rest. Returns `false`,
+    /// changing nothing, if they don't fit.
+    pub fn replace_slots(
+        &mut self,
+        slots: Range<usize>,
+        operations: Vec<TabStopOperation>,
+        path: &[TabIndex],
+    ) -> bool {
+        if operations.len() > slots.len() {
+            return false;
+        }
+        for index in slots.clone() {
+            if let TabStopOperation::Insert(handle) = &self.insertion_history[index]
+                && let Some(node) = self.by_id.get(&handle.id)
+                && node.node_insertion_index == index
+            {
+                let node = self.by_id.remove(&handle.id).unwrap();
+                self.order.remove(&node, ());
+            }
+        }
+        let mut current_path = TabStopPath(path.iter().copied().collect());
+        let mut operations = operations.into_iter();
+        for index in slots {
+            let operation = operations.next().unwrap_or(TabStopOperation::Skip);
+            match &operation {
+                TabStopOperation::Insert(handle) => {
+                    let mut path = current_path.clone();
+                    path.0.push(handle.tab_index);
+                    let node = TabStopNode {
+                        node_insertion_index: index,
+                        tab_stop: handle.tab_stop,
+                        path,
+                    };
+                    self.by_id.insert(handle.id, node.clone());
+                    self.order.insert_or_replace(node, ());
+                }
+                TabStopOperation::Group(tab_index) => current_path.0.push(*tab_index),
+                TabStopOperation::GroupEnd => {
+                    current_path.0.pop();
+                }
+                TabStopOperation::Skip => {}
+            }
+            self.insertion_history[index] = operation;
+        }
+        true
     }
 
     pub fn paint_index(&self) -> usize {

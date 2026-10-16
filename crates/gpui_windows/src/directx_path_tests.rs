@@ -1,6 +1,7 @@
 use super::{
-    DirectXAtlas, DirectXGlobalElements, DirectXRenderPipelines, DirectXRenderer, DirectXResources,
-    FontInfo, resource_tests::test_devices,
+    BUFFER_COUNT, DamageSources, DamageTracker, DirectXAtlas, DirectXGlobalElements,
+    DirectXRenderPipelines, DirectXRenderer, DirectXResources, FontInfo,
+    resource_tests::test_devices,
 };
 use anyhow::{Context, Result};
 use gpui::path_targets::path_batch_bounds;
@@ -36,6 +37,11 @@ pub(super) fn renderer(viewport: [u32; 2]) -> Result<DirectXRenderer> {
         skip_draws: false,
         active_render_target: None,
         meshes: None,
+        damage: DamageTracker::new(BUFFER_COUNT),
+        damage_sources: DamageSources::default(),
+        uploaded_generation: None,
+        drawn_generation: None,
+        background_appearance: None,
     })
 }
 
@@ -45,12 +51,12 @@ fn render_paths(
     origin: [u32; 2],
     size: [u32; 2],
 ) -> Result<Vec<u8>> {
-    renderer.pre_draw(&[0.0; 4])?;
+    renderer.pre_draw(&[0.0; 4], 0, None)?;
     let devices = renderer.devices.as_ref().unwrap();
     let resources = renderer.resources.as_mut().unwrap();
     resources.paths = None;
     resources.ensure_paths(&devices.device, Some(size))?;
-    renderer.draw_paths_to_intermediate_at(paths, origin)?;
+    renderer.draw_paths_to_intermediate_at(paths, origin, None)?;
     renderer.draw_paths_from_intermediate(paths)?;
     let devices = renderer.devices.as_ref().unwrap();
     let resources = renderer.resources.as_ref().unwrap();

@@ -18,13 +18,13 @@ use crate::{
     PromptButton, PromptLevel, Quad, QuadPulse, Render, RenderGlyphParams, RenderImage,
     RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
-    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, pulse_clock_ms, px, rems, size, transparent_black,
+    SharedString, Size, StrikethroughStyle, Style, SubscriberSet, Subscription, SystemWindowTab,
+    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
+    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Transition, TransitionState, Underline, UnderlineStyle, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations, WindowOptions,
+    WindowParams, WindowTextSystem, point, prelude::*, pulse_clock_ms, px, rems, size,
+    transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -67,13 +67,22 @@ use std::{
 use uuid::Uuid;
 
 pub(crate) mod a11y;
+mod contained;
+mod live_layer;
 mod prompts;
+mod repaint;
+mod verify;
 
 pub use a11y::A11ySubtreeBuilder;
+pub(crate) use contained::CachedViewContext;
+use contained::CachedViewEntry;
+pub use repaint::PaintRecording;
+use repaint::RetainedPaint;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
 use self::a11y::ROOT_NODE_ID;
+use crate::scene::{Damage, RecordedGlyph, RecordedPaint, RepaintId};
 use crate::util::{
     atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
     round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
@@ -756,6 +765,11 @@ pub enum WindowControlArea {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct HitboxId(u64);
 
+impl HitboxId {
+    /// The id of the empty hitboxes holding a live layer's slots.
+    pub(crate) const TOMBSTONE: Self = Self(u64::MAX);
+}
+
 #[cfg(feature = "test-support")]
 impl HitboxId {
     /// A placeholder HitboxId exclusively for integration testing API's that
@@ -993,6 +1007,14 @@ pub(crate) struct Frame {
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_hitboxes: FxHashMap<HitboxId, crate::InspectorElementId>,
     pub(crate) tab_stops: TabStopMap,
+    /// The cached views drawn in this frame, so a notified view can render
+    /// inside its nearest one (see `Window::draw_contained`).
+    pub(crate) cached_views: FxHashMap<EntityId, CachedViewEntry>,
+    /// The ranges of the main element tree, from layout through prepaint and
+    /// through paint, which a contained frame reuses around its holes.
+    pub(crate) root_ranges: Option<(Range<PrepaintStateIndex>, Range<PaintIndex>)>,
+    /// The entities read outside every cached view while drawing.
+    pub(crate) root_reads: FxHashSet<EntityId>,
 }
 
 #[derive(Clone, Default)]
@@ -1014,6 +1036,84 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     line_layout_index: LineLayoutIndex,
+}
+
+/// `self + (to - from)` in each stream.
+fn shift_index(index: usize, from: usize, to: usize) -> usize {
+    index - from + to
+}
+
+impl PrepaintStateIndex {
+    /// This index moved as far as `from` moved to `to`, in every stream.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            hitboxes_index: shift_index(
+                self.hitboxes_index,
+                from.hitboxes_index,
+                to.hitboxes_index,
+            ),
+            tooltips_index: shift_index(
+                self.tooltips_index,
+                from.tooltips_index,
+                to.tooltips_index,
+            ),
+            deferred_draws_index: shift_index(
+                self.deferred_draws_index,
+                from.deferred_draws_index,
+                to.deferred_draws_index,
+            ),
+            dispatch_tree_index: shift_index(
+                self.dispatch_tree_index,
+                from.dispatch_tree_index,
+                to.dispatch_tree_index,
+            ),
+            accessed_element_states_index: shift_index(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
+}
+
+impl PaintIndex {
+    /// This index moved as far as `from` moved to `to`, in every stream.
+    pub(crate) fn shifted(&self, from: &Self, to: &Self) -> Self {
+        Self {
+            scene_index: shift_index(self.scene_index, from.scene_index, to.scene_index),
+            mouse_listeners_index: shift_index(
+                self.mouse_listeners_index,
+                from.mouse_listeners_index,
+                to.mouse_listeners_index,
+            ),
+            input_handlers_index: shift_index(
+                self.input_handlers_index,
+                from.input_handlers_index,
+                to.input_handlers_index,
+            ),
+            cursor_styles_index: shift_index(
+                self.cursor_styles_index,
+                from.cursor_styles_index,
+                to.cursor_styles_index,
+            ),
+            accessed_element_states_index: shift_index(
+                self.accessed_element_states_index,
+                from.accessed_element_states_index,
+                to.accessed_element_states_index,
+            ),
+            tab_handle_index: shift_index(
+                self.tab_handle_index,
+                from.tab_handle_index,
+                to.tab_handle_index,
+            ),
+            line_layout_index: self
+                .line_layout_index
+                .shifted(&from.line_layout_index, &to.line_layout_index),
+        }
+    }
 }
 
 impl Frame {
@@ -1042,6 +1142,9 @@ impl Frame {
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector_hitboxes: FxHashMap::default(),
             tab_stops: TabStopMap::default(),
+            cached_views: FxHashMap::default(),
+            root_ranges: None,
+            root_reads: FxHashSet::default(),
         }
     }
 
@@ -1058,6 +1161,9 @@ impl Frame {
         self.window_control_hitboxes.clear();
         self.deferred_draws.clear();
         self.tab_stops.clear();
+        self.cached_views.clear();
+        self.root_ranges = None;
+        self.root_reads.clear();
         self.focus = None;
 
         #[cfg(any(test, feature = "test-support"))]
@@ -1166,9 +1272,40 @@ pub struct Window {
     /// Whether the rendered scene holds pulsing quads, so frames keep
     /// presenting it while nothing else changes.
     pub(crate) rendered_scene_pulses: bool,
+    /// The closures repainting the rendered scene's repaint regions.
+    retained_paints: FxHashMap<RepaintId, RetainedPaint>,
+    next_repaint_id: u64,
+    /// The viewport size and scale the rendered scene was drawn at. `None`
+    /// until the first draw, and when what's on screen can't be trusted, so
+    /// the next draw reports full damage.
+    rendered_viewport: Option<(Size<Pixels>, f32)>,
+    rendered_scene_presented: bool,
+    /// The rendered scene's damage, kept until it is presented.
+    damage_since_present: Option<Damage>,
+    /// The rendered scene's changed primitive ranges, kept until presented.
+    changed_since_present: Option<crate::PrimitiveRanges>,
+    /// Whether a retained paint closure is painting, so closures can't nest.
+    painting_retained: bool,
+    /// Cached views drawn so they can be redrawn in place, with the scene
+    /// generation they last re-rendered in.
+    live_layers: FxHashMap<EntityId, u64>,
+    /// Damage from holes redrawn in place by a frame that then had to take
+    /// another path for the rest.
+    pub(crate) in_place_damage: Option<Damage>,
+    /// The rendered frame's slot of the input handler lent to the platform.
+    pub(crate) taken_input_handler: Option<usize>,
+    /// Whether partial frames are checked against full draws (see
+    /// [`verify`]).
+    verify_frames: bool,
+    /// Whether the draw in progress is such a check.
+    drawing_full_for_verification: bool,
+    /// What contained and in-place frames copied, so tests can show it
+    /// doesn't grow with the window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) frame_work: FrameWork,
     /// The composed paint transform of the element being drawn.
     element_transform: ScreenTransform,
-    text_color_map: Option<TextColorMap>,
+    pub(crate) text_color_map: Option<TextColorMap>,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -1275,6 +1412,15 @@ struct PendingInput {
     focus: Option<FocusId>,
     timer: Option<Task<()>>,
     needs_timeout: bool,
+}
+
+/// Counts of the work frames did, for tests.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameWork {
+    /// Stream items (hitboxes, dispatch nodes, listeners, ...) copied from
+    /// the previous frame or written into a live layer's slots.
+    pub(crate) copied: usize,
 }
 
 pub(crate) struct ElementStateBox {
@@ -1589,13 +1735,16 @@ impl Window {
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
                 // - Inactive window (not focused): cap to ~30fps to save energy
-                let pulses = handle
-                    .update(&mut cx, |_, window, _| window.rendered_scene_pulses)
-                    .unwrap_or(false);
+                let (pulses, repaints) = handle
+                    .update(&mut cx, |_, window, _| {
+                        (window.rendered_scene_pulses, window.repaint_pending())
+                    })
+                    .unwrap_or((false, false));
                 let min_frame_interval = if request_frame_options.require_presentation
                     || (!request_frame_options.force_render
                         && next_frame_callbacks.borrow().is_empty()
-                        && !pulses)
+                        && !pulses
+                        && !repaints)
                 {
                     None
                 } else if !active.get() && !input_activity.borrow().is_recent(Instant::now()) {
@@ -1665,12 +1814,25 @@ impl Window {
                             .update(&mut cx, |_, window, cx| {
                                 if force_render {
                                     // Bypass cached view reuse so we don't replay stale
-                                    // atlas tile references after a GPU device recovery.
+                                    // atlas tile references after a GPU device recovery,
+                                    // and repaint every pixel.
                                     window.refresh();
+                                    window.rendered_viewport = None;
                                 }
                                 let arena_clear_needed = window.draw(cx);
                                 window.present();
                                 arena_clear_needed.clear(cx);
+                            })
+                            .log_err();
+                    })
+                } else if repaints {
+                    // Only retained paints animate: repaint their regions in
+                    // place, leaving the rest of the frame as it is.
+                    measure("frame duration", || {
+                        handle
+                            .update(&mut cx, |_, window, cx| {
+                                window.repaint(cx);
+                                window.present();
                             })
                             .log_err();
                     })
@@ -1686,12 +1848,14 @@ impl Window {
                         // End its cadence sample here too, or the next animation
                         // includes the intervening idle gap in its FPS readout.
                         #[cfg(feature = "frame-rate")]
-                        window
-                            .debug_frame_overlay
-                            .set_frame_demand(!window.next_frame_callbacks.borrow().is_empty());
+                        window.debug_frame_overlay.set_frame_demand(
+                            window.repaint_pending()
+                                || !window.next_frame_callbacks.borrow().is_empty(),
+                        );
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
                             || window.rendered_scene_pulses
+                            || window.repaint_pending()
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -1703,10 +1867,16 @@ impl Window {
                 // after this frame (the window was re-invalidated mid-draw, or
                 // animations scheduled next-frame callbacks), re-arm the frame
                 // source explicitly.
-                let pulses = handle
-                    .update(&mut cx, |_, window, _| window.rendered_scene_pulses)
-                    .unwrap_or(false);
-                if invalidator.is_dirty() || !next_frame_callbacks.borrow().is_empty() || pulses {
+                let (pulses, repaints) = handle
+                    .update(&mut cx, |_, window, _| {
+                        (window.rendered_scene_pulses, window.repaint_pending())
+                    })
+                    .unwrap_or((false, false));
+                if invalidator.is_dirty()
+                    || !next_frame_callbacks.borrow().is_empty()
+                    || pulses
+                    || repaints
+                {
                     invalidator.wake_platform();
                 }
             }
@@ -1891,6 +2061,20 @@ impl Window {
             element_opacity: 1.0,
             element_pulse: QuadPulse::default(),
             rendered_scene_pulses: false,
+            retained_paints: FxHashMap::default(),
+            next_repaint_id: RepaintId::FRAME_OVERLAY.0,
+            rendered_viewport: None,
+            rendered_scene_presented: false,
+            damage_since_present: None,
+            changed_since_present: None,
+            painting_retained: false,
+            live_layers: FxHashMap::default(),
+            in_place_damage: None,
+            taken_input_handler: None,
+            verify_frames: Self::verify_frames_from_env(),
+            drawing_full_for_verification: false,
+            #[cfg(any(test, feature = "test-support"))]
+            frame_work: FrameWork::default(),
             element_transform: ScreenTransform::IDENTITY,
             text_color_map: None,
             requested_autoscroll: None,
@@ -3000,42 +3184,123 @@ impl Window {
         // This ensures that multiple test Apps have isolated arenas.
         let arena_scope = ElementArenaScope::enter(&cx.element_arena);
 
-        self.invalidate_entities();
+        // Notified views render inside their nearest cached views when they
+        // can; otherwise every notified view dirties its ancestors.
+        let mut contained = self.take_invalidated_views(cx);
         cx.entities.clear_accessed();
         debug_assert!(self.rendered_entity_stack.is_empty());
         self.invalidator.set_dirty(false);
         self.requested_autoscroll = None;
 
-        // Restore the previously-used input handler.
-        // Place it back into a None slot (left by a previous .take()) so that
-        // cached paint_range indices in reuse_paint find the handler at the
-        // expected position.
-        if let Some(input_handler) = self.platform_window.take_input_handler() {
-            if let Some(slot) = self
-                .rendered_frame
-                .input_handlers
-                .iter_mut()
-                .rev()
-                .find(|h| h.is_none())
-            {
-                *slot = Some(input_handler);
-            } else {
-                self.rendered_frame.input_handlers.push(Some(input_handler));
+        // Live layers redraw in place, leaving the rest of the frame (and
+        // the platform's input handler) where it is.
+        if let Some(plan) = contained.take() {
+            match self.redraw_in_place(plan, cx) {
+                live_layer::InPlace::Done {
+                    mut damage,
+                    redrawn,
+                    dirty,
+                } => {
+                    self.invalidator.set_phase(DrawPhase::Paint);
+                    let unrepaintable = self.repaint_animating_regions(&mut damage, cx);
+                    #[cfg(feature = "frame-rate")]
+                    self.repaint_frame_overlay(&mut damage);
+                    self.invalidator.set_phase(DrawPhase::None);
+                    for retained in self.retained_paints.values_mut() {
+                        retained.painted_this_draw = false;
+                    }
+                    self.rendered_frame.scene.generation += 1;
+                    let changed = mem::take(&mut self.rendered_frame.scene.replaced_primitives);
+                    self.settle_damage(Some(damage), Some(changed));
+                    self.needs_present.set(true);
+                    for view in unrepaintable {
+                        cx.notify(view);
+                    }
+                    #[cfg(feature = "profiler")]
+                    {
+                        let draw_duration = self
+                            .window_profiler
+                            .end_draw(frame_dirty.dirty_at, frame_dirty.invalidations);
+                        self.debug_frame_overlay.record_draw(draw_duration);
+                    }
+                    #[cfg(all(feature = "frame-rate", not(feature = "profiler")))]
+                    self.debug_frame_overlay.record_draw(draw_start.elapsed());
+                    if self.verify_frames {
+                        self.verify_partial_frame("in-place", &redrawn, &dirty, cx);
+                    }
+                    return arena_scope.exit(&cx.element_arena);
+                }
+                live_layer::InPlace::Refused(dirty) => {
+                    contained = self.plan_contained_redraw(&dirty, true, cx);
+                    if contained.is_none() {
+                        for view in &dirty {
+                            self.mark_view_dirty(*view);
+                        }
+                    }
+                }
             }
         }
+        if contained.is_none() {
+            self.demote_idle_live_layers();
+        }
+
+        // Restore the previously-used input handler to the slot it was taken
+        // from, so that cached paint_range indices in reuse_paint find it at
+        // the expected position.
+        if let Some(input_handler) = self.platform_window.take_input_handler() {
+            match self.taken_input_handler.take() {
+                Some(index)
+                    if self
+                        .rendered_frame
+                        .input_handlers
+                        .get(index)
+                        .is_some_and(Option::is_none) =>
+                {
+                    self.rendered_frame.input_handlers[index] = Some(input_handler);
+                }
+                _ => self.rendered_frame.input_handlers.push(Some(input_handler)),
+            }
+        }
+        let drew_contained = contained.is_some();
+        let verify = contained
+            .as_ref()
+            .filter(|_| self.verify_frames)
+            .map(|plan| {
+                let redrawn = plan
+                    .holes
+                    .iter()
+                    .map(|hole| hole.entity)
+                    .collect::<Vec<_>>();
+                (redrawn, plan.dirty.clone())
+            });
         if !cx.mode.skip_drawing() {
-            self.draw_roots(cx);
+            let ((), reads) = cx.detect_accessed_entities(|cx| match contained {
+                Some(plan) => self.draw_contained(plan, cx),
+                None => self.draw_roots(cx),
+            });
+            // Even inside another window's draw, this window tracks all it read.
+            cx.entities.extend_accessed(&reads.total);
+            self.next_frame.root_reads = reads.direct;
+            if drew_contained {
+                // The reused tree read what it read before.
+                let previous = self.rendered_frame.root_reads.iter().copied();
+                self.next_frame.root_reads.extend(previous);
+            }
             #[cfg(feature = "frame-rate")]
             {
                 let viewport_size = self.viewport_size;
                 let scale_factor = self.scale_factor();
-                self.debug_frame_overlay
-                    .set_frame_demand(!self.next_frame_callbacks.borrow().is_empty());
-                self.debug_frame_overlay.paint(
-                    &mut self.next_frame.scene,
-                    viewport_size,
-                    scale_factor,
+                self.debug_frame_overlay.set_frame_demand(
+                    self.repaint_pending() || !self.next_frame_callbacks.borrow().is_empty(),
                 );
+                // A region of its own, so repaint frames refresh the readout.
+                if self.debug_frame_overlay.is_enabled() {
+                    let scene = &mut self.next_frame.scene;
+                    scene.begin_repaint_region(RepaintId::FRAME_OVERLAY);
+                    self.debug_frame_overlay
+                        .paint(scene, viewport_size, scale_factor);
+                    scene.end_repaint_region();
+                }
             }
         }
         self.dirty_views.clear();
@@ -3046,13 +3311,15 @@ impl Window {
         // paint_range indices remain valid for reuse_paint on the next frame.
         // Search backwards to find the last Some entry, since reuse_paint may
         // have copied None slots from the previous frame. (Fixes #50456)
-        let focused_text_input_active = if let Some(mut input_handler) = self
+        let focused_text_input_active = if let Some((index, mut input_handler)) = self
             .next_frame
             .input_handlers
             .iter_mut()
+            .enumerate()
             .rev()
-            .find_map(|h| h.take())
+            .find_map(|(index, handler)| Some((index, handler.take()?)))
         {
+            self.taken_input_handler = Some(index);
             let accepts_text_input = input_handler.accepts_text_input(self, cx);
             self.platform_window.set_input_handler(input_handler);
             accepts_text_input
@@ -3078,7 +3345,33 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        // Damage is where the new scene differs from the one on screen,
+        // unless the viewport changed under it.
+        let viewport = (self.viewport_size, self.scale_factor);
+        let mut damage = (self.rendered_viewport == Some(viewport)).then(|| {
+            let mut damage = Damage::default();
+            self.rendered_frame
+                .scene
+                .damage_since(&self.next_frame.scene, &mut damage);
+            damage
+        });
+        // Holes this frame redrew in place before taking this path.
+        if let Some(in_place) = self.in_place_damage.take()
+            && let Some(damage) = &mut damage
+        {
+            damage.merge(in_place);
+        }
+        self.rendered_viewport = Some(viewport);
+        self.rendered_frame.scene.generation = self.next_frame.scene.generation + 1;
         self.next_frame.clear();
+        // Regions replayed from cached views repaint now if they animate.
+        self.invalidator.set_phase(DrawPhase::Paint);
+        let mut untracked = Damage::default();
+        let unrepaintable =
+            self.repaint_animating_regions(damage.as_mut().unwrap_or(&mut untracked), cx);
+        self.invalidator.set_phase(DrawPhase::Focus);
+        self.retain_live_paints();
+        self.settle_damage(damage, None);
         self.rendered_scene_pulses = self
             .rendered_frame
             .scene
@@ -3123,10 +3416,20 @@ impl Window {
         }
 
         debug_assert!(self.rendered_entity_stack.is_empty());
+        if drew_contained {
+            // Reused views didn't render, so keep tracking what they read.
+            if let Some(tracked) = cx.tracked_entities.get(&self.handle.window_id()) {
+                let tracked = tracked.clone();
+                cx.entities.extend_accessed(&tracked);
+            }
+        }
         self.record_entities_accessed(cx);
         self.reset_cursor_style(cx);
         self.refreshing = false;
         self.invalidator.set_phase(DrawPhase::None);
+        for view in unrepaintable {
+            cx.notify(view);
+        }
         // Focus listeners may move focus (e.g. a dock forwarding focus to its active
         // panel). `Window::focus` suppresses `refresh` while a draw is in progress, so
         // schedule another frame here to render the new focus state and dispatch the
@@ -3145,6 +3448,10 @@ impl Window {
         }
         #[cfg(all(feature = "frame-rate", not(feature = "profiler")))]
         self.debug_frame_overlay.record_draw(draw_start.elapsed());
+
+        if let Some((redrawn, dirty)) = verify {
+            self.verify_partial_frame("contained", &redrawn, &dirty, cx);
+        }
 
         // Exit the scope to obtain the arena-clear token this draw owes; the
         // scope's teardown itself happens in `ElementArenaScope::drop`.
@@ -3165,12 +3472,24 @@ impl Window {
         mem::swap(&mut entities, entities_ref.deref_mut());
     }
 
-    fn invalidate_entities(&mut self) {
+    /// Takes the views notified since the last draw. Returns the plan for a
+    /// contained frame if they can render inside cached views; otherwise
+    /// marks them and their ancestors dirty for a full frame.
+    fn take_invalidated_views(&mut self, cx: &App) -> Option<contained::ContainedRedraw> {
         let mut views = self.invalidator.take_views();
-        for entity in views.drain() {
-            self.mark_view_dirty(entity);
+        let contained = if self.drawing_full_for_verification {
+            None
+        } else {
+            self.plan_contained_redraw(&views, false, cx)
+        };
+        if contained.is_none() {
+            for entity in views.iter() {
+                self.mark_view_dirty(*entity);
+            }
         }
+        views.clear();
         self.invalidator.replace_views(views);
+        contained
     }
 
     #[profiling::function]
@@ -3181,6 +3500,7 @@ impl Window {
         let present_start = Instant::now();
         self.rendered_frame.scene.pulse_clock_ms = pulse_clock_ms();
         self.platform_window.draw(&self.rendered_frame.scene);
+        self.rendered_scene_presented = true;
         #[cfg(feature = "frame-rate")]
         self.debug_frame_overlay.record_present();
         #[cfg(feature = "profiler")]
@@ -3277,6 +3597,7 @@ impl Window {
         // stretches to fill the viewport unless explicitly sized, window roots
         // fill the window when their size is `auto`.
         let scale_factor = self.scale_factor();
+        let root_prepaint_start = self.prepaint_index();
         let mut root_element = self.root.as_ref().unwrap().clone().into_any_element();
         let root_layout_id = root_element.request_layout(self, cx);
         self.layout_engine
@@ -3284,6 +3605,7 @@ impl Window {
             .unwrap()
             .stretch_auto_size_to_fill(root_layout_id, root_size, scale_factor);
         root_element.prepaint_as_root(Point::default(), root_size.into(), self, cx);
+        let root_prepaint = root_prepaint_start..self.prepaint_index();
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         let inspector_element = self.prepaint_inspector(_inspector_width, cx);
@@ -3317,7 +3639,9 @@ impl Window {
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
+        let root_paint_start = self.paint_index();
         root_element.paint(self, cx);
+        self.next_frame.root_ranges = Some((root_prepaint, root_paint_start..self.paint_index()));
 
         #[cfg(any(feature = "inspector", debug_assertions))]
         self.paint_inspector(inspector_element, cx);
@@ -3366,13 +3690,10 @@ impl Window {
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {
         // Use indexing instead of iteration to avoid borrowing self for the duration of the loop.
         for tooltip_request_index in (0..self.next_frame.tooltip_requests.len()).rev() {
-            let Some(Some(tooltip_request)) = self
-                .next_frame
-                .tooltip_requests
-                .get(tooltip_request_index)
-                .cloned()
+            let Some(tooltip_request) =
+                self.next_frame.tooltip_requests[tooltip_request_index].clone()
             else {
-                log::error!("Unexpectedly absent TooltipRequest");
+                // An empty slot of a live layer.
                 continue;
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
@@ -3565,6 +3886,12 @@ impl Window {
     }
 
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.frame_work.copied += range.end.hitboxes_index - range.start.hitboxes_index
+                + range.end.dispatch_tree_index
+                - range.start.dispatch_tree_index;
+        }
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
                 .iter()
@@ -3628,6 +3955,11 @@ impl Window {
     }
 
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.frame_work.copied +=
+                range.end.mouse_listeners_index - range.start.mouse_listeners_index;
+        }
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
                 [range.start.cursor_styles_index..range.end.cursor_styles_index]
@@ -3820,7 +4152,7 @@ impl Window {
     /// every frame while it runs; a scene that only pulses never makes it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn awaits_next_frame(&self) -> bool {
-        !self.next_frame_callbacks.borrow().is_empty()
+        !self.next_frame_callbacks.borrow().is_empty() || self.repaint_pending()
     }
 
     /// Quads painted inside `f` breathe with `pulse` on the GPU (see
@@ -4699,36 +5031,19 @@ impl Window {
                 glyph_scale,
             );
             let content_mask = self.snapped_content_mask();
-
-            let spans = glyph_color_spans(
+            let glyph = RecordedGlyph {
                 bounds,
                 content_mask,
-                scale_factor,
                 color,
-                self.text_color_map.as_ref(),
-            );
-            for (content_mask, color) in spans {
-                if subpixel_rendering {
-                    self.next_frame.scene.insert_primitive(SubpixelSprite {
-                        order: 0,
-                        pad: 0,
-                        bounds,
-                        content_mask,
-                        color: color.opacity(element_opacity).into(),
-                        tile,
-                        transformation: TransformationMatrix::unit(),
-                    });
-                } else {
-                    self.next_frame.scene.insert_primitive(MonochromeSprite {
-                        order: 0,
-                        pad: 0,
-                        bounds,
-                        content_mask,
-                        color: color.opacity(element_opacity).into(),
-                        tile,
-                        transformation: TransformationMatrix::unit(),
-                    });
-                }
+                opacity: element_opacity,
+                tile,
+                subpixel: subpixel_rendering,
+                color_map: self.text_color_map.clone(),
+            };
+            match &mut self.next_frame.scene.recording {
+                // Recorded unsplit, so a replay can map its color afresh.
+                Some(recording) => recording.push(RecordedPaint::Glyph(glyph)),
+                None => self.insert_glyph(&glyph, content_mask, glyph.color_map.as_ref()),
             }
         }
         Ok(())
@@ -5872,8 +6187,8 @@ impl Window {
 
         // Capture phase, events bubble from back to front. Handlers for this phase are used for
         // special purposes, such as detecting events outside of a given Bounds.
-        for listener in &mut mouse_listeners {
-            let listener = listener.as_mut().unwrap();
+        // Empty slots belong to live layers.
+        for listener in mouse_listeners.iter_mut().flatten() {
             listener(event, DispatchPhase::Capture, self, cx);
             if !cx.propagate_event {
                 break;
@@ -5882,8 +6197,7 @@ impl Window {
 
         // Bubble phase, where most normal handlers do their work.
         if cx.propagate_event {
-            for listener in mouse_listeners.iter_mut().rev() {
-                let listener = listener.as_mut().unwrap();
+            for listener in mouse_listeners.iter_mut().rev().flatten() {
                 listener(event, DispatchPhase::Bubble, self, cx);
                 if !cx.propagate_event {
                     break;
@@ -8952,7 +9266,7 @@ mod tests {
 /// The composed element transform in effect while drawing: a layout-space
 /// point `p` paints at `p * scale + offset`.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ScreenTransform {
+pub(crate) struct ScreenTransform {
     scale: f32,
     offset: Point<Pixels>,
 }

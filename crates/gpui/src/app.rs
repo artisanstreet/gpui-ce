@@ -774,6 +774,9 @@ pub struct App {
     pub(crate) window_invalidators_by_entity:
         FxHashMap<EntityId, FxHashMap<WindowId, WindowInvalidator>>,
     pub(crate) tracked_entities: FxHashMap<WindowId, FxHashSet<EntityId>>,
+    /// For each [`Self::detect_accessed_entities`] call in progress, the
+    /// entities read by the calls nested inside it, innermost last.
+    nested_entity_reads: Vec<FxHashSet<EntityId>>,
     pub(crate) current_window_by_entity: FxHashMap<EntityId, WindowId>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) inspector_renderer: Option<crate::InspectorRenderer>,
@@ -865,6 +868,7 @@ impl App {
                 pending_global_notifications: Default::default(),
                 observers: SubscriberSet::new(),
                 tracked_entities: FxHashMap::default(),
+                nested_entity_reads: Vec::new(),
                 window_invalidators_by_entity: FxHashMap::default(),
                 current_window_by_entity: FxHashMap::default(),
                 event_listeners: SubscriberSet::new(),
@@ -1139,20 +1143,53 @@ impl App {
         })
     }
 
+    /// Runs `callback`, returning the entities it read: those it read
+    /// itself, outside any nested call, and those it read in total. The
+    /// total also counts as read by the enclosing call.
     pub(crate) fn detect_accessed_entities<R>(
         &mut self,
         callback: impl FnOnce(&mut App) -> R,
-    ) -> (R, FxHashSet<EntityId>) {
-        let accessed_entities_start = self.entities.accessed_entities.get_mut().clone();
+    ) -> (R, EntityReads) {
+        let outer = mem::take(self.entities.accessed_entities.get_mut());
+        self.nested_entity_reads.push(FxHashSet::default());
         let result = callback(self);
-        let entities_accessed_in_callback = self
-            .entities
-            .accessed_entities
-            .get_mut()
-            .difference(&accessed_entities_start)
-            .copied()
-            .collect::<FxHashSet<EntityId>>();
-        (result, entities_accessed_in_callback)
+        let direct = mem::replace(self.entities.accessed_entities.get_mut(), outer);
+        let mut total = self.nested_entity_reads.pop().unwrap();
+        total.extend(direct.iter().copied());
+        self.extend_nested_entity_reads(&total);
+        (result, EntityReads { direct, total })
+    }
+
+    /// Counts `entities` as read by a call nested in the innermost
+    /// [`Self::detect_accessed_entities`] in progress, as a reused cached
+    /// view's reads are.
+    pub(crate) fn extend_nested_entity_reads(&mut self, entities: &FxHashSet<EntityId>) {
+        match self.nested_entity_reads.last_mut() {
+            Some(nested) => nested.extend(entities.iter().copied()),
+            None => self.entities.extend_accessed(entities),
+        }
+    }
+
+    /// Makes `window` track `entities` too, as a frame that redrew part of it
+    /// in place read them.
+    pub(crate) fn track_entities(
+        &mut self,
+        window_handle: AnyWindowHandle,
+        invalidator: WindowInvalidator,
+        entities: &FxHashSet<EntityId>,
+    ) {
+        for entity in entities {
+            self.window_invalidators_by_entity
+                .entry(*entity)
+                .or_default()
+                .insert(window_handle.id, invalidator.clone());
+            self.current_window_by_entity
+                .insert(*entity, window_handle.id);
+        }
+        self.tracked_entities
+            .entry(window_handle.id)
+            .or_default()
+            .extend(entities.iter().copied());
     }
 
     pub(crate) fn record_entities_accessed(
@@ -1786,6 +1823,7 @@ impl App {
                         if window.invalidator.is_dirty()
                             || window.needs_present.get()
                             || !window.next_frame_callbacks.borrow().is_empty()
+                            || window.repaint_pending()
                         {
                             window.platform_window.schedule_frame();
                         }
@@ -3254,4 +3292,12 @@ mod test {
         assert_eq!(path, Some(restart_path));
         assert_eq!(restart_arguments, arguments);
     }
+}
+
+/// The entities read during a [`App::detect_accessed_entities`] call.
+pub(crate) struct EntityReads {
+    /// Read by the call itself, not by calls nested in it.
+    pub(crate) direct: FxHashSet<EntityId>,
+    /// Read anywhere in the call.
+    pub(crate) total: FxHashSet<EntityId>,
 }
