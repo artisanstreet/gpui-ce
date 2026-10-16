@@ -132,7 +132,12 @@ impl Scene {
     }
 
     pub fn push_layer(&mut self, bounds: Bounds<ScaledPixels>) {
-        debug_assert!(self.recording.is_none(), "layers cannot be recorded");
+        // A recording keeps layers, so a replayed line of text still stacks
+        // its glyphs at one order.
+        if let Some(recording) = &mut self.recording {
+            recording.push(RecordedPaint::StartLayer(bounds));
+            return;
+        }
         let order = match self.open_regions.last_mut() {
             Some(region) => {
                 self.repaint_regions[region.index]
@@ -150,7 +155,10 @@ impl Scene {
     }
 
     pub fn pop_layer(&mut self) {
-        debug_assert!(self.recording.is_none(), "layers cannot be recorded");
+        if let Some(recording) = &mut self.recording {
+            recording.push(RecordedPaint::EndLayer);
+            return;
+        }
         self.layer_stack.pop();
         match self.open_regions.last() {
             Some(region) => self.repaint_regions[region.index]
@@ -1396,6 +1404,8 @@ pub(crate) enum RecordedPaint {
     /// A glyph keeps its color unmapped, so replaying it under a
     /// [`TextColorMap`] maps it afresh.
     Glyph(RecordedGlyph),
+    StartLayer(Bounds<ScaledPixels>),
+    EndLayer,
 }
 
 #[derive(Clone)]

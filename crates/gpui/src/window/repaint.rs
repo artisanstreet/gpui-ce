@@ -154,8 +154,8 @@ impl Window {
         }
     }
 
-    /// Paints a [`PaintRecording`] as it was recorded, clipped to the current
-    /// content mask. Its glyphs take the current
+    /// Paints a [`PaintRecording`] as it was recorded, layers included,
+    /// clipped to the current content mask. Its glyphs take the current
     /// [`text color map`](Self::with_text_color_map), or the one in effect when
     /// they were recorded if there is none; nothing else is restyled.
     pub fn paint_recording(&mut self, recording: &PaintRecording) {
@@ -170,6 +170,8 @@ impl Window {
                     mask.bounds = mask.bounds.intersect(&content_mask.bounds);
                     self.next_frame.scene.insert_primitive(primitive);
                 }
+                RecordedPaint::StartLayer(bounds) => self.next_frame.scene.push_layer(*bounds),
+                RecordedPaint::EndLayer => self.next_frame.scene.pop_layer(),
                 RecordedPaint::Glyph(glyph) => {
                     let map = self
                         .text_color_map
@@ -1066,5 +1068,209 @@ mod tests {
             (vec![0.75], 1),
             "the glyph recolors and the background stays"
         );
+    }
+
+    /// Records `quads` quads, each overlapping the one before, inside a
+    /// [`Window::paint_layer`] as text lines paint (or without one), with a
+    /// glyph among them, and replays the recording each frame under a moving
+    /// text color map.
+    struct RecordedLine {
+        quads: usize,
+        layer: bool,
+        glyph: RecordedGlyph,
+        phase: Rc<Cell<f32>>,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for RecordedLine {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.renders.update(|renders| renders + 1);
+            let (quads, layer, glyph, phase) = (
+                self.quads,
+                self.layer,
+                self.glyph.clone(),
+                self.phase.clone(),
+            );
+            canvas(
+                |_, _, _| {},
+                move |bounds, _, window, cx| {
+                    let paint_line = |window: &mut Window| {
+                        for index in 0..quads {
+                            let left = bounds.left() + px(index as f32 * 0.25);
+                            let quad = Bounds::new(point(left, bounds.top()), size(px(4.), px(8.)));
+                            window.paint_quad(fill(quad, red()));
+                        }
+                    };
+                    let mut recording = window.record_paint(|window| {
+                        if layer {
+                            window.paint_layer(bounds, paint_line);
+                        } else {
+                            paint_line(window);
+                        }
+                    });
+                    // The test text system shapes no glyphs: add one by hand,
+                    // inside the layer when there is one.
+                    let mut paints = recording.paints.to_vec();
+                    let at = if layer {
+                        paints.len() - 1
+                    } else {
+                        paints.len()
+                    };
+                    paints.insert(at, RecordedPaint::Glyph(glyph.clone()));
+                    recording = PaintRecording {
+                        paints: paints.into(),
+                    };
+                    let phase = phase.clone();
+                    window.paint_animated(
+                        move |window, _| {
+                            let phase = phase.get();
+                            window.with_text_color_map(
+                                Some(Rc::new(move |_, color: Hsla| color.opacity(phase))),
+                                |window| window.paint_recording(&recording),
+                            );
+                            true
+                        },
+                        cx,
+                    );
+                },
+            )
+            .size_full()
+        }
+    }
+
+    fn open_recorded_line(
+        cx: &mut TestAppContext,
+        quads: usize,
+        layer: bool,
+    ) -> (WindowHandle<RecordedLine>, Rc<Cell<f32>>, Rc<Cell<usize>>) {
+        let bounds = Bounds::new(
+            point(ScaledPixels(4.), ScaledPixels(4.)),
+            size(ScaledPixels(8.), ScaledPixels(12.)),
+        );
+        let glyph = RecordedGlyph {
+            bounds,
+            content_mask: crate::ContentMask { bounds },
+            color: hsla(0., 0., 0., 1.),
+            opacity: 1.,
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(1),
+                padding: 0,
+                bounds: Bounds::new(
+                    point(DevicePixels(0), DevicePixels(0)),
+                    size(DevicePixels(8), DevicePixels(12)),
+                ),
+            },
+            subpixel: false,
+            color_map: None,
+        };
+        let (phase, renders) = (Rc::new(Cell::new(0.25)), Rc::new(Cell::new(0)));
+        let window = cx.open_window(size(px(400.), px(100.)), {
+            let (phase, renders) = (phase.clone(), renders.clone());
+            move |_, _| RecordedLine {
+                quads,
+                layer,
+                glyph,
+                phase,
+                renders,
+            }
+        });
+        cx.run_until_parked();
+        window
+            .update(cx, |_, window, _| window.active.set(true))
+            .unwrap();
+        (window, phase, renders)
+    }
+
+    /// The painted glyph's alpha, the painted quads, and how many layers the
+    /// scene holds.
+    fn recorded_line_output(
+        cx: &mut TestAppContext,
+        window: WindowHandle<RecordedLine>,
+    ) -> (Vec<f32>, usize) {
+        window
+            .update(cx, |_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                (
+                    scene
+                        .monochrome_sprites
+                        .iter()
+                        .filter(|sprite| !sprite.bounds.is_empty())
+                        .map(|sprite| sprite.color.a)
+                        .collect(),
+                    scene
+                        .quads
+                        .iter()
+                        .filter(|quad| !quad.bounds.is_empty())
+                        .count(),
+                )
+            })
+            .unwrap()
+    }
+
+    #[crate::test]
+    fn recorded_layers_replay_across_repaint_frames(cx: &mut TestAppContext) {
+        let (window, phase, renders) = open_recorded_line(cx, 3, true);
+        assert_eq!(recorded_line_output(cx, window), (vec![0.25], 3));
+        let rendered = renders.get();
+        for alpha in [0.5, 0.75, 1.0] {
+            phase.set(alpha);
+            frame(cx, window);
+            assert_eq!(recorded_line_output(cx, window), (vec![alpha], 3));
+        }
+        assert_eq!(renders.get(), rendered, "repainted without rendering");
+    }
+
+    #[crate::test]
+    fn a_long_recorded_line_repaints_in_place(cx: &mut TestAppContext) {
+        // Each quad overlaps the one before, as glyphs of a tight line can:
+        // without its layer the line would stack 600 orders deep.
+        let (window, phase, renders) = open_recorded_line(cx, 600, true);
+        let rendered = renders.get();
+        for alpha in [0.5, 0.75, 1.0] {
+            phase.set(alpha);
+            frame(cx, window);
+            assert_eq!(recorded_line_output(cx, window), (vec![alpha], 600));
+        }
+        assert_eq!(
+            renders.get(),
+            rendered,
+            "the layer keeps the line within its orders"
+        );
+        let depth = window
+            .update(cx, |_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                scene
+                    .region_indices
+                    .values()
+                    .map(|index| {
+                        let orders = &scene.repaint_regions[*index].orders;
+                        orders.end - orders.start
+                    })
+                    .max()
+            })
+            .unwrap();
+        assert_eq!(
+            depth,
+            Some(256),
+            "the line stacks within the default reservation"
+        );
+    }
+
+    #[crate::test]
+    fn deep_recorded_paint_without_a_layer_settles_in_place(cx: &mut TestAppContext) {
+        // 300 orders deep: the region reserves as many when first painted, so
+        // repaints fit instead of falling back to rendering every frame.
+        let (window, phase, renders) = open_recorded_line(cx, 300, false);
+        let rendered = renders.get();
+        for alpha in [0.5, 0.75, 1.0] {
+            phase.set(alpha);
+            frame(cx, window);
+            assert_eq!(recorded_line_output(cx, window), (vec![alpha], 300));
+        }
+        assert_eq!(renders.get(), rendered);
     }
 }
