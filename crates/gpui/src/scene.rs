@@ -5,9 +5,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Mesh,
-    MeshStyle, Pixels, Point, Radians, ScaledFilter, ScaledPixels, Size, TextColorMap,
-    bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, ContentMask, Corners, Edges,
+    Hsla, Mesh, MeshStyle, Pixels, Point, Radians, ScaledFilter, ScaledPixels, Size, TextColorMap,
+    TileId, bounds_tree::BoundsTree, point,
 };
 use collections::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -1294,6 +1294,21 @@ trait Tombstone: Clone {
 }
 
 macro_rules! tombstone {
+    // A slack sprite names no texture.
+    (sprite $type:ty $(, $field:ident = $value:expr)*) => {
+        impl Tombstone for $type {
+            fn tombstone(&self, order: DrawOrder) -> Self {
+                Self {
+                    order,
+                    bounds: Bounds::default(),
+                    content_mask: ContentMask::default(),
+                    tile: slack_tile(self.tile.texture_id.kind),
+                    $($field: $value,)*
+                    ..self.clone()
+                }
+            }
+        }
+    };
     ($type:ty $(, $field:ident = $value:expr)*) => {
         impl Tombstone for $type {
             fn tombstone(&self, order: DrawOrder) -> Self {
@@ -1315,15 +1330,46 @@ tombstone!(
 );
 tombstone!(Quad, pulse = QuadPulse::default());
 tombstone!(Underline);
-tombstone!(
-    MonochromeSprite,
-    transformation = TransformationMatrix::unit()
-);
-tombstone!(
-    SubpixelSprite,
-    transformation = TransformationMatrix::unit()
-);
-tombstone!(PolychromeSprite);
+tombstone!(sprite MonochromeSprite, transformation = TransformationMatrix::unit());
+tombstone!(sprite SubpixelSprite, transformation = TransformationMatrix::unit());
+tombstone!(sprite PolychromeSprite);
+
+/// The texture index of slack sprites, which no atlas texture has: slack
+/// names no texture, so it can't name one that's gone.
+const SLACK_TEXTURE_INDEX: u32 = u32::MAX;
+
+fn slack_tile(kind: AtlasTextureKind) -> AtlasTile {
+    AtlasTile::slack(kind)
+}
+
+fn is_slack(tile: &AtlasTile) -> bool {
+    tile.is_slack()
+}
+
+impl AtlasTile {
+    /// The tile of a slack sprite: an empty slot a live layer keeps in a
+    /// sprite vector. It names no atlas texture and sorts after every real
+    /// tile at its order. [`Scene::batches`] never starts a batch with one;
+    /// inside a batch, slack draws as nothing with the batch's texture.
+    #[doc(hidden)]
+    pub fn slack(kind: AtlasTextureKind) -> Self {
+        AtlasTile {
+            texture_id: AtlasTextureId {
+                index: SLACK_TEXTURE_INDEX,
+                kind,
+            },
+            tile_id: TileId(u32::MAX),
+            padding: 0,
+            bounds: Bounds::default(),
+        }
+    }
+
+    /// Whether this is the tile of a slack sprite (see [`Self::slack`]).
+    #[doc(hidden)]
+    pub fn is_slack(&self) -> bool {
+        self.texture_id.index == SLACK_TEXTURE_INDEX
+    }
+}
 
 /// Kinds without slack only ever replace their run with as many primitives.
 macro_rules! no_tombstone {
@@ -1790,6 +1836,28 @@ impl<'a> Iterator for BatchIterator<'a> {
     type Item = PrimitiveBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // No batch starts with slack, so every batch names a real texture.
+        while self
+            .monochrome_sprites_iter
+            .next_if(|sprite| is_slack(&sprite.tile))
+            .is_some()
+        {
+            self.monochrome_sprites_start += 1;
+        }
+        while self
+            .subpixel_sprites_iter
+            .next_if(|sprite| is_slack(&sprite.tile))
+            .is_some()
+        {
+            self.subpixel_sprites_start += 1;
+        }
+        while self
+            .polychrome_sprites_iter
+            .next_if(|sprite| is_slack(&sprite.tile))
+            .is_some()
+        {
+            self.polychrome_sprites_start += 1;
+        }
         let mut orders_and_kinds = [
             (
                 self.shadows_iter.peek().map(|s| s.order),
@@ -1908,11 +1976,12 @@ impl<'a> Iterator for BatchIterator<'a> {
                 let sprites_start = self.monochrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.monochrome_sprites_iter.next();
+                // Slack inside a run draws with it, as nothing.
                 while self
                     .monochrome_sprites_iter
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
+                            && (sprite.tile.texture_id == texture_id || is_slack(&sprite.tile))
                     })
                     .is_some()
                 {
@@ -1929,11 +1998,12 @@ impl<'a> Iterator for BatchIterator<'a> {
                 let sprites_start = self.subpixel_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.subpixel_sprites_iter.next();
+                // Slack inside a run draws with it, as nothing.
                 while self
                     .subpixel_sprites_iter
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
+                            && (sprite.tile.texture_id == texture_id || is_slack(&sprite.tile))
                     })
                     .is_some()
                 {
@@ -1950,11 +2020,12 @@ impl<'a> Iterator for BatchIterator<'a> {
                 let sprites_start = self.polychrome_sprites_start;
                 let mut sprites_end = sprites_start + 1;
                 self.polychrome_sprites_iter.next();
+                // Slack inside a run draws with it, as nothing.
                 while self
                     .polychrome_sprites_iter
                     .next_if(|sprite| {
                         (sprite.order, batch_kind) < max_order_and_kind
-                            && sprite.tile.texture_id == texture_id
+                            && (sprite.tile.texture_id == texture_id || is_slack(&sprite.tile))
                     })
                     .is_some()
                 {
@@ -3295,5 +3366,98 @@ mod tests {
             "{:?}",
             damage.regions()
         );
+    }
+
+    fn image(page: u32, left: f32) -> PolychromeSprite {
+        let bounds = Bounds::new(point(sp(left), sp(0.)), Size::new(sp(10.), sp(10.)));
+        PolychromeSprite {
+            order: 0,
+            pad: 0,
+            grayscale: false.into(),
+            opacity: 1.,
+            bounds,
+            content_mask: ContentMask { bounds },
+            corner_radii: Corners::default(),
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: page,
+                    kind: AtlasTextureKind::Polychrome,
+                },
+                tile_id: TileId(page),
+                padding: 0,
+                bounds: Bounds::default(),
+            },
+        }
+    }
+
+    fn sprite_batches(scene: &Scene) -> Vec<(u32, Range<usize>)> {
+        scene
+            .batches()
+            .filter_map(|batch| match batch {
+                PrimitiveBatch::PolychromeSprites { texture_id, range } => {
+                    Some((texture_id.index, range))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slack_after_a_released_image_names_no_texture_and_starts_no_batch() {
+        // A region shows an image on atlas page 3, keeping slack behind it.
+        let mut scene = Scene::default();
+        scene.begin_repaint_region(RepaintId(1));
+        scene.insert_primitive(image(3, 0.));
+        scene.end_repaint_region();
+        scene.finish();
+        let base = scene.repaint_regions[0].orders.start;
+        assert!(
+            scene.polychrome_sprites[1..]
+                .iter()
+                .all(|sprite| is_slack(&sprite.tile)),
+            "slack names no atlas page"
+        );
+
+        // The image is released and the region shows nothing now: every
+        // slot is slack, and no batch draws any of it.
+        let mut empty = Scene::default();
+        empty.begin_repaint_region_at(RepaintId(1), base);
+        empty.end_repaint_region();
+        let mut damage = Damage::default();
+        assert!(scene.replace_repaint_region(0, &mut empty, &mut damage));
+        assert!(
+            scene
+                .polychrome_sprites
+                .iter()
+                .all(|sprite| is_slack(&sprite.tile))
+        );
+        assert_eq!(sprite_batches(&scene), vec![]);
+
+        // An image on page 5 fills a slot; the slack around it draws in its
+        // batch, which names page 5 only.
+        let mut repainted = Scene::default();
+        repainted.begin_repaint_region_at(RepaintId(1), base);
+        repainted.insert_primitive(image(5, 20.));
+        repainted.end_repaint_region();
+        assert!(scene.replace_repaint_region(0, &mut repainted, &mut damage));
+        let batches = sprite_batches(&scene);
+        assert_eq!(batches.len(), 1);
+        let (page, range) = batches[0].clone();
+        assert_eq!(page, 5);
+        assert!(!is_slack(&scene.polychrome_sprites[range.start].tile));
+    }
+
+    #[test]
+    fn slack_inside_a_run_does_not_split_its_batch() {
+        // Images on page 1 before and after a region whose slack sorts
+        // between them: one batch, slack drawn with it as nothing.
+        let mut scene = Scene::default();
+        scene.begin_repaint_region(RepaintId(1));
+        scene.insert_primitive(image(1, 0.));
+        scene.end_repaint_region();
+        scene.insert_primitive(image(1, 40.));
+        scene.finish();
+        let batches = sprite_batches(&scene);
+        assert_eq!(batches, vec![(1, 0..scene.polychrome_sprites.len())]);
     }
 }
