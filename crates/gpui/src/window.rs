@@ -1728,9 +1728,22 @@ impl Window {
                 let force_render =
                     mem::take(&mut deferred_force_render) || request_frame_options.force_render;
 
-                let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
-                    .log_err();
+                // The App can also be borrowed outside a draw: Win32 re-enters
+                // the window procedure from input dispatch (a synchronous
+                // `WM_SHOWWINDOW`, a modal loop, cross-thread `SendMessage`).
+                // Taking the next-frame callbacks then would drop them when the
+                // updates below fail, and a caller that guards on "a frame is
+                // scheduled" (a wheel glide) would wait forever. Defer the whole
+                // frame, keep the callbacks, and ask for another frame.
+                let Ok(thermal_state) = handle.update(&mut cx, |_, _, cx| cx.thermal_state())
+                else {
+                    log::debug!("deferring frame request: the window can't be updated");
+                    deferred_force_render |= force_render;
+                    if !next_frame_callbacks.borrow().is_empty() {
+                        invalidator.wake_platform();
+                    }
+                    return;
+                };
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
@@ -1749,7 +1762,7 @@ impl Window {
                     None
                 } else if !active.get() && !input_activity.borrow().is_recent(Instant::now()) {
                     inactive_frame_interval
-                } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
+                } else if let ThermalState::Critical | ThermalState::Serious = thermal_state {
                     Some(Duration::from_micros(16667))
                 } else {
                     None
@@ -8462,6 +8475,38 @@ mod tests {
         assert!(
             test_window.frame_wake_count() > baseline || callback_ran.get(),
             "a frame request with pending next-frame callbacks must either run them or re-arm the frame source"
+        );
+    }
+
+    /// Win32 can deliver a frame request while the App is borrowed outside a
+    /// draw. The callbacks must survive it and run on the next frame; losing
+    /// them froze the Editor's wheel glide until restart.
+    #[gpui::test]
+    fn next_frame_callbacks_survive_a_frame_request_while_the_app_is_busy(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        let callback_ran = Rc::new(Cell::new(false));
+        window
+            .update(cx, {
+                let callback_ran = callback_ran.clone();
+                let test_window = test_window.clone();
+                move |_, window, _| {
+                    window.on_next_frame(move |_, _| callback_ran.set(true));
+                    let baseline = test_window.frame_wake_count();
+                    test_window.simulate_frame_request(RequestFrameOptions::default());
+                    assert!(
+                        test_window.frame_wake_count() > baseline,
+                        "a deferred frame must ask for another one"
+                    );
+                }
+            })
+            .unwrap();
+        assert!(!callback_ran.get());
+
+        test_window.simulate_frame_request(RequestFrameOptions::default());
+        assert!(
+            callback_ran.get(),
+            "the next frame runs the callback the busy request couldn't"
         );
     }
 
