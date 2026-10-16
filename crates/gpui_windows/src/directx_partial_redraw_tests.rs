@@ -1,9 +1,10 @@
 use super::path_pixel_tests::renderer;
-use super::{DamageRect, DamageSources, DamageTracker, FrameDamage, Repaint};
+use super::{DamageRect, DamageSources, DamageTracker, FrameDamage, Repaint, batch_bounds};
 use anyhow::Result;
 use gpui::{
-    BackdropFilter, Bounds, ContentMask, Corners, FilterBoundary, Quad, QuadPulse, ScaledFilter,
-    ScaledPixels, Scene, WindowBackgroundAppearance, hsla, point, size,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, BackdropFilter, Bounds, ContentMask, Corners,
+    FilterBoundary, PaddedBool32, PolychromeSprite, PrimitiveRanges, Quad, QuadPulse, ScaledFilter,
+    ScaledPixels, Scene, Shadow, TileId, WindowBackgroundAppearance, hsla, point, size,
 };
 
 const VIEWPORT: [u32; 2] = [96, 96];
@@ -140,15 +141,6 @@ fn assert_partial_matches_full(before: &Scene, after: &Scene, repaint: &Repaint)
 fn a_partial_repaint_over_the_previous_frame_matches_a_full_render() -> Result<()> {
     for filters in [false, true] {
         // A second change far from the first, like a sidebar dot beside a transcript line.
-        let corner = |hue| Quad {
-            order: 7,
-            bounds: rect(88.0, 84.0, 6.0, 6.0),
-            content_mask: ContentMask {
-                bounds: rect(0.0, 0.0, 96.0, 96.0),
-            },
-            background: hsla(hue, 0.8, 0.5, 1.0).into(),
-            ..Default::default()
-        };
         let before = scene(
             1,
             0.0,
@@ -236,4 +228,184 @@ fn removing_a_blurred_group_repaints_the_blur_it_spread() -> Result<()> {
     };
     assert!(matches!(repaint, Repaint::Partial(_)), "{repaint:?}");
     assert_partial_matches_full(&before, &after, repaint)
+}
+
+/// A small quad in the bottom-right corner, drawn last.
+fn corner(hue: f32) -> Quad {
+    Quad {
+        order: 7,
+        bounds: rect(88.0, 84.0, 6.0, 6.0),
+        content_mask: ContentMask {
+            bounds: rect(0.0, 0.0, 96.0, 96.0),
+        },
+        background: hsla(hue, 0.8, 0.5, 1.0).into(),
+        ..Default::default()
+    }
+}
+
+/// Renders `before` whole, then `after` whole over the instance buffers `before` left.
+fn render_over(before: &Scene, after: &Scene) -> Result<image::RgbaImage> {
+    let background = WindowBackgroundAppearance::Transparent;
+    let mut renderer = renderer(VIEWPORT)?;
+    renderer.render(before, background, &Repaint::Full)?;
+    renderer.render(after, background, &Repaint::Full)?;
+    renderer.read_render_target()
+}
+
+fn render_fresh(scene: &Scene) -> Result<image::RgbaImage> {
+    renderer(VIEWPORT)?.render_to_image(scene, WindowBackgroundAppearance::Transparent)
+}
+
+#[test]
+fn changed_ranges_upload_only_their_instances() -> Result<()> {
+    let square = rect(30.0, 30.0, 12.0, 12.0);
+    // Quads sort to [background, square, corner].
+    let before = scene(1, 0.0, square, false, false, &[corner(0.5)]);
+    let mut after = scene(2, 0.33, square, false, false, &[corner(0.8)]);
+
+    after.changed_primitives = Some(PrimitiveRanges {
+        quads: 1..3,
+        ..Default::default()
+    });
+    assert!(render_over(&before, &after)? == render_fresh(&after)?);
+
+    // Claiming only the square changed leaves the corner as uploaded before, which shows that
+    // nothing outside the range was written.
+    after.changed_primitives = Some(PrimitiveRanges {
+        quads: 1..2,
+        ..Default::default()
+    });
+    let stale_corner = scene(2, 0.33, square, false, false, &[corner(0.5)]);
+    assert!(render_over(&before, &after)? == render_fresh(&stale_corner)?);
+    Ok(())
+}
+
+#[test]
+fn a_vector_outgrowing_its_buffer_uploads_whole() -> Result<()> {
+    let square = rect(30.0, 30.0, 12.0, 12.0);
+    let before = scene(1, 0.0, square, false, false, &[corner(0.5)]);
+    // Past the quad buffer's initial 64 instances, so it regrows and starts empty.
+    let dots: Vec<Quad> = (0..100)
+        .map(|ix| Quad {
+            order: 8 + ix,
+            bounds: rect(
+                (ix % 10) as f32 * 9.0,
+                60.0 + (ix / 10) as f32 * 3.0,
+                2.0,
+                2.0,
+            ),
+            content_mask: ContentMask {
+                bounds: rect(0.0, 0.0, 96.0, 96.0),
+            },
+            background: hsla(ix as f32 / 100.0, 0.8, 0.5, 1.0).into(),
+            ..Default::default()
+        })
+        .collect();
+    let mut after = scene(
+        2,
+        0.0,
+        square,
+        false,
+        false,
+        &[[corner(0.5)].as_slice(), &dots].concat(),
+    );
+    after.changed_primitives = Some(PrimitiveRanges {
+        quads: 3..after.quads.len(),
+        ..Default::default()
+    });
+    assert!(render_over(&before, &after)? == render_fresh(&after)?);
+    Ok(())
+}
+
+#[test]
+fn slack_instances_widen_no_batch() {
+    let full = ContentMask {
+        bounds: rect(0.0, 0.0, 96.0, 96.0),
+    };
+    let mut scene = Scene::default();
+    let shadow = Shadow {
+        order: 0,
+        blur_radius: ScaledPixels(2.0),
+        bounds: rect(40.0, 40.0, 10.0, 10.0),
+        corner_radii: Corners::default(),
+        content_mask: full,
+        color: hsla(0.0, 0.0, 0.0, 0.5).into(),
+        element_bounds: rect(40.0, 40.0, 10.0, 10.0),
+        element_corner_radii: Corners::default(),
+        inset: 0,
+        pad: 0,
+    };
+    scene.insert_primitive(shadow);
+    // Live layers reserve slots as primitives with empty bounds and masks.
+    scene.insert_primitive(Shadow {
+        order: 1,
+        blur_radius: ScaledPixels(0.0),
+        bounds: Bounds::default(),
+        content_mask: ContentMask::default(),
+        element_bounds: Bounds::default(),
+        ..shadow
+    });
+    scene.insert_primitive(Quad {
+        order: 2,
+        bounds: rect(10.0, 12.0, 4.0, 4.0),
+        content_mask: full,
+        ..Default::default()
+    });
+    scene.insert_primitive(Quad {
+        order: 3,
+        ..Default::default()
+    });
+    scene.finish();
+    let bounds: Vec<_> = scene
+        .batches()
+        .map(|batch| batch_bounds(&scene, batch))
+        .collect();
+    assert_eq!(
+        bounds,
+        [
+            // The blur's gaussian tail reaches 3 radii out.
+            Some(DamageRect {
+                left: 34,
+                top: 34,
+                right: 56,
+                bottom: 56,
+            }),
+            Some(DamageRect {
+                left: 10,
+                top: 12,
+                right: 14,
+                bottom: 16,
+            }),
+        ]
+    );
+}
+
+#[test]
+fn slack_sprites_naming_a_freed_atlas_texture_draw_nothing() -> Result<()> {
+    let square = rect(30.0, 30.0, 12.0, 12.0);
+    let plain = scene(1, 0.0, square, false, false, &[]);
+    let mut slack = scene(1, 0.0, square, false, false, &[]);
+    // A slot left by an image whose texture the atlas has since released: this renderer's atlas
+    // holds no polychrome texture at all.
+    slack.insert_primitive(PolychromeSprite {
+        order: 9,
+        pad: 0,
+        grayscale: PaddedBool32::from(false),
+        opacity: 1.0,
+        bounds: Bounds::default(),
+        content_mask: ContentMask::default(),
+        corner_radii: Corners::default(),
+        tile: AtlasTile {
+            texture_id: AtlasTextureId {
+                index: 3,
+                kind: AtlasTextureKind::Polychrome,
+            },
+            tile_id: TileId(0),
+            padding: 0,
+            bounds: Bounds::default(),
+        },
+    });
+    slack.finish();
+    assert!(render_fresh(&slack)? == render_fresh(&plain)?);
+    Ok(())
 }

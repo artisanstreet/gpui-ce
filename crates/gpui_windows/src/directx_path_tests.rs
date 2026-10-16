@@ -40,6 +40,7 @@ pub(super) fn renderer(viewport: [u32; 2]) -> Result<DirectXRenderer> {
         damage: DamageTracker::new(BUFFER_COUNT),
         damage_sources: DamageSources::default(),
         uploaded_generation: None,
+        drawn_generation: None,
         background_appearance: None,
     })
 }

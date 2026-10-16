@@ -1,4 +1,5 @@
 use std::{
+    ops::Range,
     slice,
     sync::{Arc, OnceLock},
 };
@@ -220,6 +221,9 @@ pub(crate) struct DirectXRenderer {
     /// The scene generation whose instances the pipeline buffers and mesh targets hold, so a
     /// present that only advances pulses skips the upload.
     uploaded_generation: Option<u64>,
+    /// The generation of the last scene handed to [`draw`](Self::draw), which the window counts
+    /// as presented whatever the renderer did with it.
+    drawn_generation: Option<u64>,
     /// Retained pixels were cleared to the previous appearance.
     background_appearance: Option<WindowBackgroundAppearance>,
 }
@@ -574,6 +578,7 @@ impl DirectXRenderer {
             damage: DamageTracker::new(BUFFER_COUNT),
             damage_sources: DamageSources::default(),
             uploaded_generation: None,
+            drawn_generation: None,
             background_appearance: None,
         })
     }
@@ -781,6 +786,7 @@ impl DirectXRenderer {
                 .render(scene, background_appearance, repaint)
                 .and_then(|()| self.present(repaint)),
         };
+        self.drawn_generation = Some(scene.generation);
         match presented {
             Ok(true) => {
                 let tinted = match &plan.repaint {
@@ -803,6 +809,22 @@ impl DirectXRenderer {
                 self.damage.invalidate();
                 Err(error)
             }
+        }
+    }
+
+    /// Which of the scene's instances can differ from those uploaded, `None` meaning any. A
+    /// pulse-only present changes none. The window's changed ranges hold against generation
+    /// `generation - 1` and the last scene it handed to [`draw`](Self::draw), so they apply when
+    /// the buffers hold either.
+    fn changed_since_upload(&self, scene: &Scene) -> Option<PrimitiveRanges> {
+        let uploaded = self.uploaded_generation?;
+        if uploaded == scene.generation {
+            return Some(PrimitiveRanges::default());
+        }
+        if uploaded + 1 == scene.generation || self.drawn_generation == Some(uploaded) {
+            scene.changed_primitives.clone()
+        } else {
+            None
         }
     }
 
@@ -854,9 +876,12 @@ impl DirectXRenderer {
         background_appearance: WindowBackgroundAppearance,
         repaint: &Repaint,
     ) -> Result<()> {
-        // A pulse-only present re-presents the uploaded scene.
-        let reuse_uploads = self.uploaded_generation.take() == Some(scene.generation);
-        if !reuse_uploads && (!scene.meshes.is_empty() || self.meshes.is_some()) {
+        let changed = self.changed_since_upload(scene);
+        self.uploaded_generation = None;
+        let meshes_changed = changed
+            .as_ref()
+            .is_none_or(|changed| !changed.meshes.is_empty());
+        if meshes_changed && (!scene.meshes.is_empty() || self.meshes.is_some()) {
             let devices = self.devices.as_ref().context("devices missing")?;
             if self.meshes.is_none() {
                 self.meshes = Some(crate::directx_mesh::MeshRenderer::new(&devices.device)?);
@@ -868,9 +893,7 @@ impl DirectXRenderer {
                 (self.width, self.height),
             )?;
         }
-        if !reuse_uploads {
-            self.upload_scene_buffers(scene)?;
-        }
+        self.upload_scene_buffers(scene, changed.as_ref())?;
         self.uploaded_generation = Some(scene.generation);
         {
             let devices = self.devices.as_ref().context("devices missing")?;
@@ -916,12 +939,10 @@ impl DirectXRenderer {
         // D3D11 scissors with rect 0 unless a geometry shader picks another viewport, so each
         // rectangle of a partial repaint is its own pass over the batches that can touch it.
         let clips = match repaint {
-            Repaint::Partial(rects) => {
-                self.damage_sources.update(scene);
-                rects.iter().copied().map(Some).collect()
-            }
+            Repaint::Partial(rects) => rects.iter().copied().map(Some).collect(),
             Repaint::Nothing | Repaint::Full => vec![None],
         };
+        self.damage_sources.update(scene);
         let batch_bounds = std::mem::take(&mut self.damage_sources.batches);
         let result = clips.into_iter().try_for_each(|clip| {
             self.render_pass(
@@ -944,7 +965,7 @@ impl DirectXRenderer {
     }
 
     /// Encodes the batches of `scene` that can touch `clip` (`None`: the whole target), clipped
-    /// to it. `batch_bounds` holds [`batch_bounds`] per batch when `clip` is set.
+    /// to it. `batch_bounds` holds [`batch_bounds`] for each of the scene's batches.
     fn render_pass(
         &mut self,
         scene: &Scene,
@@ -1023,8 +1044,10 @@ impl DirectXRenderer {
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
         for (ix, batch) in scene.batches().enumerate() {
-            if let (Some(clip), Some(Some(bounds))) = (clip, batch_bounds.get(ix))
-                && !clip.intersects(bounds)
+            // Batches of only empty slots, which live layers reserve, draw nothing; their sprites
+            // may even name an atlas texture freed since.
+            if let Some(Some(bounds)) = batch_bounds.get(ix)
+                && (bounds.is_empty() || clip.is_some_and(|clip| !clip.intersects(bounds)))
             {
                 continue;
             }
@@ -1181,12 +1204,14 @@ impl DirectXRenderer {
             !self.skip_draws,
             "render_to_image unavailable while recovering from a lost device"
         );
-        // This scene is not the window's: the next present must neither reuse its uploads nor
-        // trust the back buffer this overwrites.
+        // This scene is not the window's: the next present must neither reuse its uploads or
+        // per-generation sources nor trust the back buffer this overwrites.
         self.damage.invalidate();
         self.uploaded_generation = None;
+        self.damage_sources = DamageSources::default();
         let rendered = self.render(scene, background_appearance, &Repaint::Full);
         self.uploaded_generation = None;
+        self.damage_sources = DamageSources::default();
         rendered?;
         self.read_render_target()
     }
@@ -1300,57 +1325,51 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn upload_scene_buffers(&mut self, scene: &Scene) -> Result<()> {
+    /// Uploads the scene's instances; with `changed`, only those in its ranges.
+    fn upload_scene_buffers(
+        &mut self,
+        scene: &Scene,
+        changed: Option<&PrimitiveRanges>,
+    ) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-
-        if !scene.shadows.is_empty() {
-            self.pipelines.shadow_pipeline.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.shadows,
-            )?;
-        }
-
-        if !scene.quads.is_empty() {
-            self.pipelines.quad_pipeline.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.quads,
-            )?;
-        }
-
-        if !scene.underlines.is_empty() {
-            self.pipelines.underline_pipeline.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.underlines,
-            )?;
-        }
-
-        if !scene.monochrome_sprites.is_empty() {
-            self.pipelines.mono_sprites.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.monochrome_sprites,
-            )?;
-        }
-
-        if !scene.subpixel_sprites.is_empty() {
-            self.pipelines.subpixel_sprites.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.subpixel_sprites,
-            )?;
-        }
-
-        if !scene.polychrome_sprites.is_empty() {
-            self.pipelines.poly_sprites.update_buffer(
-                &devices.device,
-                &devices.device_context,
-                &scene.polychrome_sprites,
-            )?;
-        }
-
+        let (device, context) = (&devices.device, &devices.device_context);
+        let pipelines = &mut self.pipelines;
+        pipelines.shadow_pipeline.update_changed(
+            device,
+            context,
+            &scene.shadows,
+            changed.map(|changed| changed.shadows.clone()),
+        )?;
+        pipelines.quad_pipeline.update_changed(
+            device,
+            context,
+            &scene.quads,
+            changed.map(|changed| changed.quads.clone()),
+        )?;
+        pipelines.underline_pipeline.update_changed(
+            device,
+            context,
+            &scene.underlines,
+            changed.map(|changed| changed.underlines.clone()),
+        )?;
+        pipelines.mono_sprites.update_changed(
+            device,
+            context,
+            &scene.monochrome_sprites,
+            changed.map(|changed| changed.monochrome_sprites.clone()),
+        )?;
+        pipelines.subpixel_sprites.update_changed(
+            device,
+            context,
+            &scene.subpixel_sprites,
+            changed.map(|changed| changed.subpixel_sprites.clone()),
+        )?;
+        pipelines.poly_sprites.update_changed(
+            device,
+            context,
+            &scene.polychrome_sprites,
+            changed.map(|changed| changed.polychrome_sprites.clone()),
+        )?;
         Ok(())
     }
 
@@ -2089,6 +2108,7 @@ impl DirectXRenderPipelines {
             ShaderModule::Shadow,
             4,
             create_blend_state(device)?,
+            InstanceUpload::Retained,
         )?;
         let quad_pipeline = PipelineState::new(
             device,
@@ -2096,6 +2116,7 @@ impl DirectXRenderPipelines {
             ShaderModule::Quad,
             64,
             create_blend_state(device)?,
+            InstanceUpload::Retained,
         )?;
         let path_rasterization_pipeline = PipelineState::new(
             device,
@@ -2103,6 +2124,7 @@ impl DirectXRenderPipelines {
             ShaderModule::PathRasterization,
             32,
             create_blend_state_for_path_rasterization(device)?,
+            InstanceUpload::Discard,
         )?;
         let path_sprite_pipeline = PipelineState::new(
             device,
@@ -2110,6 +2132,7 @@ impl DirectXRenderPipelines {
             ShaderModule::PathSprite,
             4,
             create_blend_state_for_path_sprite(device)?,
+            InstanceUpload::Discard,
         )?;
         let underline_pipeline = PipelineState::new(
             device,
@@ -2117,6 +2140,7 @@ impl DirectXRenderPipelines {
             ShaderModule::Underline,
             4,
             create_blend_state(device)?,
+            InstanceUpload::Retained,
         )?;
         let mono_sprites = PipelineState::new(
             device,
@@ -2124,6 +2148,7 @@ impl DirectXRenderPipelines {
             ShaderModule::MonochromeSprite,
             512,
             create_blend_state(device)?,
+            InstanceUpload::Retained,
         )?;
         let subpixel_sprites = PipelineState::new(
             device,
@@ -2131,6 +2156,7 @@ impl DirectXRenderPipelines {
             ShaderModule::SubpixelSprite,
             512,
             create_blend_state_for_subpixel_rendering(device)?,
+            InstanceUpload::Retained,
         )?;
         let poly_sprites = PipelineState::new(
             device,
@@ -2138,6 +2164,7 @@ impl DirectXRenderPipelines {
             ShaderModule::PolychromeSprite,
             16,
             create_blend_state(device)?,
+            InstanceUpload::Retained,
         )?;
 
         let blur_downsample_vertex = create_vertex_shader(
@@ -2176,6 +2203,7 @@ impl DirectXRenderPipelines {
                 ShaderModule::Quad,
                 1,
                 create_blend_state(device)?,
+                InstanceUpload::Discard,
             )?)
         } else {
             None
@@ -2331,12 +2359,26 @@ struct BatchParams {
 
 const _: () = assert!(std::mem::size_of::<BatchParams>() == 16);
 
+/// How a pipeline's instance buffer is written.
+#[derive(Clone, Copy, PartialEq)]
+enum InstanceUpload {
+    /// Rewritten whole through a discarded dynamic buffer: for instances built per draw.
+    Discard,
+    /// Kept across frames in a default-usage buffer, so a frame uploads only the instances that
+    /// changed. Mapping with `NO_OVERWRITE` instead would race the previous frame's draws, which
+    /// may still be reading the slots being rewritten; `UpdateSubresource` is ordered after them.
+    Retained,
+}
+
 struct PipelineState<T> {
     label: &'static str,
     vertex: ID3D11VertexShader,
     fragment: ID3D11PixelShader,
     buffer: ID3D11Buffer,
     buffer_size: usize,
+    upload: InstanceUpload,
+    /// How many instances the buffer holds from the last upload.
+    uploaded_len: usize,
     view: Option<ID3D11ShaderResourceView>,
     blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
@@ -2349,6 +2391,7 @@ impl<T> PipelineState<T> {
         shader_module: ShaderModule,
         buffer_size: usize,
         blend_state: ID3D11BlendState,
+        upload: InstanceUpload,
     ) -> Result<Self> {
         let vertex = {
             let raw_shader = RawShaderBytes::new(shader_module, ShaderTarget::Vertex)?;
@@ -2358,7 +2401,7 @@ impl<T> PipelineState<T> {
             let raw_shader = RawShaderBytes::new(shader_module, ShaderTarget::Fragment)?;
             create_fragment_shader(device, raw_shader.as_bytes())?
         };
-        let buffer = create_buffer(device, std::mem::size_of::<T>(), buffer_size)?;
+        let buffer = create_buffer(device, std::mem::size_of::<T>(), buffer_size, upload)?;
         let view = create_buffer_view(device, &buffer)?;
 
         Ok(PipelineState {
@@ -2367,6 +2410,8 @@ impl<T> PipelineState<T> {
             fragment,
             buffer,
             buffer_size,
+            upload,
+            uploaded_len: 0,
             view,
             blend_state,
             _marker: std::marker::PhantomData,
@@ -2379,7 +2424,21 @@ impl<T> PipelineState<T> {
         device_context: &ID3D11DeviceContext,
         data: &[T],
     ) -> Result<()> {
+        self.update_changed(device, device_context, data, None)
+    }
+
+    /// Uploads `data`, of which only the instances in `changed` can differ from the last upload
+    /// when it is given. A retained buffer then writes just those; a regrown one, all of them.
+    fn update_changed(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        data: &[T],
+        changed: Option<Range<usize>>,
+    ) -> Result<()> {
+        let mut regrown = false;
         if self.buffer_size < data.len() {
+            regrown = true;
             let element_size = std::mem::size_of::<T>();
             let required_size = std::mem::size_of_val(data);
             anyhow::ensure!(
@@ -2397,13 +2456,40 @@ impl<T> PipelineState<T> {
                 self.buffer_size,
                 new_buffer_size
             );
-            let buffer = create_buffer(device, std::mem::size_of::<T>(), new_buffer_size)?;
+            let buffer = create_buffer(
+                device,
+                std::mem::size_of::<T>(),
+                new_buffer_size,
+                self.upload,
+            )?;
             let view = create_buffer_view(device, &buffer)?;
             self.buffer = buffer;
             self.view = view;
             self.buffer_size = new_buffer_size;
         }
-        update_buffer(device_context, &self.buffer, data)
+        let range = match changed {
+            Some(changed) if !regrown && self.upload == InstanceUpload::Retained => {
+                // Instances past the previous end are new whatever the range says.
+                let end = if data.len() > self.uploaded_len {
+                    data.len()
+                } else {
+                    changed.end.min(data.len())
+                };
+                changed.start.min(self.uploaded_len).min(end)..end
+            }
+            _ => 0..data.len(),
+        };
+        self.uploaded_len = data.len();
+        if range.is_empty() {
+            return Ok(());
+        }
+        match self.upload {
+            InstanceUpload::Discard => update_buffer(device_context, &self.buffer, data),
+            InstanceUpload::Retained => {
+                update_buffer_range(device_context, &self.buffer, data, range);
+                Ok(())
+            }
+        }
     }
 
     fn draw(
@@ -2907,12 +2993,17 @@ fn create_buffer(
     device: &ID3D11Device,
     element_size: usize,
     buffer_size: usize,
+    upload: InstanceUpload,
 ) -> Result<ID3D11Buffer> {
+    let (usage, cpu_access) = match upload {
+        InstanceUpload::Discard => (D3D11_USAGE_DYNAMIC, D3D11_CPU_ACCESS_WRITE.0 as u32),
+        InstanceUpload::Retained => (D3D11_USAGE_DEFAULT, 0),
+    };
     let desc = D3D11_BUFFER_DESC {
         ByteWidth: (element_size * buffer_size) as u32,
-        Usage: D3D11_USAGE_DYNAMIC,
+        Usage: usage,
         BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
-        CPUAccessFlags: D3D11_CPU_ACCESS_WRITE.0 as u32,
+        CPUAccessFlags: cpu_access,
         MiscFlags: D3D11_RESOURCE_MISC_BUFFER_STRUCTURED.0 as u32,
         StructureByteStride: element_size as u32,
     };
@@ -2944,6 +3035,28 @@ fn update_buffer<T>(
         device_context.Unmap(buffer, 0);
     }
     Ok(())
+}
+
+/// Writes `data[range]` to the same instances of a default-usage `buffer`.
+fn update_buffer_range<T>(
+    device_context: &ID3D11DeviceContext,
+    buffer: &ID3D11Buffer,
+    data: &[T],
+    range: Range<usize>,
+) {
+    let size = std::mem::size_of::<T>();
+    let region = D3D11_BOX {
+        left: (range.start * size) as u32,
+        right: (range.end * size) as u32,
+        top: 0,
+        bottom: 1,
+        front: 0,
+        back: 1,
+    };
+    // SAFETY: `range` lies within `data`, and the caller sized `buffer` for `data`.
+    unsafe {
+        device_context.UpdateSubresource(buffer, 0, Some(&region), data[range].as_ptr() as _, 0, 0);
+    }
 }
 
 #[inline]
