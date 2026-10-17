@@ -303,7 +303,6 @@ fn meshes_draw_lit_on_a_transparent_rounded_viewport() -> Result<()> {
     assert_eq!(center[3], 255, "the cube covers the viewport center");
     assert!(center[0] > 40, "the cube is lit, not black: {center:?}");
     assert_eq!(pixel(4, 4)[3], 0, "outside the viewport stays clear");
-    assert_eq!(pixel(18, 18)[3], 0, "the rounded corner clips");
     assert_eq!(pixel(20, 20)[3], 0, "the background stays transparent");
     // The top face is red: some pixel above the center is red-dominant.
     let red = (20..48).any(|y| {
@@ -327,6 +326,28 @@ fn meshes_draw_lit_on_a_transparent_rounded_viewport() -> Result<()> {
         dark(&wire),
         dark(&pixels)
     );
+    Ok(())
+}
+
+#[test]
+fn rounded_corners_clip_a_mesh_that_fills_its_bounds() -> Result<()> {
+    let (device, context) = device()?;
+    let mut filled = paint(&Arc::new(cube()), 0.0);
+    // Head-on from 0.9 units the front face spans about ±3.1 × ±4.7 in NDC, so
+    // the cube covers every target pixel, the corners included.
+    filled.style.view = translation(0.0, 0.0, -0.9);
+    let pixels = render(&device, &context, &[filled])?;
+    save("filled-corners", &pixels)?;
+    let alpha = |x: u32, y: u32| pixels[((y * WIDTH + x) * 4 + 3) as usize];
+    // The bounds span 16..112 × 16..80 with 12 px radii; these pixel centers
+    // sit about 2.9 px outside each arc.
+    for (x, y) in [(17, 17), (110, 17), (17, 78), (110, 78)] {
+        assert_eq!(alpha(x, y), 0, "the rounded corner at ({x}, {y}) clips");
+    }
+    // Edge midpoints and a pixel just inside the top-left arc stay covered.
+    for (x, y) in [(64, 17), (17, 48), (110, 48), (64, 78), (20, 20)] {
+        assert_eq!(alpha(x, y), 255, "the mesh covers ({x}, {y})");
+    }
     Ok(())
 }
 

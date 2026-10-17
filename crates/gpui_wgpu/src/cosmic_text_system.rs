@@ -61,9 +61,9 @@ struct CosmicTextSystemState {
     /// the cap new probes run uncached instead of growing memory.
     cluster_formation_cache: HashMap<(SharedString, String), bool>,
     /// Lazily built native-first emoji chain shared by every run in the
-    /// line (families are run-independent by construction). Mirrors the
-    /// staleness policy of `font_ids_by_family_cache`: built once, not
-    /// refreshed by later `add_fonts`.
+    /// line (families are run-independent by construction). Cleared by
+    /// `add_fonts` with the other family caches, so faces registered
+    /// after the first layout still join the chain.
     emoji_chain_cache: Option<Arc<[(FontId, SharedString)]>>,
     /// Whether a glyph of a known emoji font carries color data, keyed by
     /// font and glyph. Emoji faces also hold plain monochrome glyphs
@@ -263,7 +263,7 @@ impl PlatformTextSystem for CosmicTextSystem {
 const EMOJI_FALLBACK_FAMILIES: &[&str] = &[
     "Segoe UI Emoji",
     "Noto Color Emoji",
-    "AppleColorEmoji",
+    "Apple Color Emoji",
     "Twemoji Mozilla",
 ];
 
@@ -319,6 +319,12 @@ impl CosmicTextSystemState {
         for bytes in fonts {
             db.load_font_source(cosmic_text::fontdb::Source::Binary(Arc::new(bytes)));
         }
+        // Family lookups cache misses as empty, and formation probes
+        // depend on which faces exist; new faces must reach both.
+        // `loaded_fonts` stays append-only, so issued `FontId`s remain valid.
+        self.font_ids_by_family_cache.clear();
+        self.cluster_formation_cache.clear();
+        self.emoji_chain_cache = None;
         Ok(())
     }
 
@@ -405,6 +411,16 @@ impl CosmicTextSystemState {
                 continue;
             };
 
+            // `add_fonts` clears the family cache, so a family can load
+            // again; the face it already loaded keeps its `FontId`.
+            if let Some(index) = self.loaded_fonts.iter().position(|loaded| {
+                loaded.font.id() == font.id()
+                    && loaded.features == cosmic_features
+                    && *loaded.user_fallback_chain == *user_fallback_chain
+            }) {
+                loaded_font_ids.push(FontId(index));
+                continue;
+            }
             let font_id = FontId(self.loaded_fonts.len());
             loaded_font_ids.push(font_id);
             self.loaded_fonts.push(LoadedFont {
@@ -466,9 +482,15 @@ impl CosmicTextSystemState {
         }
         let font_ref = self.loaded_fonts[font_id.0].font.as_swash();
         let mut scaler = self.swash_scale_context.builder(font_ref).build();
-        let is_color = scaler.has_color_bitmaps()
-            || scaler
-                .scale_color_outline_into(glyph_id, &mut swash::scale::outline::Outline::new());
+        // `has_color_bitmaps` is font-wide: one strike would flag every
+        // glyph, so probe this glyph's own bitmap. The scaler is unsized,
+        // which `BestFit` rejects; `LargestSize` only needs a strike.
+        let is_color = scaler.scale_color_bitmap_into(
+            glyph_id,
+            StrikeWith::LargestSize,
+            &mut swash::scale::image::Image::new(),
+        ) || scaler
+            .scale_color_outline_into(glyph_id, &mut swash::scale::outline::Outline::new());
         self.color_glyph_cache.insert((font_id, glyph_id), is_color);
         is_color
     }
@@ -766,11 +788,17 @@ impl CosmicTextSystemState {
             };
 
             // build one `Attrs` per slot up front. each clone of span attrs
-            // would otherwise re-allocate the `font_features` Vec.
+            // would otherwise re-allocate the `font_features` Vec. The
+            // synthesized emoji chain takes default features (see
+            // `emoji_fallback_chain`); user chains keep the run's.
+            let synthesized_chain = properties.fallback_chain.is_empty();
             let fallback_attrs: SmallVec<[Attrs<'_>; 4]> = chain
                 .iter()
                 .map(|(font_id, family_name)| {
                     let mut attrs = properties.attributes(*font_id, family_name);
+                    if synthesized_chain {
+                        attrs = attrs.font_features(CosmicFontFeatures::new());
+                    }
                     if let Some(letter_spacing) = letter_spacing {
                         attrs = attrs.letter_spacing(letter_spacing);
                     }
@@ -1774,6 +1802,50 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// A family registered after the first layout must resolve. Before
+    /// `add_fonts` invalidated the family caches, the first lookup's miss
+    /// was cached as empty and the family stayed unresolvable forever;
+    /// the emoji chain likewise kept omitting late-registered faces.
+    #[test]
+    fn family_registered_after_layout_resolves() -> Result<()> {
+        const LILEX: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
+        let text_system = text_system()?;
+
+        // Non-ASCII text builds (and caches) the emoji chain.
+        layout_text(&text_system, "a\u{2500}b")?;
+        assert!(text_system.0.read().emoji_chain_cache.is_some());
+        assert!(text_system.font_id(&gpui::font("Lilex")).is_err());
+        let plex = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let loaded = text_system.0.read().loaded_fonts.len();
+
+        text_system.add_fonts(vec![Cow::Borrowed(LILEX)])?;
+        assert!(text_system.0.read().emoji_chain_cache.is_none());
+        // Reloading a family keeps its faces' ids instead of duplicating them.
+        assert_eq!(text_system.font_id(&gpui::font("IBM Plex Sans"))?, plex);
+        assert_eq!(text_system.0.read().loaded_fonts.len(), loaded);
+        let lilex = text_system.font_id(&gpui::font("Lilex"))?;
+        assert_eq!(
+            face_postscript(&text_system, lilex).as_deref(),
+            Some("Lilex-Regular")
+        );
+        let text = "a\u{2500}b";
+        let runs = [FontRun {
+            len: text.len(),
+            font_id: lilex,
+            letter_spacing: None,
+        }];
+        let layout = text_system.layout_line(text, gpui::px(16.0), &runs);
+        assert!(
+            layout
+                .runs
+                .iter()
+                .all(|run| face_postscript(&text_system, run.font_id).as_deref()
+                    == Some("Lilex-Regular")),
+            "late-registered family must shape its own text"
+        );
         Ok(())
     }
 

@@ -14,7 +14,9 @@ const VIEWPORT: [u32; 2] = [32, 32];
 
 #[test]
 fn a_released_images_slack_sprite_is_batched_and_draws_nothing() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device()? else {
+        return Ok(());
+    };
     let (device, queue) = (Arc::new(device), Arc::new(queue));
     let atlas = WgpuAtlas::new(device.clone(), queue.clone(), FORMAT);
     let image = |id| {
@@ -261,7 +263,8 @@ fn render(
     Ok(pixels)
 }
 
-fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
+/// `None` when the host has no adapter, so the test skips instead of failing.
+fn test_device() -> Result<Option<(wgpu::Device, wgpu::Queue)>> {
     block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -270,13 +273,20 @@ fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
             memory_budget_thresholds: Default::default(),
             display: None,
         });
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
-            .await?;
+            .await
+        {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                eprintln!("skipping: no wgpu adapter ({error})");
+                return Ok(None);
+            }
+        };
         adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sprite slack regression"),
@@ -289,6 +299,7 @@ fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await
+            .map(Some)
             .map_err(anyhow::Error::from)
     })
 }

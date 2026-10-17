@@ -1739,7 +1739,9 @@ impl Window {
                 else {
                     log::debug!("deferring frame request: the window can't be updated");
                     deferred_force_render |= force_render;
-                    if !next_frame_callbacks.borrow().is_empty() {
+                    // The App's flush re-requests frames for dirty windows and
+                    // pending callbacks, but not for a force-only frame.
+                    if force_render || !next_frame_callbacks.borrow().is_empty() {
                         invalidator.wake_platform();
                     }
                     return;
@@ -4124,6 +4126,11 @@ impl Window {
     /// resolved against `bounds` and composed with any enclosing transform.
     /// Layout is unaffected. Call it around both prepaint, where hitboxes
     /// are inserted, and paint.
+    ///
+    /// Elements handed to [`Self::defer_draw`] (such as [`crate::deferred`]
+    /// popovers) are not transformed: they are drawn after this scope has
+    /// restored, like they escape element opacity, so an anchored popover
+    /// does not inherit an ancestor's animating scale.
     pub fn with_element_transform<R>(
         &mut self,
         transform: Option<ElementTransform>,
@@ -4541,6 +4548,10 @@ impl Window {
     ///
     /// When `content_mask` is provided, the deferred element will be clipped to that region during
     /// both prepaint and paint. When `None`, no additional clipping is applied.
+    ///
+    /// The deferred element is drawn outside every enclosing
+    /// [`Self::with_element_transform`] and element opacity scope: it lands
+    /// at `absolute_offset` untransformed and fully opaque.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn defer_draw(
@@ -7937,7 +7948,21 @@ pub fn outline(
     }
 }
 
-/** Split only the visible raster, keeping the original atlas bounds/UVs. */
+/// Two colours that 8-bit output cannot tell apart: every sRGB channel,
+/// alpha included, within one 8-bit step.
+fn indistinguishable_in_8_bit(a: Hsla, b: Hsla) -> bool {
+    const STEP: f32 = 1.0 / 255.0;
+    let (a, b) = (crate::hsla_to_rgba(a), crate::hsla_to_rgba(b));
+    (a.red - b.red).abs() <= STEP
+        && (a.green - b.green).abs() <= STEP
+        && (a.blue - b.blue).abs() <= STEP
+        && (a.alpha - b.alpha).abs() <= STEP
+}
+
+/** Split only the visible raster, keeping the original atlas bounds/UVs.
+Columns join a span while their colour stays within one 8-bit step of the
+span's first column, so smooth gradients do not emit a sprite per device
+column and long spans cannot drift. */
 fn glyph_color_spans(
     bounds: Bounds<ScaledPixels>,
     mask: ContentMask<ScaledPixels>,
@@ -7958,7 +7983,7 @@ fn glyph_color_spans(
         let end = (x + 1.0).min(visible.right().0);
         let color = map(px((x + end) * 0.5 / scale), base);
         if let Some((previous, previous_color)) = spans.last_mut()
-            && *previous_color == color
+            && indistinguishable_in_8_bit(*previous_color, color)
         {
             previous.bounds.size.width += ScaledPixels(end - x);
         } else {
@@ -8229,6 +8254,53 @@ mod tests {
             1
         );
         assert_eq!(glyph_color_spans(bounds, mask, 2.0, white(), None).len(), 1);
+    }
+
+    #[test]
+    fn text_color_map_merges_gradients_below_8_bit_precision_but_splits_steps() {
+        use super::{ContentMask, TextColorMap, glyph_color_spans, indistinguishable_in_8_bit};
+        use crate::{ScaledPixels, black, hsla, white};
+        let bounds = Bounds::new(
+            point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size(ScaledPixels(40.0), ScaledPixels(10.0)),
+        );
+        let mask = ContentMask { bounds };
+        // A gentle gradient: a 1/1000 lightness change per device column
+        // shifts 8-bit output only every ~4 columns.
+        let gentle: TextColorMap =
+            Rc::new(|x, base| hsla(0.0, 0.0, f32::from(x) / 1000.0, base.alpha));
+        let spans = glyph_color_spans(bounds, mask, 1.0, white(), Some(&gentle));
+        assert_eq!(spans.len(), 10, "40 columns merge into ~10 spans, not 40");
+        let mut right = ScaledPixels(0.0);
+        for (mask, color) in &spans {
+            assert_eq!(mask.bounds.left(), right, "spans tile the glyph");
+            right = mask.bounds.right();
+            // No drift: every column a span covers renders within one
+            // 8-bit step of the span's colour.
+            let mut x = mask.bounds.left().0;
+            while x < mask.bounds.right().0 {
+                assert!(indistinguishable_in_8_bit(
+                    *color,
+                    gentle(px(x + 0.5), white())
+                ));
+                x += 1.0;
+            }
+        }
+        assert_eq!(right, bounds.right());
+
+        // A hard colour step still splits exactly at the step.
+        let step: TextColorMap = Rc::new(|x, _| {
+            if f32::from(x) < 20.0 {
+                black()
+            } else {
+                white()
+            }
+        });
+        let spans = glyph_color_spans(bounds, mask, 1.0, white(), Some(&step));
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].0.bounds.right(), ScaledPixels(20.0));
+        assert_eq!(spans[0].1, black());
+        assert_eq!(spans[1].1, white());
     }
 
     #[test]
@@ -9333,16 +9405,22 @@ impl ScreenTransform {
 
     /// The transform of `transform` with its origin resolved against
     /// `bounds`: `origin + translate + (p - origin) * scale`.
+    ///
+    /// Every element transform passes through here, so this is where the
+    /// `scale >= 0` contract is enforced: a negative (or NaN) scale would
+    /// produce negative sizes that snapping collapses, leaving the element
+    /// invisible and unhittable, so it clamps to `0` instead.
     fn resolve(transform: &ElementTransform, bounds: Bounds<Pixels>) -> Self {
+        let scale = transform.scale.max(0.0);
         let origin = point(
             bounds.origin.x + bounds.size.width * transform.origin.x,
             bounds.origin.y + bounds.size.height * transform.origin.y,
         );
         Self {
-            scale: transform.scale,
+            scale,
             offset: point(
-                origin.x * (1.0 - transform.scale) + transform.translate.x,
-                origin.y * (1.0 - transform.scale) + transform.translate.y,
+                origin.x * (1.0 - scale) + transform.translate.x,
+                origin.y * (1.0 - scale) + transform.translate.y,
             ),
         }
     }

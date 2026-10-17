@@ -1856,7 +1856,9 @@ mod tests {
 /// a new glyph size on every frame.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ElementTransform {
-    /// The uniform scale factor; `1.0` leaves the size unchanged.
+    /// The uniform scale factor; `1.0` leaves the size unchanged. Must be
+    /// `>= 0`: reflection is not supported, and a negative scale is clamped
+    /// to `0`.
     pub scale: f32,
     /// The offset applied after scaling, in logical pixels.
     pub translate: Point<Pixels>,
@@ -1882,7 +1884,8 @@ impl ElementTransform {
         origin: Point { x: 0.5, y: 0.5 },
     };
 
-    /// A uniform scale about the element's centre.
+    /// A uniform scale about the element's centre. `scale` must be `>= 0`;
+    /// a negative scale is clamped to `0`.
     pub fn scale(scale: f32) -> Self {
         Self {
             scale,

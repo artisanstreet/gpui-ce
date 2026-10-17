@@ -13,6 +13,10 @@ pub fn deferred(child: impl IntoElement) -> Deferred {
 
 /// An element which delays the painting of its child until after all of
 /// its ancestors, while keeping its layout as part of the current element tree.
+///
+/// The child is drawn outside its ancestors' element transforms and opacity:
+/// an anchored popover stays put and opaque while the element it anchors to
+/// animates a scale or fade.
 pub struct Deferred {
     child: Option<AnyElement>,
     priority: usize,

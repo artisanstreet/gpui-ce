@@ -1,8 +1,9 @@
 //! Draws [`PaintMesh`] primitives: lit triangle meshes with a depth buffer.
 //!
-//! Each frame, before the main pass, every mesh in the scene renders into its
-//! own resolved texture, using shared 4× multisampled color and depth scratch
-//! textures for meshes with the same device-pixel dimensions.
+//! Each frame, before the main pass, every mesh in the scene whose geometry,
+//! style, or target size changed renders into its own resolved texture, using
+//! shared 4× multisampled color and depth scratch textures for meshes with the
+//! same device-pixel dimensions; an unchanged mesh keeps last frame's texture.
 //! In the main pass, a [`PrimitiveBatch::Meshes`] batch composites those
 //! textures like images (content mask, rounded corners, opacity), so meshes
 //! keep the scene's 2D draw order and never need a depth buffer there.
@@ -92,6 +93,10 @@ struct Target {
     mesh_bind_group: wgpu::BindGroup,
     composite_uniforms: wgpu::Buffer,
     composite_bind_group: wgpu::BindGroup,
+    /// The geometry and uniforms `resolve_view` holds; `None` until rendered.
+    rendered: Option<(MeshId, MeshUniforms)>,
+    /// The parameters last written to `composite_uniforms`.
+    composited: Option<CompositeParams>,
 }
 
 /// Each pass clears these attachments and resolves before another mesh uses them.
@@ -311,6 +316,16 @@ impl MeshRenderer {
         self.geometry.clear();
     }
 
+    /// Forget what every target holds, so the next [`prepare`](Self::prepare)
+    /// renders them all again. Call when the encoder given to `prepare` is
+    /// dropped instead of submitted.
+    pub(crate) fn invalidate(&mut self) {
+        for target in &mut self.targets {
+            target.rendered = None;
+            target.composited = None;
+        }
+    }
+
     pub(crate) fn memory_stats(&self) -> MeshMemoryStats {
         use crate::wgpu_renderer::diagnostics::texture_bytes;
         MeshMemoryStats {
@@ -339,8 +354,9 @@ impl MeshRenderer {
         }
     }
 
-    /// Renders every mesh into its offscreen target. Call once per frame
-    /// before the main pass, with the scene's meshes in scene order.
+    /// Renders every changed mesh into its offscreen target. Call once per
+    /// frame before the main pass, with the scene's meshes in scene order, and
+    /// submit `encoder` (or call [`invalidate`](Self::invalidate)).
     pub(crate) fn prepare(
         &mut self,
         device: &wgpu::Device,
@@ -373,6 +389,62 @@ impl MeshRenderer {
                 }
             }
             let frame = self.frame;
+            let geometry = self
+                .geometry
+                .entry(paint.mesh.id())
+                .or_insert_with(|| upload(device, paint));
+            geometry.last_painted = frame;
+
+            let target = &mut self.targets[index];
+            let bounds = |b: gpui::Bounds<gpui::ScaledPixels>| {
+                [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0]
+            };
+            let radii = paint.corner_radii;
+            let composite = CompositeParams {
+                bounds: bounds(paint.bounds),
+                content_mask: bounds(paint.content_mask.bounds),
+                corner_radii: [
+                    radii.top_left.0,
+                    radii.top_right.0,
+                    radii.bottom_right.0,
+                    radii.bottom_left.0,
+                ],
+                params: [paint.opacity, 0.0, 0.0, 0.0],
+            };
+            if !same_bytes(target.composited.as_ref(), &composite) {
+                queue.write_buffer(
+                    &target.composite_uniforms,
+                    0,
+                    bytemuck::bytes_of(&composite),
+                );
+                target.composited = Some(composite);
+            }
+
+            let style = &paint.style;
+            let [r, g, b] = style.base_color;
+            let uniforms = MeshUniforms {
+                view: style.view,
+                projection: style.projection,
+                base_color: [r, g, b, 1.0],
+                edge_color: style.edge_color,
+                params: [EDGE_HALF_WIDTH, 0.0, 0.0, 0.0],
+            };
+            let rendered = target
+                .rendered
+                .as_ref()
+                .filter(|(id, _)| *id == paint.mesh.id())
+                .map(|(_, uniforms)| uniforms);
+            if same_bytes(rendered, &uniforms) {
+                // The resolved texture already holds this mesh; keep its
+                // scratch size alive so the next change doesn't reallocate.
+                if let Some(scratch) = self.scratch_targets.get_mut(&size) {
+                    scratch.last_used = frame;
+                }
+                continue;
+            }
+            queue.write_buffer(&target.mesh_uniforms, 0, bytemuck::bytes_of(&uniforms));
+            target.rendered = Some((paint.mesh.id(), uniforms));
+            let target = &self.targets[index];
             let scratch = self
                 .scratch_targets
                 .entry(size)
@@ -396,43 +468,6 @@ impl MeshRenderer {
                     last_used: frame,
                 });
             scratch.last_used = frame;
-            let geometry = self
-                .geometry
-                .entry(paint.mesh.id())
-                .or_insert_with(|| upload(device, paint));
-            geometry.last_painted = frame;
-
-            let target = &self.targets[index];
-            let style = &paint.style;
-            let [r, g, b] = style.base_color;
-            let uniforms = MeshUniforms {
-                view: style.view,
-                projection: style.projection,
-                base_color: [r, g, b, 1.0],
-                edge_color: style.edge_color,
-                params: [EDGE_HALF_WIDTH, 0.0, 0.0, 0.0],
-            };
-            queue.write_buffer(&target.mesh_uniforms, 0, bytemuck::bytes_of(&uniforms));
-            let bounds = |b: gpui::Bounds<gpui::ScaledPixels>| {
-                [b.origin.x.0, b.origin.y.0, b.size.width.0, b.size.height.0]
-            };
-            let radii = paint.corner_radii;
-            let composite = CompositeParams {
-                bounds: bounds(paint.bounds),
-                content_mask: bounds(paint.content_mask.bounds),
-                corner_radii: [
-                    radii.top_left.0,
-                    radii.top_right.0,
-                    radii.bottom_right.0,
-                    radii.bottom_left.0,
-                ],
-                params: [paint.opacity, 0.0, 0.0, 0.0],
-            };
-            queue.write_buffer(
-                &target.composite_uniforms,
-                0,
-                bytemuck::bytes_of(&composite),
-            );
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("mesh_pass"),
@@ -539,8 +574,15 @@ impl MeshRenderer {
             mesh_bind_group,
             composite_uniforms,
             composite_bind_group,
+            rendered: None,
+            composited: None,
         }
     }
+}
+
+/// Whether `previous` holds exactly `current`'s bytes.
+fn same_bytes<T: Pod>(previous: Option<&T>, current: &T) -> bool {
+    previous.is_some_and(|previous| bytemuck::bytes_of(previous) == bytemuck::bytes_of(current))
 }
 
 fn target_view(

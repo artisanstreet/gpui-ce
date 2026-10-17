@@ -23,12 +23,12 @@
 //! -> S925 (bottom, root `fff79dba`), derived from the canonical Oklch
 //! constants through the app's own conversion chain
 //! (`modules/ui/src/theme.rs`: `Oklch::to_srgb`, then `srgb_to_hsla`).
+use super::gpu_test_support::{PIXEL_FORMAT, render_pixels, test_device};
 use super::*;
 use gpui::{
-    BorderStyle, ColorSpace, ContentMask, Corners, Edges, QuadPulse, block_on, hsla,
-    linear_color_stop, linear_gradient, point, size, solid_background,
+    BorderStyle, ColorSpace, ContentMask, Corners, Edges, QuadPulse, hsla, linear_color_stop,
+    linear_gradient, point, size, solid_background,
 };
-use std::{sync::mpsc, time::Duration};
 use wgpu::util::DeviceExt as _;
 
 /// Canonical surface-ramp constants, `(lightness, chroma, hue)`.
@@ -37,7 +37,9 @@ const S925_OKLCH: (f64, f64, f64) = (0.1755, 0.0055, 285.854);
 
 #[test]
 fn dark_oklab_ramp_matches_reference_with_zero_mean_dither() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device("gradient pixel regression")? else {
+        return Ok(());
+    };
     let pipeline = quad_pipeline(&device, wgpu::BlendState::ALPHA_BLENDING);
     let globals = globals_group(&device, &pipeline, 64.0, 256.0, 0);
     let (ht, st, lt) = surface_hsla(S900_OKLCH);
@@ -181,7 +183,9 @@ fn dark_oklab_ramp_matches_reference_with_zero_mean_dither() -> Result<()> {
 
 #[test]
 fn srgb_black_white_midpoint_is_encoded() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device("gradient pixel regression")? else {
+        return Ok(());
+    };
     let pipeline = quad_pipeline(&device, wgpu::BlendState::ALPHA_BLENDING);
     let globals = globals_group(&device, &pipeline, 64.0, 256.0, 0);
     let background = linear_gradient(
@@ -225,7 +229,9 @@ fn srgb_black_white_midpoint_is_encoded() -> Result<()> {
 
 #[test]
 fn equal_stop_gradient_matches_solid() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device("gradient pixel regression")? else {
+        return Ok(());
+    };
     let pipeline = quad_pipeline(&device, wgpu::BlendState::ALPHA_BLENDING);
     let globals = globals_group(&device, &pipeline, 64.0, 64.0, 0);
     let (h, s, l) = surface_hsla(S900_OKLCH);
@@ -281,7 +287,9 @@ fn equal_stop_gradient_matches_solid() -> Result<()> {
 
 #[test]
 fn solid_fill_stays_bit_exact() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device("gradient pixel regression")? else {
+        return Ok(());
+    };
     let pipeline = quad_pipeline(&device, wgpu::BlendState::ALPHA_BLENDING);
     let globals = globals_group(&device, &pipeline, 64.0, 64.0, 0);
     let (h, s, l) = surface_hsla(S900_OKLCH);
@@ -330,7 +338,9 @@ fn solid_fill_stays_bit_exact() -> Result<()> {
 /// across the clock's wrap.
 #[test]
 fn pulsing_quad_breathes_with_the_present_clock() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device("gradient pixel regression")? else {
+        return Ok(());
+    };
     let pipeline = quad_pipeline(&device, wgpu::BlendState::ALPHA_BLENDING);
     let alpha_at = |start_ms: u32, clock_ms: u32| -> Result<u8> {
         let globals = globals_group_at(&device, &pipeline, 64.0, 64.0, 0, clock_ms);
@@ -367,7 +377,9 @@ fn pulsing_quad_breathes_with_the_present_clock() -> Result<()> {
 
 #[test]
 fn transparent_gradient_edge_blends_monotonically_in_both_alpha_modes() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device("gradient pixel regression")? else {
+        return Ok(());
+    };
     let (h, s, l) = surface_hsla(S900_OKLCH);
     let background = linear_gradient(
         180.0,
@@ -450,38 +462,6 @@ fn full_quad(background: Background, width: f32, height: f32) -> Quad {
     }
 }
 
-fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
-    block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: None,
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await?;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gradient pixel regression"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            })
-            .await
-            .map_err(anyhow::Error::from)
-    })
-}
-
 fn quad_pipeline(device: &wgpu::Device, blend: wgpu::BlendState) -> wgpu::RenderPipeline {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("production quads"),
@@ -501,7 +481,7 @@ fn quad_pipeline(device: &wgpu::Device, blend: wgpu::BlendState) -> wgpu::Render
             entry_point: Some("fs_quad"),
             compilation_options: Default::default(),
             targets: &[Some(wgpu::ColorTargetState {
-                format: wgpu::TextureFormat::Rgba8Unorm,
+                format: PIXEL_FORMAT,
                 blend: Some(blend),
                 write_mask: wgpu::ColorWrites::ALL,
             })],
@@ -580,79 +560,19 @@ fn render_quad_pixels(
             resource: instances.as_entire_binding(),
         }],
     });
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("gradient pixels"),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
+    render_pixels(
+        device,
+        queue,
+        device.create_command_encoder(&Default::default()),
+        (width, height),
+        wgpu::Color::TRANSPARENT,
+        |pass| {
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, globals, &[]);
+            pass.set_bind_group(1, &instances_group, &[]);
+            pass.draw(0..4, 0..1);
         },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::Rgba8Unorm,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let bytes_per_row = width * 4;
-    let output = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gradient readback"),
-        size: (bytes_per_row * height) as u64,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-    let mut encoder = device.create_command_encoder(&Default::default());
-    let view = texture.create_view(&Default::default());
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("gradient pixels"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, globals, &[]);
-        pass.set_bind_group(1, &instances_group, &[]);
-        pass.draw(0..4, 0..1);
-    }
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &output,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(height),
-            },
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    let submission = queue.submit([encoder.finish()]);
-    let (sender, receiver) = mpsc::channel();
-    output
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-    device.poll(wgpu::PollType::Wait {
-        submission_index: Some(submission),
-        timeout: Some(Duration::from_secs(10)),
-    })?;
-    receiver.recv_timeout(Duration::from_secs(10))??;
-    let pixels = output.slice(..).get_mapped_range().to_vec();
-    output.unmap();
-    Ok(pixels)
+    )
 }
 
 /// App surface-ramp stop as GPUI `(hue, saturation, lightness)`, ported from
