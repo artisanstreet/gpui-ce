@@ -166,6 +166,9 @@ impl WindowsWindowInner {
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             DM_POINTERHITTEST => self.handle_dm_pointer_hit_test(wparam),
             WM_GETOBJECT => self.handle_wm_getobject(wparam, lparam),
+            _ if msg == crate::taskbar_badge::taskbar_button_created() => {
+                self.handle_taskbar_button_created(handle)
+            }
             _ => None,
         };
         if let Some(n) = handled {
@@ -173,6 +176,14 @@ impl WindowsWindowInner {
         } else {
             unsafe { DefWindowProcW(handle, msg, wparam, lparam) }
         }
+    }
+
+    fn handle_taskbar_button_created(&self, handle: HWND) -> Option<isize> {
+        let count = self.state.badge_count.get();
+        if count > 0 {
+            crate::taskbar_badge::set_overlay(handle, count).log_err();
+        }
+        None
     }
 
     fn handle_end_session_msg(&self, wparam: WPARAM) -> Option<isize> {

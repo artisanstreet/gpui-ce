@@ -6738,6 +6738,11 @@ impl Window {
         self.platform_window.request_attention();
     }
 
+    /// Shows a count on the app's taskbar button or dock icon; zero clears it.
+    pub fn set_badge_count(&self, count: usize) {
+        self.platform_window.set_badge_count(count);
+    }
+
     /// Minimize the current window at the platform level.
     pub fn minimize_window(&self) {
         self.platform_window.minimize();

@@ -66,6 +66,8 @@ pub struct WindowsWindowState {
     pub last_reported_modifiers: Cell<Option<Modifiers>>,
     pub last_reported_capslock: Cell<Option<Capslock>>,
     pub hovered: Cell<bool>,
+    /// Re-applied when Explorer recreates the taskbar button.
+    pub badge_count: Cell<usize>,
     pub direct_manipulation: DirectManipulationHandler,
 
     #[cfg(feature = "wgpu")]
@@ -198,6 +200,7 @@ impl WindowsWindowState {
             last_reported_modifiers: Cell::new(last_reported_modifiers),
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
+            badge_count: Cell::new(0),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             frame_ready: Arc::new(AtomicBool::new(true)),
@@ -937,6 +940,12 @@ impl PlatformWindow for WindowsWindow {
                 unsafe { FlashWindowEx(&info).ok().log_err() };
             })
             .detach();
+    }
+
+    fn set_badge_count(&self, count: usize) {
+        if self.state.badge_count.replace(count) != count {
+            crate::taskbar_badge::set_overlay(self.0.hwnd, count).log_err();
+        }
     }
 
     fn is_active(&self) -> bool {
