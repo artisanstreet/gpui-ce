@@ -1725,6 +1725,10 @@ impl WgpuRenderer {
 
             if overflow {
                 drop(encoder);
+                // The dropped encoder held this frame's mesh renders.
+                if let Some(meshes) = self.resources_mut().meshes.as_mut() {
+                    meshes.invalidate();
+                }
                 if self.instance_data_capacity >= self.max_instance_data_size {
                     log::error!(
                         "instance buffer size grew too large: {}",
@@ -3667,6 +3671,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 24 * 4);
     }
 }
+
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "gpu_test_support.rs"]
+mod gpu_test_support;
 
 #[cfg(all(test, not(target_family = "wasm")))]
 #[path = "shadow_tests.rs"]

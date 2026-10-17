@@ -30,7 +30,9 @@ fn compact_paths_preserve_pixels_in_odd_rectangular_viewport_with_textures() -> 
 }
 
 fn compare_targets(webgl: bool, viewport: [u32; 2]) -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device()? else {
+        return Ok(());
+    };
     let layouts = WgpuRenderer::create_bind_group_layouts(&device, webgl);
     let mut pipelines = WgpuPipelines::new(
         &device,
@@ -134,7 +136,8 @@ fn curved_path(color: Background, offset: f32) -> Path<ScaledPixels> {
     path
 }
 
-fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
+/// `None` when the host has no adapter, so the test skips instead of failing.
+fn test_device() -> Result<Option<(wgpu::Device, wgpu::Queue)>> {
     block_on(async {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::all(),
@@ -143,13 +146,20 @@ fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
             memory_budget_thresholds: Default::default(),
             display: None,
         });
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
                 force_fallback_adapter: false,
             })
-            .await?;
+            .await
+        {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                eprintln!("skipping: no wgpu adapter ({error})");
+                return Ok(None);
+            }
+        };
         anyhow::ensure!(
             adapter
                 .get_texture_format_features(FORMAT)
@@ -169,6 +179,7 @@ fn test_device() -> Result<(wgpu::Device, wgpu::Queue)> {
                 experimental_features: wgpu::ExperimentalFeatures::disabled(),
             })
             .await
+            .map(Some)
             .map_err(anyhow::Error::from)
     })
 }
@@ -451,7 +462,9 @@ fn render_paths(
 /// of the offscreen pool alive. Encoded work must survive dropping every pool handle.
 #[test]
 fn content_group_targets_release_without_invalidating_queued_commands() -> Result<()> {
-    let (device, queue) = test_device()?;
+    let Some((device, queue)) = test_device()? else {
+        return Ok(());
+    };
     let mut textures = Vec::new();
     let mut views = Vec::new();
     let allocate = || WgpuRenderer::create_path_intermediate(&device, FORMAT, 8, 8);

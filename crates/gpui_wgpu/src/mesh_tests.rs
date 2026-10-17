@@ -1,7 +1,8 @@
 //! Pixel coverage of the shipping mesh pass and composite.
+use super::gpu_test_support::{PIXEL_FORMAT, render_pixels, test_device};
 use super::*;
-use gpui::{ContentMask, Corners, Mesh, MeshStyle, MeshVertex, PaintMesh, block_on, point, size};
-use std::{sync::mpsc, time::Duration};
+use gpui::{ContentMask, Corners, Mesh, MeshStyle, MeshVertex, PaintMesh, point, size};
+use std::time::Duration;
 use wgpu::util::DeviceExt as _;
 
 const WIDTH: u32 = 128;
@@ -97,38 +98,6 @@ fn cube() -> Mesh {
     Mesh::new(vertices)
 }
 
-fn device() -> Result<(wgpu::Device, wgpu::Queue)> {
-    block_on(async {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: None,
-        });
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            })
-            .await?;
-        adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("mesh pixel regression"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_defaults()
-                    .using_resolution(adapter.limits())
-                    .using_alignment(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            })
-            .await
-            .map_err(anyhow::Error::from)
-    })
-}
-
 fn paint(mesh: &Arc<Mesh>, edges: f32) -> PaintMesh {
     let bounds = Bounds::new(
         point(ScaledPixels(16.0), ScaledPixels(16.0)),
@@ -159,23 +128,8 @@ fn paint(mesh: &Arc<Mesh>, edges: f32) -> PaintMesh {
     }
 }
 
-/// Renders `paints` through the mesh pass and composite; RGBA rows.
-fn render(device: &wgpu::Device, queue: &wgpu::Queue, paints: &[PaintMesh]) -> Result<Vec<u8>> {
-    render_with_scratch_mode(device, queue, paints, true)
-}
-
-fn render_with_scratch_mode(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    paints: &[PaintMesh],
-    shared: bool,
-) -> Result<Vec<u8>> {
-    let layouts = WgpuRenderer::create_bind_group_layouts(device, false);
-    let format = wgpu::TextureFormat::Rgba8Unorm;
-    // Separate renderers give each mesh independent color/depth scratch storage.
-    let mut renderers: Vec<_> = (0..if shared { 1 } else { paints.len() })
-        .map(|_| MeshRenderer::new(device, &layouts.globals, format))
-        .collect();
+/// The scene's group 0 for a `WIDTH`×`HEIGHT` premultiplied target.
+fn globals_group(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> wgpu::BindGroup {
     let globals = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("mesh globals"),
         contents: bytemuck::bytes_of(&GlobalParams {
@@ -196,9 +150,9 @@ fn render_with_scratch_mode(
         }),
         usage: wgpu::BufferUsages::UNIFORM,
     });
-    let globals_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("mesh globals"),
-        layout: &layouts.globals,
+        layout,
         entries: &[
             wgpu::BindGroupEntry {
                 binding: 0,
@@ -209,28 +163,26 @@ fn render_with_scratch_mode(
                 resource: gamma.as_entire_binding(),
             },
         ],
-    });
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("mesh pixels"),
-        size: wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-        view_formats: &[],
-    });
-    let bytes_per_row = WIDTH * 4;
-    let output = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("mesh readback"),
-        size: u64::from(bytes_per_row * HEIGHT),
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    })
+}
+
+/// Renders `paints` through the mesh pass and composite; RGBA rows.
+fn render(device: &wgpu::Device, queue: &wgpu::Queue, paints: &[PaintMesh]) -> Result<Vec<u8>> {
+    render_with_scratch_mode(device, queue, paints, true)
+}
+
+fn render_with_scratch_mode(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    paints: &[PaintMesh],
+    shared: bool,
+) -> Result<Vec<u8>> {
+    let layouts = WgpuRenderer::create_bind_group_layouts(device, false);
+    // Separate renderers give each mesh independent color/depth scratch storage.
+    let mut renderers: Vec<_> = (0..if shared { 1 } else { paints.len() })
+        .map(|_| MeshRenderer::new(device, &layouts.globals, PIXEL_FORMAT))
+        .collect();
+    let globals_group = globals_group(device, &layouts.globals);
     let mut encoder = device.create_command_encoder(&Default::default());
     if shared {
         renderers[0].prepare(device, queue, &mut encoder, paints);
@@ -239,59 +191,22 @@ fn render_with_scratch_mode(
             renderer.prepare(device, queue, &mut encoder, std::slice::from_ref(paint));
         }
     }
-    let view = texture.create_view(&Default::default());
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("mesh pixels"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
-        });
-        if shared {
-            renderers[0].composite(0..paints.len(), &globals_group, &mut pass);
-        } else {
-            for renderer in &renderers {
-                renderer.composite(0..1, &globals_group, &mut pass);
+    let pixels = render_pixels(
+        device,
+        queue,
+        encoder,
+        (WIDTH, HEIGHT),
+        wgpu::Color::TRANSPARENT,
+        |pass| {
+            if shared {
+                renderers[0].composite(0..paints.len(), &globals_group, pass);
+            } else {
+                for renderer in &renderers {
+                    renderer.composite(0..1, &globals_group, pass);
+                }
             }
-        }
-    }
-    encoder.copy_texture_to_buffer(
-        texture.as_image_copy(),
-        wgpu::TexelCopyBufferInfo {
-            buffer: &output,
-            layout: wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(HEIGHT),
-            },
         },
-        wgpu::Extent3d {
-            width: WIDTH,
-            height: HEIGHT,
-            depth_or_array_layers: 1,
-        },
-    );
-    let submission = queue.submit([encoder.finish()]);
-    let (sender, receiver) = mpsc::channel();
-    output
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-    device.poll(wgpu::PollType::Wait {
-        submission_index: Some(submission),
-        timeout: Some(Duration::from_secs(10)),
-    })?;
-    receiver.recv_timeout(Duration::from_secs(10))??;
-    let pixels = output.slice(..).get_mapped_range().to_vec();
-    output.unmap();
+    )?;
     if let Some(path) = std::env::var_os("GPUI_MESH_TEST_DUMP") {
         // A binary PPM of the RGB channels, for eyeballing the render.
         let mut ppm = format!("P6 {WIDTH} {HEIGHT} 255\n").into_bytes();
@@ -305,7 +220,9 @@ fn render_with_scratch_mode(
 
 #[test]
 fn shared_mesh_scratch_preserves_depth_transparency_and_composite_order() -> Result<()> {
-    let (device, queue) = device()?;
+    let Some((device, queue)) = test_device("mesh pixel regression")? else {
+        return Ok(());
+    };
     let mut first = paint(&Arc::new(cube()), 0.0);
     first.bounds.origin = point(ScaledPixels(4.0), ScaledPixels(8.0));
     let mut second = paint(&Arc::new(cube()), 1.0);
@@ -337,7 +254,9 @@ fn shared_mesh_scratch_preserves_depth_transparency_and_composite_order() -> Res
 
 #[test]
 fn mesh_scratch_tracks_current_sizes_and_releases_while_commands_are_pending() -> Result<()> {
-    let (device, queue) = device()?;
+    let Some((device, queue)) = test_device("mesh pixel regression")? else {
+        return Ok(());
+    };
     let layouts = WgpuRenderer::create_bind_group_layouts(&device, false);
     let mut renderer =
         MeshRenderer::new(&device, &layouts.globals, wgpu::TextureFormat::Rgba8Unorm);
@@ -388,7 +307,9 @@ fn mesh_scratch_tracks_current_sizes_and_releases_while_commands_are_pending() -
 
 #[test]
 fn meshes_draw_lit_on_a_transparent_rounded_viewport() -> Result<()> {
-    let (device, queue) = device()?;
+    let Some((device, queue)) = test_device("mesh pixel regression")? else {
+        return Ok(());
+    };
     let empty = render(
         &device,
         &queue,
@@ -405,7 +326,6 @@ fn meshes_draw_lit_on_a_transparent_rounded_viewport() -> Result<()> {
     assert_eq!(center[3], 255, "the cube covers the viewport center");
     assert!(center[0] > 40, "the cube is lit, not black: {center:?}");
     assert_eq!(pixel(4, 4)[3], 0, "outside the viewport stays clear");
-    assert_eq!(pixel(18, 18)[3], 0, "the rounded corner clips");
     assert_eq!(pixel(20, 20)[3], 0, "the background stays transparent");
     // The top face is red: some pixel above the center is red-dominant.
     let red = (20..48).any(|y| {
@@ -426,6 +346,87 @@ fn meshes_draw_lit_on_a_transparent_rounded_viewport() -> Result<()> {
         "wireframe edges draw: {} dark pixels vs {}",
         dark(&wire),
         dark(&pixels)
+    );
+    Ok(())
+}
+
+#[test]
+fn rounded_corners_clip_a_mesh_that_fills_its_bounds() -> Result<()> {
+    let Some((device, queue)) = test_device("mesh pixel regression")? else {
+        return Ok(());
+    };
+    let mut filled = paint(&Arc::new(cube()), 0.0);
+    // Head-on from 0.9 units the front face spans about ±3.1 × ±4.7 in NDC, so
+    // the cube covers every target pixel, the corners included.
+    filled.style.view = translation(0.0, 0.0, -0.9);
+    let pixels = render(&device, &queue, &[filled])?;
+    let alpha = |x: u32, y: u32| pixels[((y * WIDTH + x) * 4 + 3) as usize];
+    // The bounds span 16..112 × 16..80 with 12 px radii; these pixel centers
+    // sit about 2.9 px outside each arc.
+    for (x, y) in [(17, 17), (110, 17), (17, 78), (110, 78)] {
+        assert_eq!(alpha(x, y), 0, "the rounded corner at ({x}, {y}) clips");
+    }
+    // Edge midpoints and a pixel just inside the top-left arc stay covered.
+    for (x, y) in [(64, 17), (17, 48), (110, 48), (64, 78), (20, 20)] {
+        assert_eq!(alpha(x, y), 255, "the mesh covers ({x}, {y})");
+    }
+    Ok(())
+}
+
+#[test]
+fn unchanged_meshes_keep_their_render_and_changed_ones_redraw() -> Result<()> {
+    let Some((device, queue)) = test_device("mesh pixel regression")? else {
+        return Ok(());
+    };
+    let layouts = WgpuRenderer::create_bind_group_layouts(&device, false);
+    let globals = globals_group(&device, &layouts.globals);
+    let mut renderer = MeshRenderer::new(&device, &layouts.globals, PIXEL_FORMAT);
+    let frame = |renderer: &mut MeshRenderer, paints: &[PaintMesh]| {
+        let mut encoder = device.create_command_encoder(&Default::default());
+        renderer.prepare(&device, &queue, &mut encoder, paints);
+        render_pixels(
+            &device,
+            &queue,
+            encoder,
+            (WIDTH, HEIGHT),
+            wgpu::Color::TRANSPARENT,
+            |pass| renderer.composite(0..paints.len(), &globals, pass),
+        )
+    };
+    let mesh = Arc::new(cube());
+    let mut painted = paint(&mesh, 0.0);
+    let gray = frame(&mut renderer, std::slice::from_ref(&painted))?;
+    assert_eq!(
+        gray,
+        render(&device, &queue, std::slice::from_ref(&painted))?
+    );
+    assert_eq!(
+        gray,
+        frame(&mut renderer, std::slice::from_ref(&painted))?,
+        "an unchanged mesh composites its cached render"
+    );
+
+    painted.style.base_color = [0.1, 0.8, 0.2];
+    let green = render(&device, &queue, std::slice::from_ref(&painted))?;
+    assert_ne!(gray, green);
+    // A frame whose encoder is dropped never renders; invalidating forces the
+    // next frame to render the new style instead of trusting the lost one.
+    let mut dropped = device.create_command_encoder(&Default::default());
+    renderer.prepare(
+        &device,
+        &queue,
+        &mut dropped,
+        std::slice::from_ref(&painted),
+    );
+    drop(dropped);
+    renderer.invalidate();
+    assert_eq!(green, frame(&mut renderer, std::slice::from_ref(&painted))?);
+
+    // Moving the mesh only recomposites it.
+    painted.bounds.origin = point(ScaledPixels(8.0), ScaledPixels(12.0));
+    assert_eq!(
+        render(&device, &queue, std::slice::from_ref(&painted))?,
+        frame(&mut renderer, std::slice::from_ref(&painted))?
     );
     Ok(())
 }

@@ -977,12 +977,18 @@ float4 hsla_to_rgba(Hsla hsla) {
   return rgba;
 }
 
+// Exact piecewise sRGB transfer curves, matching the DirectX and WGPU
+// backends. Only the Oklab gradient conversions below use them.
 float3 srgb_to_linear(float3 color) {
-  return pow(color, float3(2.2));
+  float3 higher = pow((color + 0.055) / 1.055, float3(2.4));
+  float3 lower = color / 12.92;
+  return select(higher, lower, color < float3(0.04045));
 }
 
 float3 linear_to_srgb(float3 color) {
-  return pow(color, float3(1.0 / 2.2));
+  float3 higher = 1.055 * pow(color, float3(1.0 / 2.4)) - 0.055;
+  float3 lower = color * 12.92;
+  return select(higher, lower, color < float3(0.0031308));
 }
 
 // Converts a sRGB color to the Oklab color space.
@@ -1023,8 +1029,9 @@ float4 oklab_to_srgb(float4 color) {
    	-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s
   );
 
-  // Convert linear sRGB to non-linear sRGB
-  return float4(linear_to_srgb(linear_rgb), color.a);
+  // Convert linear sRGB to non-linear sRGB. The clamp keeps out-of-gamut
+  // mixes (negative linear channels) from producing NaN in `pow`.
+  return float4(linear_to_srgb(saturate(linear_rgb)), color.a);
 }
 
 float4 to_device_position(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -1207,6 +1214,20 @@ float2x2 rotate2d(float angle) {
     return float2x2(c, -s, s, c);
 }
 
+// Same 4x4 Bayer ordered dither as the WGPU and DirectX shaders, in units of
+// one 8-bit code: strictly inside half a code, identical across RGB channels,
+// without changing alpha.
+float gradient_dither(float2 position) {
+  int x = int(floor(position.x)) & 3;
+  int y = int(floor(position.y)) & 3;
+  int qx = (x >> 1) & 1;
+  int qy = (y >> 1) & 1;
+  int lx = x & 1;
+  int ly = y & 1;
+  int threshold = 4 * (2 * (lx ^ ly) + ly) + 2 * (qx ^ qy) + qy;
+  return (float(threshold) + 0.5) / 16.0 - 0.5;
+}
+
 float4 fill_color(Background background,
                       float2 position,
                       Bounds_ScaledPixels bounds,
@@ -1259,17 +1280,11 @@ float4 fill_color(Background background,
         }
       }
 
-      // Dither to reduce banding in gradients (especially dark/alpha).
-      // Triangular-distributed noise breaks up 8-bit quantization steps.
-      // ±2/255 for RGB (enough for dark-on-dark compositing),
-      // ±3/255 for alpha (needs more because alpha × dark color = tiny steps).
-      {
-        float2 seed = position * 0.6180339887; // golden ratio spread
-        float r1 = fract(sin(dot(seed, float2(12.9898, 78.233))) * 43758.5453);
-        float r2 = fract(sin(dot(seed, float2(39.3460, 11.135))) * 24634.6345);
-        float tri = r1 + r2 - 1.0; // triangular PDF, range [-1, +1]
-        color.rgb += tri * 2.0 / 255.0;
-        color.a   += tri * 3.0 / 255.0;
+      // Deterministic ordered dither at the final 8-bit quantization,
+      // skipped when the stops are identical so flat gradients match solid
+      // fills; alpha is never dithered.
+      if (!all(color0 == color1)) {
+        color.rgb += gradient_dither(position) / 255.0;
       }
 
       break;
