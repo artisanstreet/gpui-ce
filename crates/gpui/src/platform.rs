@@ -893,7 +893,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     /// Shows a count on the app's taskbar or dock icon; zero clears it.
-    fn set_badge_count(&self, _count: usize) {}
+    /// Platforms that draw their own badge (macOS) ignore `color`.
+    fn set_badge(&self, _count: usize, _color: crate::Hsla) {}
     fn is_active(&self) -> bool;
     fn is_hovered(&self) -> bool;
     fn background_appearance(&self) -> WindowBackgroundAppearance;

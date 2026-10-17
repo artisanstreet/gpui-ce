@@ -179,9 +179,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_taskbar_button_created(&self, handle: HWND) -> Option<isize> {
-        let count = self.state.badge_count.get();
+        let (count, color) = self.state.badge.get();
         if count > 0 {
-            crate::taskbar_badge::set_overlay(handle, count).log_err();
+            crate::taskbar_badge::set_overlay(handle, count, color).log_err();
         }
         None
     }

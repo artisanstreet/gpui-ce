@@ -1,6 +1,7 @@
 //! The count badge drawn over a window's taskbar button. Windows takes a
 //! small icon, not text, so the count is rasterized here: GDI draws the
-//! digits as coverage, and a red disc is composited underneath.
+//! digits as coverage, inked white or dark against a disc in the caller's
+//! colour.
 
 use std::sync::OnceLock;
 
@@ -19,8 +20,7 @@ use windows::{
     core::{HSTRING, PCWSTR, w},
 };
 
-/// Fluent's red, so the badge reads like the system's own.
-const BADGE_RED: [u8; 3] = [0xD1, 0x34, 0x38];
+use gpui::{Hsla, Rgba, hsla_to_rgba};
 
 /// Sent by Explorer once a window's taskbar button exists, and again after
 /// Explorer restarts; overlays set before then are lost.
@@ -29,8 +29,8 @@ pub(crate) fn taskbar_button_created() -> u32 {
     *MESSAGE.get_or_init(|| unsafe { RegisterWindowMessageW(w!("TaskbarButtonCreated")) })
 }
 
-/// Shows `count` over the window's taskbar button; zero clears it.
-pub(crate) fn set_overlay(hwnd: HWND, count: usize) -> Result<()> {
+/// Shows `count` on a `color` disc over the window's taskbar button; zero clears it.
+pub(crate) fn set_overlay(hwnd: HWND, count: usize, color: Hsla) -> Result<()> {
     let taskbar: ITaskbarList3 =
         unsafe { CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER)? };
     unsafe { taskbar.HrInit()? };
@@ -45,7 +45,7 @@ pub(crate) fn set_overlay(hwnd: HWND, count: usize) -> Result<()> {
     } else {
         count.to_string()
     };
-    let icon = badge_icon(&label, size)?;
+    let icon = badge_icon(&label, size, hsla_to_rgba(color))?;
     let description = HSTRING::from(format!("{count} unread"));
     let result = unsafe { taskbar.SetOverlayIcon(hwnd, icon, &description) };
     // The taskbar keeps its own copy.
@@ -54,7 +54,11 @@ pub(crate) fn set_overlay(hwnd: HWND, count: usize) -> Result<()> {
     Ok(())
 }
 
-fn badge_icon(label: &str, size: i32) -> Result<HICON> {
+fn badge_icon(label: &str, size: i32, color: Rgba) -> Result<HICON> {
+    let fill = [color.red, color.green, color.blue].map(|channel| (channel * 255.).round() as u8);
+    // Light fills take dark digits; the threshold is relative luminance.
+    let luminance = 0.2126 * color.red + 0.7152 * color.green + 0.0722 * color.blue;
+    let ink = if luminance > 0.5 { 0x1A } else { 0xFF } as f32;
     let header = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -116,12 +120,12 @@ fn badge_icon(label: &str, size: i32) -> Result<HICON> {
             let y = (index as i32 / size) as f32 + 0.5 - radius;
             let disc = (radius - (x * x + y * y).sqrt() + 0.5).clamp(0., 1.);
             let text = pixel[1] as f32 / 255.;
-            let mix = |red: u8| (red as f32 + (255. - red as f32) * text).round() as u8;
+            let mix = |channel: u8| (channel as f32 + (ink - channel as f32) * text).round() as u8;
             // BGRA, straight alpha.
             *pixel = [
-                mix(BADGE_RED[2]),
-                mix(BADGE_RED[1]),
-                mix(BADGE_RED[0]),
+                mix(fill[2]),
+                mix(fill[1]),
+                mix(fill[0]),
                 (disc * 255.).round() as u8,
             ];
         }

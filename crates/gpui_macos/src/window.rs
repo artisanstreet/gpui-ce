@@ -2052,7 +2052,7 @@ impl PlatformWindow for MacWindow {
             .detach();
     }
 
-    fn set_badge_count(&self, count: usize) {
+    fn set_badge(&self, count: usize, _color: gpui::Hsla) {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let tile: id = msg_send![app, dockTile];
