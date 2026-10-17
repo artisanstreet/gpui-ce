@@ -26,6 +26,7 @@ mod monitor_vsync;
 mod platform;
 mod system_notifications;
 mod system_settings;
+mod taskbar_badge;
 mod util;
 mod window;
 mod wrapper;

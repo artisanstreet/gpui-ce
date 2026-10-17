@@ -2052,6 +2052,19 @@ impl PlatformWindow for MacWindow {
             .detach();
     }
 
+    fn set_badge(&self, count: usize, _color: gpui::Hsla) {
+        unsafe {
+            let app = NSApplication::sharedApplication(nil);
+            let tile: id = msg_send![app, dockTile];
+            if count == 0 {
+                let _: () = msg_send![tile, setBadgeLabel: nil];
+            } else {
+                let label = ns_string(&count.to_string());
+                let _: () = msg_send![tile, setBadgeLabel: label];
+            }
+        }
+    }
+
     fn is_active(&self) -> bool {
         unsafe { self.0.lock().native_window.isKeyWindow() == YES }
     }

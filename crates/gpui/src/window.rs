@@ -6738,6 +6738,12 @@ impl Window {
         self.platform_window.request_attention();
     }
 
+    /// Shows a count on the app's taskbar button or dock icon; zero clears it.
+    /// Windows draws the badge in `color`; macOS keeps the system's red.
+    pub fn set_badge(&self, count: usize, color: Hsla) {
+        self.platform_window.set_badge(count, color);
+    }
+
     /// Minimize the current window at the platform level.
     pub fn minimize_window(&self) {
         self.platform_window.minimize();
