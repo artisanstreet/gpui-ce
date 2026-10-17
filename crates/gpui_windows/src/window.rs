@@ -68,6 +68,8 @@ pub struct WindowsWindowState {
     pub hovered: Cell<bool>,
     /// Re-applied when Explorer recreates the taskbar button.
     pub badge: Cell<(usize, Hsla)>,
+    /// Whether `badge` reached the taskbar.
+    pub badge_applied: Cell<bool>,
     pub direct_manipulation: DirectManipulationHandler,
 
     #[cfg(feature = "wgpu")]
@@ -201,6 +203,7 @@ impl WindowsWindowState {
             last_reported_capslock: Cell::new(last_reported_capslock),
             hovered: Cell::new(hovered),
             badge: Cell::new((0, Hsla::default())),
+            badge_applied: Cell::new(true),
             renderer: RefCell::new(renderer),
             force_render_pending: Cell::new(false),
             frame_ready: Arc::new(AtomicBool::new(true)),
@@ -943,8 +946,14 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn set_badge(&self, count: usize, color: Hsla) {
-        if self.state.badge.replace((count, color)) != (count, color) {
-            crate::taskbar_badge::set_overlay(self.0.hwnd, count, color).log_err();
+        // Repeats are skipped only once applied, so a failed apply retries.
+        if self.state.badge.replace((count, color)) != (count, color)
+            || !self.state.badge_applied.get()
+        {
+            let applied = crate::taskbar_badge::set_overlay(self.0.hwnd, count, color)
+                .log_err()
+                .is_some();
+            self.state.badge_applied.set(applied);
         }
     }
 

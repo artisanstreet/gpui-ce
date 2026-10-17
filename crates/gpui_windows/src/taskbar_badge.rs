@@ -56,9 +56,22 @@ pub(crate) fn set_overlay(hwnd: HWND, count: usize, color: Hsla) -> Result<()> {
 
 fn badge_icon(label: &str, size: i32, color: Rgba) -> Result<HICON> {
     let fill = [color.red, color.green, color.blue].map(|channel| (channel * 255.).round() as u8);
-    // Light fills take dark digits; the threshold is relative luminance.
-    let luminance = 0.2126 * color.red + 0.7152 * color.green + 0.0722 * color.blue;
-    let ink = if luminance > 0.5 { 0x1A } else { 0xFF } as f32;
+    // Digits take whichever ink contrasts more with the fill (WCAG ratio).
+    let linear = |channel: f32| {
+        if channel <= 0.04045 {
+            channel / 12.92
+        } else {
+            ((channel + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance =
+        0.2126 * linear(color.red) + 0.7152 * linear(color.green) + 0.0722 * linear(color.blue);
+    let dark = linear(0x1A as f32 / 255.);
+    let ink = if (luminance + 0.05) / (dark + 0.05) > 1.05 / (luminance + 0.05) {
+        0x1A
+    } else {
+        0xFF
+    } as f32;
     let header = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -75,7 +88,15 @@ fn badge_icon(label: &str, size: i32, color: Rgba) -> Result<HICON> {
     unsafe {
         let dc = CreateCompatibleDC(None);
         let mut bits = std::ptr::null_mut();
-        let color = CreateDIBSection(Some(dc), &header, DIB_RGB_COLORS, &mut bits, None, 0)?;
+        let color = match CreateDIBSection(Some(dc), &header, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(color) => color,
+            Err(error) => {
+                DeleteDC(dc).ok().ok();
+                return Err(error.into());
+            }
+        };
+        // Every pixel's green channel is read back as text coverage.
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, (size * size * 4) as usize);
         let previous_bitmap = SelectObject(dc, color.into());
 
         // White digits on black: any channel is the text's coverage.

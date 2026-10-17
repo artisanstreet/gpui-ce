@@ -263,7 +263,7 @@ impl PlatformTextSystem for CosmicTextSystem {
 const EMOJI_FALLBACK_FAMILIES: &[&str] = &[
     "Segoe UI Emoji",
     "Noto Color Emoji",
-    "AppleColorEmoji",
+    "Apple Color Emoji",
     "Twemoji Mozilla",
 ];
 

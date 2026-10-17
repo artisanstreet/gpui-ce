@@ -1739,7 +1739,9 @@ impl Window {
                 else {
                     log::debug!("deferring frame request: the window can't be updated");
                     deferred_force_render |= force_render;
-                    if !next_frame_callbacks.borrow().is_empty() {
+                    // The App's flush re-requests frames for dirty windows and
+                    // pending callbacks, but not for a force-only frame.
+                    if force_render || !next_frame_callbacks.borrow().is_empty() {
                         invalidator.wake_platform();
                     }
                     return;

@@ -116,8 +116,12 @@ impl MonitorClock {
                 return;
             }
         }
-        self.output = None;
-        self.retry_after = Some(now + Duration::from_secs(1));
+        // Arm the retry only when an output is dropped: re-arming on every
+        // fallback frame would push it a second ahead forever while frames
+        // keep coming. A failed reacquire above has already armed it.
+        if self.output.take().is_some() {
+            self.retry_after = Some(now + Duration::from_secs(1));
+        }
         // Remote sessions and outputs without a usable DXGI vblank retain a
         // bounded fallback. Local monitors use their actual hardware clock.
         std::thread::sleep(Duration::from_micros(16_667));
