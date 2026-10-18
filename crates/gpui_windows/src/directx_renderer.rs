@@ -3062,11 +3062,15 @@ fn create_blend_state_for_subpixel_rendering(device: &ID3D11Device) -> Result<ID
     desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
     desc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC1_COLOR;
     desc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC1_COLOR;
-    // It does not make sense to draw transparent subpixel-rendered text, since it cannot be meaningfully alpha-blended onto anything else.
-    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
-    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
-    desc.RenderTarget[0].RenderTargetWriteMask =
-        D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8 & !D3D11_COLOR_WRITE_ENABLE_ALPHA.0 as u8;
+    // Alpha composites "over" by the glyph's coverage (the second source's alpha). Subpixel text
+    // only draws in opaque windows, where that leaves the target opaque; but a content-filter
+    // group (`.blur()`) renders into a cleared, transparent target that is later composited
+    // premultiplied, and there the text must carry its coverage in alpha. With alpha writes masked
+    // off the group kept alpha 0 under the glyphs, so the composite added the text colour to the
+    // backdrop instead of covering it: dark text vanished into a light background.
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_SRC1_ALPHA;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC1_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
 
     unsafe {
         let mut state = None;
@@ -3905,3 +3909,7 @@ mod partial_redraw_tests;
 #[cfg(test)]
 #[path = "directx_snapshot_transition_tests.rs"]
 mod snapshot_transition_tests;
+
+#[cfg(test)]
+#[path = "directx_text_blur_tests.rs"]
+mod text_blur_tests;

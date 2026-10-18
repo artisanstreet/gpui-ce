@@ -1251,8 +1251,11 @@ SubpixelSpriteFragmentOutput subpixel_sprite_fragment(MonochromeSpriteFragmentIn
     float3 alpha_corrected = apply_contrast_and_gamma_correction3(sample, input.color.rgb, subpixel_enhanced_contrast, gamma_ratios);
 
     SubpixelSpriteFragmentOutput output;
+    float3 coverage = input.color.a * alpha_corrected;
     output.foreground = float4(input.color.rgb, 1.0f);
-    output.alpha = float4(input.color.a * alpha_corrected, 1.0f);
+    // Alpha takes the strongest channel's coverage, so the colour this writes into a transparent
+    // target (color * coverage per channel) never exceeds its alpha: valid premultiplied.
+    output.alpha = float4(coverage, max(coverage.r, max(coverage.g, coverage.b)));
     return output;
 }
 
