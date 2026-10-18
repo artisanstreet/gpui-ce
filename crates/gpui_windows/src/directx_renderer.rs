@@ -226,6 +226,14 @@ pub(crate) struct DirectXRenderer {
     drawn_generation: Option<u64>,
     /// Retained pixels were cleared to the previous appearance.
     background_appearance: Option<WindowBackgroundAppearance>,
+    /// The frame a snapshot transition composites over the following presents.
+    snapshot: Option<Snapshot>,
+}
+
+/// A copy of the back buffer, kept while a snapshot transition plays.
+struct Snapshot {
+    _texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
 }
 
 /// A scene's inputs to damage planning, gathered once per generation rather than per present.
@@ -448,6 +456,11 @@ struct DirectXRenderPipelines {
     scissor_rasterizer: ID3D11RasterizerState,
     /// Draws the [`SHOW_DAMAGE`] tint from its own one-quad buffer, leaving the scene's intact.
     damage_overlay: Option<PipelineState<Quad>>,
+    // The snapshot transition's full-window composite; parameters at register b5.
+    snapshot_vertex: ID3D11VertexShader,
+    snapshot_fragment: ID3D11PixelShader,
+    snapshot_params_buffer: ID3D11Buffer,
+    snapshot_blend: ID3D11BlendState,
 }
 
 struct DirectXGlobalElements {
@@ -580,6 +593,7 @@ impl DirectXRenderer {
             uploaded_generation: None,
             drawn_generation: None,
             background_appearance: None,
+            snapshot: None,
         })
     }
 
@@ -701,6 +715,8 @@ impl DirectXRenderer {
     fn handle_device_lost_impl(&mut self, directx_devices: &DirectXDevices) -> Result<()> {
         let disable_direct_composition = self.direct_composition.is_none();
         self.meshes = None;
+        // The snapshot belonged to the lost device: the transition just ends.
+        self.snapshot = None;
         self.active_render_target = None;
         self.damage.invalidate();
         self.uploaded_generation = None;
@@ -779,13 +795,35 @@ impl DirectXRenderer {
             // and so likely do not have the textures anymore that are required for drawing
             return Ok(());
         }
+        let transition = scene
+            .snapshot_transition
+            .filter(|_| self.snapshot.is_some());
+        if transition.is_some() || (scene.snapshot_transition.is_none() && self.snapshot.is_some())
+        {
+            // Every present of a transition repaints whole, and so does the first one after
+            // it: the composite left the back buffers holding pixels no scene drew.
+            self.damage.invalidate();
+        }
+        if scene.snapshot_transition.is_none() {
+            self.snapshot = None;
+        }
         let plan = self.plan_frame(scene, background_appearance);
         let presented = match &plan.repaint {
             Repaint::Nothing => Ok(true),
             repaint => self
                 .render(scene, background_appearance, repaint)
+                .and_then(|()| match &transition {
+                    Some(frame) => self.composite_snapshot(frame),
+                    None => Ok(()),
+                })
                 .and_then(|()| self.present(repaint)),
         };
+        if transition.is_some() {
+            // The flipped buffer holds the composite.
+            self.damage.invalidate();
+            self.drawn_generation = Some(scene.generation);
+            return presented.map(|_| ());
+        }
         self.drawn_generation = Some(scene.generation);
         match presented {
             Ok(true) => {
@@ -1186,6 +1224,110 @@ impl DirectXRenderer {
         Ok(())
     }
 
+    /// Renders `scene`, the window's last drawn scene, whole into the back buffer and keeps a
+    /// copy as the snapshot the following presents composite while their scene carries a
+    /// [`SnapshotTransitionFrame`]. Nothing is presented: the next present repaints whole.
+    /// Returns false while recovering from a lost device.
+    pub(crate) fn begin_snapshot_transition(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<bool> {
+        self.snapshot = None;
+        if self.skip_draws {
+            return Ok(false);
+        }
+        let rendered = self.render(scene, background_appearance, &Repaint::Full);
+        // The back buffer no longer holds what the tracker last saw presented there.
+        self.damage.invalidate();
+        rendered?;
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let render_target = self
+            .resources
+            .as_ref()
+            .context("resources missing")?
+            .render_target
+            .as_ref()
+            .context("render target missing")?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe { render_target.GetDesc(&mut desc) };
+        let desc = D3D11_TEXTURE2D_DESC {
+            MipLevels: 1,
+            ArraySize: 1,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_SHADER_RESOURCE.0 as u32,
+            CPUAccessFlags: 0,
+            MiscFlags: 0,
+            ..desc
+        };
+        let mut texture = None;
+        unsafe {
+            devices
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut texture))
+                .context("creating the snapshot texture")?
+        };
+        let texture = texture.context("snapshot texture missing")?;
+        unsafe { devices.device_context.CopyResource(&texture, render_target) };
+        let mut srv = None;
+        unsafe {
+            devices
+                .device
+                .CreateShaderResourceView(&texture, None, Some(&mut srv))
+                .context("creating the snapshot view")?
+        };
+        self.snapshot = Some(Snapshot {
+            _texture: texture,
+            srv,
+        });
+        Ok(true)
+    }
+
+    /// Composites the snapshot over the whole back buffer, which holds the new frame.
+    fn composite_snapshot(&self, frame: &SnapshotTransitionFrame) -> Result<()> {
+        let Some(snapshot) = self.snapshot.as_ref() else {
+            return Ok(());
+        };
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let resources = self.resources.as_ref().context("resources missing")?;
+        let ctx = &devices.device_context;
+        let pipelines = &self.pipelines;
+        update_buffer(
+            ctx,
+            &pipelines.snapshot_params_buffer,
+            &[SnapshotParams {
+                shimmer: frame.shimmer,
+                edge: frame.edge(),
+                band: frame.band,
+                feather: SNAPSHOT_FEATHER,
+                _pad: 0.0,
+            }],
+        )?;
+        let params = [Some(pipelines.snapshot_params_buffer.clone())];
+        unsafe {
+            ctx.PSSetShaderResources(0, Some(&[None]));
+            ctx.OMSetRenderTargets(Some(slice::from_ref(&resources.render_target_view)), None);
+            // Never scissored: the composite covers the whole window.
+            ctx.RSSetState(&pipelines.rasterizer);
+            ctx.RSSetViewports(Some(slice::from_ref(&resources.viewport)));
+            ctx.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx.VSSetShader(&pipelines.snapshot_vertex, None);
+            ctx.PSSetShader(&pipelines.snapshot_fragment, None);
+            ctx.VSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
+            ctx.PSSetConstantBuffers(0, Some(slice::from_ref(&self.globals.global_params_buffer)));
+            ctx.PSSetConstantBuffers(5, Some(&params));
+            ctx.PSSetShaderResources(0, Some(slice::from_ref(&snapshot.srv)));
+            ctx.OMSetBlendState(&pipelines.snapshot_blend, None, 0xFFFFFFFF);
+            ctx.DrawInstanced(3, 1, 0, 0);
+            ctx.PSSetShaderResources(0, Some(&[None]));
+        }
+        Ok(())
+    }
+
     /// Render `scene` to an offscreen CPU image **without presenting** so
     /// the window need never be shown or visible (the macOS headless path
     /// goes through MetalRenderer; this is the Windows analogue). Draws into
@@ -1286,6 +1428,8 @@ impl DirectXRenderer {
         self.width = width;
         self.height = height;
         self.damage.invalidate();
+        // The snapshot no longer lines up with the window.
+        self.snapshot = None;
 
         // Clear the render target before resizing
         let devices = self.devices.as_ref().context("devices missing")?;
@@ -2196,6 +2340,17 @@ impl DirectXRenderPipelines {
         // Premultiplied (One / InvSrcAlpha) — the composite outputs a premultiplied blurred sample;
         // straight-alpha blending would darken the faded edges.
         let blur_blend_composite = create_blend_state_for_path_rasterization(device)?;
+        let snapshot_vertex = create_vertex_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::SnapshotTransition, ShaderTarget::Vertex)?.as_bytes(),
+        )?;
+        let snapshot_fragment = create_fragment_shader(
+            device,
+            RawShaderBytes::new(ShaderModule::SnapshotTransition, ShaderTarget::Fragment)?
+                .as_bytes(),
+        )?;
+        let snapshot_params_buffer = create_constant_buffer::<SnapshotParams>(device)?.unwrap();
+        let snapshot_blend = create_blend_state_for_snapshot(device)?;
         let damage_overlay = if std::env::var_os(SHOW_DAMAGE).is_some_and(|value| value == "1") {
             Some(PipelineState::new(
                 device,
@@ -2230,6 +2385,10 @@ impl DirectXRenderPipelines {
             rasterizer: create_rasterizer_state(device, false)?,
             scissor_rasterizer: create_rasterizer_state(device, true)?,
             damage_overlay,
+            snapshot_vertex,
+            snapshot_fragment,
+            snapshot_params_buffer,
+            snapshot_blend,
         })
     }
 }
@@ -2350,6 +2509,22 @@ impl Default for BlurParams {
         }
     }
 }
+/// Mirrors the `SnapshotParams` cbuffer (register b5) in `shaders.hlsl`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SnapshotParams {
+    shimmer: [f32; 4],
+    edge: f32,
+    band: f32,
+    feather: f32,
+    _pad: f32,
+}
+
+const _: () = assert!(std::mem::size_of::<SnapshotParams>() == 32);
+
+/// Half the width of the soft edge between the frames, on the diagonal coordinate.
+const SNAPSHOT_FEATHER: f32 = 0.008;
+
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C, align(16))]
 struct BatchParams {
@@ -2943,6 +3118,24 @@ fn create_blend_state_for_path_sprite(device: &ID3D11Device) -> Result<ID3D11Ble
 /// A blend state that overwrites the target (no blending) — used for the blur downsample and
 /// gaussian passes.
 #[inline]
+/// Dual-source: the composite adds source 0 and keeps the target scaled by source 1.
+fn create_blend_state_for_snapshot(device: &ID3D11Device) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0].BlendEnable = true.into();
+    desc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+    desc.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlend = D3D11_BLEND_SRC1_COLOR;
+    desc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+    desc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_SRC1_ALPHA;
+    desc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8;
+    unsafe {
+        let mut state = None;
+        device.CreateBlendState(&desc, Some(&mut state))?;
+        Ok(state.unwrap())
+    }
+}
+
 fn create_blend_state_no_blend(device: &ID3D11Device) -> Result<ID3D11BlendState> {
     let mut desc = D3D11_BLEND_DESC::default();
     desc.RenderTarget[0].BlendEnable = false.into();
@@ -3138,6 +3331,7 @@ pub(crate) mod shader_resources {
         BlurDownsample,
         Blur,
         BlurComposite,
+        SnapshotTransition,
         Mesh,
         MeshComposite,
     }
@@ -3229,6 +3423,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::BlurComposite => match target {
                     ShaderTarget::Vertex => BLUR_COMPOSITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => BLUR_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::SnapshotTransition => match target {
+                    ShaderTarget::Vertex => SNAPSHOT_TRANSITION_VERTEX_BYTES,
+                    ShaderTarget::Fragment => SNAPSHOT_TRANSITION_FRAGMENT_BYTES,
                 },
                 ShaderModule::Mesh => match target {
                     ShaderTarget::Vertex => MESH_VERTEX_BYTES,
@@ -3332,6 +3530,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::BlurDownsample => "blur_downsample",
                 ShaderModule::Blur => "blur",
                 ShaderModule::BlurComposite => "blur_composite",
+                ShaderModule::SnapshotTransition => "snapshot_transition",
                 ShaderModule::Mesh => "mesh",
                 ShaderModule::MeshComposite => "mesh_composite",
             }
@@ -3702,3 +3901,7 @@ mod blur_regression_tests;
 #[cfg(test)]
 #[path = "directx_partial_redraw_tests.rs"]
 mod partial_redraw_tests;
+
+#[cfg(test)]
+#[path = "directx_snapshot_transition_tests.rs"]
+mod snapshot_transition_tests;

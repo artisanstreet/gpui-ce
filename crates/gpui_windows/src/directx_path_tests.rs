@@ -42,6 +42,7 @@ pub(super) fn renderer(viewport: [u32; 2]) -> Result<DirectXRenderer> {
         uploaded_generation: None,
         drawn_generation: None,
         background_appearance: None,
+        snapshot: None,
     })
 }
 

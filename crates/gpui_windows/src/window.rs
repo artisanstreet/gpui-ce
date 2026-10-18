@@ -1207,6 +1207,31 @@ impl PlatformWindow for WindowsWindow {
         }
     }
 
+    fn begin_snapshot_transition(&self, scene: &Scene) -> bool {
+        #[cfg(not(feature = "wgpu"))]
+        {
+            // A draw holding the renderer (a re-entrant call) just skips the transition.
+            let Ok(mut renderer) = self.state.renderer.try_borrow_mut() else {
+                return false;
+            };
+            match renderer.begin_snapshot_transition(scene, self.state.background_appearance.get())
+            {
+                Ok(began) => began,
+                Err(error) => {
+                    log::error!("failed to capture the snapshot transition's frame: {error:#}");
+                    drop(renderer);
+                    self.state.device_recovery.request_check();
+                    false
+                }
+            }
+        }
+        #[cfg(feature = "wgpu")]
+        {
+            let _ = scene;
+            false
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
         #[cfg(feature = "wgpu")]

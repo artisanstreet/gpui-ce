@@ -63,6 +63,11 @@ pub struct Scene {
     /// The window stamps it on every present, so a frame that only advances
     /// pulses re-presents this scene without rebuilding it.
     pub pulse_clock_ms: u32,
+    /// The frame of a [`crate::SnapshotTransition`] to composite over this
+    /// scene, stamped by the window on every present like
+    /// [`Self::pulse_clock_ms`]. `None` when no transition plays; a renderer
+    /// holding a snapshot drops it then and repaints the whole target.
+    pub snapshot_transition: Option<SnapshotTransitionFrame>,
     /// Counts drawn scenes. The window bumps it each time it finishes a new
     /// scene; a present that only advances pulses keeps it, so a renderer can
     /// tell "same content, later clock" from "new content".
@@ -2213,6 +2218,29 @@ impl QuadPulse {
     /// Whether this quad breathes at all.
     pub fn is_active(&self) -> bool {
         self.period_ms != 0
+    }
+}
+
+/// One present of a [`crate::SnapshotTransition`]: how far the diagonal edge
+/// has swept, and how the band along it looks.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SnapshotTransitionFrame {
+    /// Eased progress in `[0, 1]`. At 0 the snapshot covers the window; at 1
+    /// the band has left past the bottom-right corner.
+    pub progress: f32,
+    /// The band's width as a fraction of the window diagonal.
+    pub band: f32,
+    /// The band's highlight as straight sRGB `[r, g, b, a]`; `a` is the peak
+    /// strength.
+    pub shimmer: [f32; 4],
+}
+
+impl SnapshotTransitionFrame {
+    /// Where the edge sits on the diagonal coordinate `(x / W + y / H) / 2`:
+    /// it starts a band before 0 and ends a band past 1, so the band enters
+    /// and leaves whole. Pixels past the edge still show the snapshot.
+    pub fn edge(&self) -> f32 {
+        -self.band + self.progress * (1.0 + 2.0 * self.band)
     }
 }
 

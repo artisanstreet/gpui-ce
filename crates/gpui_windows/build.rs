@@ -50,6 +50,7 @@ fn main() -> Result<()> {
         "blur_downsample",
         "blur",
         "blur_composite",
+        "snapshot_transition",
         "emoji_rasterization",
     ]
     .into_iter()

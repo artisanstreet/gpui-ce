@@ -1437,3 +1437,56 @@ float4 blur_composite_fragment(BlurCompositeFragmentInput input): SV_Target {
     float a = coverage * blur_opacity;
     return float4(blurred.rgb * a, blurred.a * a);
 }
+
+/*
+** Snapshot transition
+**
+** Composites the snapshot of the previous frame (t0) over the new frame already in the target,
+** masked by a diagonal edge, with a shimmer band along the edge. Dual-source blending (One /
+** Src1Color) keeps the target's own alpha exact for transparent windows:
+**   result = snapshot * m * (1 - a) + shimmer * a + target * (1 - m) * (1 - a)
+** where m is how much of the snapshot shows and a the shimmer's strength.
+*/
+
+cbuffer SnapshotParams: register(b5) {
+    // Straight sRGB; alpha is the peak strength.
+    float4 snapshot_shimmer;
+    // Where the edge sits on the diagonal coordinate t = (x / W + y / H) / 2.
+    float snapshot_edge;
+    float snapshot_band;
+    float snapshot_feather;
+    float snapshot_pad;
+};
+
+struct SnapshotFragmentOutput {
+    float4 color: SV_Target0;
+    float4 keep: SV_Target1;
+};
+
+BlurVertexOutput snapshot_transition_vertex(uint vertex_id: SV_VertexID) {
+    return blur_fullscreen(vertex_id);
+}
+
+SnapshotFragmentOutput snapshot_transition_fragment(BlurVertexOutput input) {
+    float t = (input.position.x / global_viewport_size.x
+        + input.position.y / global_viewport_size.y) * 0.5;
+    // Past the edge the snapshot still shows.
+    float m = smoothstep(snapshot_edge - snapshot_feather, snapshot_edge + snapshot_feather, t);
+    // The band is centred on the edge: flat in the middle, fading linearly to both sides like
+    // ShimmerText, smoothed.
+    float strength = 0.0;
+    if (snapshot_band > 0.0) {
+        float o = (t - snapshot_edge) / snapshot_band + 0.5;
+        strength = saturate(min(o, 1.0 - o) / 0.4);
+        strength = strength * strength * (3.0 - 2.0 * strength);
+    }
+    float a = snapshot_shimmer.a * strength;
+    float4 snapshot = t_sprite.Load(int3(int2(input.position.xy), 0));
+    SnapshotFragmentOutput output;
+    output.color = float4(
+        snapshot.rgb * m * (1.0 - a) + snapshot_shimmer.rgb * a,
+        snapshot.a * m * (1.0 - a) + a);
+    float keep = (1.0 - m) * (1.0 - a);
+    output.keep = float4(keep, keep, keep, keep);
+    return output;
+}

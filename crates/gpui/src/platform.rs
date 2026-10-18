@@ -919,6 +919,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Keeps what `scene`, the last scene drawn, shows as the snapshot a
+    /// [`crate::SnapshotTransition`] composites over the following presents
+    /// (see [`Scene::snapshot_transition`]). Returns false where transitions
+    /// aren't supported, so the change shows at once.
+    fn begin_snapshot_transition(&self, _scene: &Scene) -> bool {
+        false
+    }
     fn schedule_frame(&self) {}
     /// Changes presentation synchronization where supported.
     fn set_vsync(&self, _enabled: bool) {}

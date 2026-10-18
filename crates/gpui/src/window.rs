@@ -71,6 +71,7 @@ mod contained;
 mod live_layer;
 mod prompts;
 mod repaint;
+mod snapshot_transition;
 mod verify;
 
 pub use a11y::A11ySubtreeBuilder;
@@ -78,6 +79,7 @@ pub(crate) use contained::CachedViewContext;
 use contained::CachedViewEntry;
 pub use repaint::PaintRecording;
 use repaint::RetainedPaint;
+pub use snapshot_transition::SnapshotTransition;
 
 use self::a11y::A11y;
 #[cfg(not(target_family = "wasm"))]
@@ -1272,6 +1274,9 @@ pub struct Window {
     /// Whether the rendered scene holds pulsing quads, so frames keep
     /// presenting it while nothing else changes.
     pub(crate) rendered_scene_pulses: bool,
+    /// The snapshot transition playing, which presents every frame like a
+    /// pulse.
+    snapshot_transition: Option<snapshot_transition::ActiveSnapshotTransition>,
     /// The closures repainting the rendered scene's repaint regions.
     retained_paints: FxHashMap<RepaintId, RetainedPaint>,
     next_repaint_id: u64,
@@ -1752,7 +1757,7 @@ impl Window {
                 // - Inactive window (not focused): cap to ~30fps to save energy
                 let (pulses, repaints) = handle
                     .update(&mut cx, |_, window, _| {
-                        (window.rendered_scene_pulses, window.repaint_pending())
+                        (window.presents_every_frame(), window.repaint_pending())
                     })
                     .unwrap_or((false, false));
                 let min_frame_interval = if request_frame_options.require_presentation
@@ -1869,7 +1874,7 @@ impl Window {
                         );
                         if window.invalidator.is_dirty()
                             || !window.next_frame_callbacks.borrow().is_empty()
-                            || window.rendered_scene_pulses
+                            || window.presents_every_frame()
                             || window.repaint_pending()
                         {
                             window.platform_window.schedule_frame();
@@ -1884,7 +1889,7 @@ impl Window {
                 // source explicitly.
                 let (pulses, repaints) = handle
                     .update(&mut cx, |_, window, _| {
-                        (window.rendered_scene_pulses, window.repaint_pending())
+                        (window.presents_every_frame(), window.repaint_pending())
                     })
                     .unwrap_or((false, false));
                 if invalidator.is_dirty()
@@ -2076,6 +2081,7 @@ impl Window {
             element_opacity: 1.0,
             element_pulse: QuadPulse::default(),
             rendered_scene_pulses: false,
+            snapshot_transition: None,
             retained_paints: FxHashMap::default(),
             next_repaint_id: RepaintId::FRAME_OVERLAY.0,
             rendered_viewport: None,
@@ -2730,8 +2736,14 @@ impl Window {
     /// the platform window, then notifies observers. Normally called automatically
     /// by the platform's resize callback, but exposed publicly for test infrastructure.
     pub fn bounds_changed(&mut self, cx: &mut App) {
-        self.scale_factor = self.platform_window.scale_factor();
-        self.viewport_size = self.platform_window.content_size();
+        let scale_factor = self.platform_window.scale_factor();
+        let viewport_size = self.platform_window.content_size();
+        if scale_factor != self.scale_factor || viewport_size != self.viewport_size {
+            // The snapshot no longer lines up with the window.
+            self.end_snapshot_transition();
+        }
+        self.scale_factor = scale_factor;
+        self.viewport_size = viewport_size;
         self.display_id = self.platform_window.display().map(|display| display.id());
         self.mouse_position = self.platform_window.mouse_position();
 
@@ -3514,6 +3526,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.rendered_frame.scene.pulse_clock_ms = pulse_clock_ms();
+        self.rendered_frame.scene.snapshot_transition =
+            self.snapshot_transition_frame(Instant::now());
         self.platform_window.draw(&self.rendered_frame.scene);
         self.rendered_scene_presented = true;
         #[cfg(feature = "frame-rate")]
@@ -3527,6 +3541,12 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// Whether every frame presents even when nothing re-renders: pulsing
+    /// quads advance, or a snapshot transition sweeps.
+    pub(crate) fn presents_every_frame(&self) -> bool {
+        self.rendered_scene_pulses || self.snapshot_transition.is_some()
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
