@@ -1042,6 +1042,8 @@ impl DirectXRenderer {
                 &scene.meshes,
                 (self.width, self.height),
             )?;
+        } else if let Some(meshes) = self.meshes.as_mut() {
+            meshes.trim_idle();
         }
         self.upload_scene_buffers(scene, changed.as_ref())?;
         self.uploaded_generation = Some(scene.generation);

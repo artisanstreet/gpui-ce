@@ -1,7 +1,12 @@
 //! Lit meshes rendered into independent resolves with shared MSAA/depth scratch.
 //! Composite at the mesh batch's scene position to retain 2D ordering and filters.
 
-use std::{collections::HashMap, mem::size_of, ops::Range};
+use std::{
+    collections::HashMap,
+    mem::size_of,
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use anyhow::{Context, Result};
 use gpui::{MeshId, MeshVertex, PaintMesh};
@@ -15,6 +20,11 @@ const SAMPLE_COUNT: u32 = 4;
 const MAX_TARGET_SIDE: u32 = 4096;
 const EVICT_AFTER_FRAMES: u64 = 120;
 const MAX_VERTEX_BYTES: usize = 256 * 1024 * 1024;
+/// The multisampled color and depth scratch is only drawn through: once rendered, a mesh
+/// composites from its resolve. Renders this close together (a drag, an orbit) keep the scratch;
+/// a lone render, or one this long after the last, frees it. A 1120x600 viewer's 4x color and
+/// depth held 21 MB for as long as the model was on screen.
+const SCRATCH_KEEP: Duration = Duration::from_secs(1);
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 
@@ -79,6 +89,7 @@ pub(crate) struct MeshRenderer {
     targets: Vec<Target>,
     scratch: HashMap<(u32, u32), Scratch>,
     frame: u64,
+    last_prepare: Option<Instant>,
 }
 
 impl MeshRenderer {
@@ -180,7 +191,18 @@ impl MeshRenderer {
             targets: Vec::new(),
             scratch: HashMap::new(),
             frame: 0,
+            last_prepare: None,
         })
+    }
+
+    /// Frees the scratch once renders have stopped for [`SCRATCH_KEEP`]; called every frame.
+    pub(crate) fn trim_idle(&mut self) {
+        if self
+            .last_prepare
+            .is_some_and(|last| last.elapsed() >= SCRATCH_KEEP)
+        {
+            self.scratch.clear();
+        }
     }
 
     pub(crate) fn clear(&mut self) {
@@ -317,8 +339,18 @@ impl MeshRenderer {
                 context.ResolveSubresource(&target.resolve, 0, &scratch.color, 0, COLOR_FORMAT);
             }
         }
-        self.scratch
-            .retain(|_, target| target.last_used == self.frame);
+        let now = Instant::now();
+        let rendering_again = self
+            .last_prepare
+            .is_some_and(|last| now.duration_since(last) < SCRATCH_KEEP);
+        self.last_prepare = Some(now);
+        if rendering_again {
+            self.scratch
+                .retain(|_, target| target.last_used == self.frame);
+        } else {
+            // The immediate context keeps what queued work still needs.
+            self.scratch.clear();
+        }
         self.geometry
             .retain(|_, geometry| self.frame - geometry.last_painted <= EVICT_AFTER_FRAMES);
         Ok(())

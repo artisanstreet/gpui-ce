@@ -362,22 +362,25 @@ fn geometry_and_targets_reuse_then_release_and_reappear() -> Result<()> {
     renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
     assert_eq!(renderer.geometry.len(), 1);
     assert_eq!(renderer.targets.len(), 2);
-    assert_eq!(renderer.scratch.len(), 1);
+    // A lone render keeps only the resolves it composites from.
+    assert!(renderer.scratch.is_empty());
     let geometry = renderer.geometry[&mesh.id()].buffer.clone();
     let first_resolve = renderer.targets[0].resolve.clone();
-    let first_scratch = renderer.scratch[&(96, 64)].color.clone();
     let first_pixels = readback(&device, &context, &first_resolve)?;
     assert!(first_pixels.iter().any(|byte| *byte != 0));
 
+    // Renders in quick succession, as a drag makes, keep the scratch.
     paints[0].style.base_color = [0.1, 0.8, 0.1];
     renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
     assert_eq!(renderer.geometry[&mesh.id()].buffer, geometry);
     assert_eq!(renderer.targets[0].resolve, first_resolve);
-    assert_eq!(renderer.scratch[&(96, 64)].color, first_scratch);
+    assert_eq!(renderer.scratch.len(), 1);
+    let first_scratch = renderer.scratch[&(96, 64)].color.clone();
     assert_ne!(readback(&device, &context, &first_resolve)?, first_pixels);
 
     paints[1].bounds.size = size(ScaledPixels(48.0), ScaledPixels(32.0));
     renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
+    assert_eq!(renderer.scratch[&(96, 64)].color, first_scratch);
     assert_eq!(renderer.scratch.len(), 2);
     renderer.prepare(&device, &context, &paints[1..], (WIDTH, HEIGHT))?;
     assert_eq!(renderer.targets.len(), 1);
@@ -398,6 +401,32 @@ fn geometry_and_targets_reuse_then_release_and_reappear() -> Result<()> {
     assert_eq!(renderer.targets.len(), 2);
     assert_eq!(renderer.scratch.len(), 2);
     assert_ne!(renderer.geometry[&mesh.id()].buffer, geometry);
+    Ok(())
+}
+
+#[test]
+fn a_model_left_still_frees_its_scratch_and_still_draws() -> Result<()> {
+    let (device, context) = device()?;
+    let mut renderer = MeshRenderer::new(&device)?;
+    let paints = [paint(&Arc::new(cube()), 0.0)];
+    renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
+    renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
+    assert_eq!(renderer.scratch.len(), 1);
+    renderer.trim_idle();
+    assert_eq!(
+        renderer.scratch.len(),
+        1,
+        "a drag in progress keeps its scratch"
+    );
+    renderer.last_prepare = Some(std::time::Instant::now() - SCRATCH_KEEP);
+    renderer.trim_idle();
+    assert!(renderer.scratch.is_empty());
+    let resolve = renderer.targets[0].resolve.clone();
+    assert!(
+        readback(&device, &context, &resolve)?
+            .iter()
+            .any(|v| *v != 0)
+    );
     Ok(())
 }
 
