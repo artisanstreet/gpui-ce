@@ -29,6 +29,7 @@ const SCRATCH_KEEP: Duration = Duration::from_secs(1);
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 
 #[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
 struct MeshUniforms {
     view: [[f32; 4]; 4],
     projection: [[f32; 4]; 4],
@@ -62,6 +63,8 @@ struct Geometry {
 
 struct Target {
     size: (u32, u32),
+    /// What `resolve` holds; a frame asking for the same skips the render.
+    rendered: Option<(MeshId, MeshUniforms)>,
     resolve: ID3D11Texture2D,
     view: ID3D11ShaderResourceView,
     uniforms: ID3D11Buffer,
@@ -195,7 +198,7 @@ impl MeshRenderer {
         })
     }
 
-    /// Frees the scratch once renders have stopped for [`SCRATCH_KEEP`]; called every frame.
+    /// Frees the scratch once [`SCRATCH_KEEP`] has passed since the last render.
     pub(crate) fn trim_idle(&mut self) {
         if self
             .last_prepare
@@ -225,6 +228,7 @@ impl MeshRenderer {
         let _restore = MeshStateRestore(context);
         self.frame += 1;
         self.targets.truncate(meshes.len());
+        let mut drew = false;
         for (index, paint) in meshes.iter().enumerate() {
             let side = |length: f32| (length.ceil().max(1.0) as u32).min(MAX_TARGET_SIDE);
             let size = (
@@ -243,19 +247,13 @@ impl MeshRenderer {
                     self.targets.push(target);
                 }
             }
-            if let std::collections::hash_map::Entry::Vacant(entry) = self.scratch.entry(size) {
-                entry.insert(Scratch::new(device, size)?);
-            }
             if let std::collections::hash_map::Entry::Vacant(entry) =
                 self.geometry.entry(paint.mesh.id())
             {
                 entry.insert(Geometry::new(device, paint)?);
             }
-            let scratch = self.scratch.get_mut(&size).unwrap();
-            scratch.last_used = self.frame;
             let geometry = self.geometry.get_mut(&paint.mesh.id()).unwrap();
             geometry.last_painted = self.frame;
-            let target = &self.targets[index];
             let style = &paint.style;
             let uniforms = MeshUniforms {
                 view: style.view,
@@ -288,18 +286,34 @@ impl MeshRenderer {
             // These repr(C) records contain only f32 arrays, with no padding.
             unsafe {
                 context.UpdateSubresource(
+                    &self.targets[index].composite,
+                    0,
+                    None,
+                    &composite as *const _ as _,
+                    0,
+                    0,
+                );
+            }
+            // Moving or clipping the viewer only changes the composite: the resolve already
+            // holds this view of this mesh.
+            let wanted = (paint.mesh.id(), uniforms);
+            if self.targets[index].rendered == Some(wanted) {
+                continue;
+            }
+            drew = true;
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.scratch.entry(size) {
+                entry.insert(Scratch::new(device, size)?);
+            }
+            let scratch = self.scratch.get_mut(&size).unwrap();
+            scratch.last_used = self.frame;
+            let target = &mut self.targets[index];
+            target.rendered = Some(wanted);
+            unsafe {
+                context.UpdateSubresource(
                     &target.uniforms,
                     0,
                     None,
                     &uniforms as *const _ as _,
-                    0,
-                    0,
-                );
-                context.UpdateSubresource(
-                    &target.composite,
-                    0,
-                    None,
-                    &composite as *const _ as _,
                     0,
                     0,
                 );
@@ -338,6 +352,12 @@ impl MeshRenderer {
                 context.OMSetRenderTargets(None, None);
                 context.ResolveSubresource(&target.resolve, 0, &scratch.color, 0, COLOR_FORMAT);
             }
+        }
+        if !drew {
+            self.trim_idle();
+            self.geometry
+                .retain(|_, geometry| self.frame - geometry.last_painted <= EVICT_AFTER_FRAMES);
+            return Ok(());
         }
         let now = Instant::now();
         let rendering_again = self
@@ -420,6 +440,7 @@ impl Target {
         unsafe { device.CreateShaderResourceView(&resolve, None, Some(&mut view))? };
         Ok(Self {
             size,
+            rendered: None,
             resolve,
             view: view.context("mesh resolve view missing")?,
             uniforms: constant_buffer::<MeshUniforms>(device)?,

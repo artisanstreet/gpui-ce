@@ -375,13 +375,15 @@ fn geometry_and_targets_reuse_then_release_and_reappear() -> Result<()> {
     assert_eq!(renderer.geometry[&mesh.id()].buffer, geometry);
     assert_eq!(renderer.targets[0].resolve, first_resolve);
     assert_eq!(renderer.scratch.len(), 1);
-    let first_scratch = renderer.scratch[&(96, 64)].color.clone();
     assert_ne!(readback(&device, &context, &first_resolve)?, first_pixels);
 
+    // The unchanged first model is not rendered again; only the resized one draws.
+    let unchanged = readback(&device, &context, &first_resolve)?;
     paints[1].bounds.size = size(ScaledPixels(48.0), ScaledPixels(32.0));
     renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
-    assert_eq!(renderer.scratch[&(96, 64)].color, first_scratch);
-    assert_eq!(renderer.scratch.len(), 2);
+    assert_eq!(renderer.scratch.len(), 1);
+    assert!(renderer.scratch.contains_key(&(48, 32)));
+    assert_eq!(readback(&device, &context, &first_resolve)?, unchanged);
     renderer.prepare(&device, &context, &paints[1..], (WIDTH, HEIGHT))?;
     assert_eq!(renderer.targets.len(), 1);
     assert_eq!(renderer.targets[0].size, (48, 32));
@@ -408,18 +410,22 @@ fn geometry_and_targets_reuse_then_release_and_reappear() -> Result<()> {
 fn a_model_left_still_frees_its_scratch_and_still_draws() -> Result<()> {
     let (device, context) = device()?;
     let mut renderer = MeshRenderer::new(&device)?;
-    let paints = [paint(&Arc::new(cube()), 0.0)];
+    let mut paints = [paint(&Arc::new(cube()), 0.0)];
     renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
+    // A drag turns the model every frame.
+    paints[0].style.view = multiply(paints[0].style.view, rotation_y(10.0));
     renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
     assert_eq!(renderer.scratch.len(), 1);
-    renderer.trim_idle();
+    // Frames that leave the model as it is (other content animating) keep the drag's
+    // scratch until a second has passed since the last render, then free it.
+    renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
     assert_eq!(
         renderer.scratch.len(),
         1,
         "a drag in progress keeps its scratch"
     );
     renderer.last_prepare = Some(std::time::Instant::now() - SCRATCH_KEEP);
-    renderer.trim_idle();
+    renderer.prepare(&device, &context, &paints, (WIDTH, HEIGHT))?;
     assert!(renderer.scratch.is_empty());
     let resolve = renderer.targets[0].resolve.clone();
     assert!(
