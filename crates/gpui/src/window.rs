@@ -3526,6 +3526,8 @@ impl Window {
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
         self.rendered_frame.scene.pulse_clock_ms = pulse_clock_ms();
+        self.rendered_frame.scene.exact_text_coverage =
+            self.text_rendering_mode.get() == TextRenderingMode::Outline;
         self.rendered_frame.scene.snapshot_transition =
             self.snapshot_transition_frame(Instant::now());
         self.platform_window.draw(&self.rendered_frame.scene);
@@ -5053,6 +5055,7 @@ impl Window {
             scale_factor,
             is_emoji: false,
             subpixel_rendering,
+            hinting: self.text_rendering_mode.get() != TextRenderingMode::Outline,
             dilation,
         };
 
@@ -5144,6 +5147,7 @@ impl Window {
             scale_factor,
             is_emoji: true,
             subpixel_rendering: false,
+            hinting: true,
             dilation: 0,
         };
 

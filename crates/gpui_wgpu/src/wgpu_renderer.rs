@@ -1391,10 +1391,24 @@ impl WgpuRenderer {
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
+        // Zero ratios and contrast leave the coverage untouched.
+        let exact = scene.exact_text_coverage;
         let gamma_params = GammaParams {
-            gamma_ratios: self.rendering_params.gamma_ratios,
-            grayscale_enhanced_contrast: self.rendering_params.grayscale_enhanced_contrast,
-            subpixel_enhanced_contrast: self.rendering_params.subpixel_enhanced_contrast,
+            gamma_ratios: if exact {
+                [0.0; 4]
+            } else {
+                self.rendering_params.gamma_ratios
+            },
+            grayscale_enhanced_contrast: if exact {
+                0.0
+            } else {
+                self.rendering_params.grayscale_enhanced_contrast
+            },
+            subpixel_enhanced_contrast: if exact {
+                0.0
+            } else {
+                self.rendering_params.subpixel_enhanced_contrast
+            },
             is_bgr: self.is_bgr as u32,
             _pad: 0,
         };

@@ -577,7 +577,7 @@ impl CosmicTextSystemState {
             .swash_scale_context
             .builder(font_ref)
             .size(pixel_size * params.scale_factor)
-            .hint(true)
+            .hint(params.hinting)
             .build();
 
         let sources: &[Source] = if params.is_emoji {
@@ -1525,6 +1525,7 @@ mod tests {
             scale_factor: 1.5,
             is_emoji: false,
             subpixel_rendering,
+            hinting: true,
             dilation: 0,
         })
     }
@@ -1984,6 +1985,7 @@ mod tests {
                 scale_factor: 1.0,
                 is_emoji: glyph.is_emoji,
                 subpixel_rendering: false,
+                hinting: true,
                 dilation: 0,
             };
             let bounds = text_system.glyph_raster_bounds(&params)?;
@@ -2036,6 +2038,7 @@ mod tests {
             scale_factor: 1.0,
             is_emoji: true,
             subpixel_rendering: false,
+            hinting: true,
             dilation: 0,
         };
         let bounds = text_system.glyph_raster_bounds(&params)?;
@@ -2152,6 +2155,7 @@ mod tests {
             scale_factor: 1.0,
             is_emoji: true,
             subpixel_rendering: false,
+            hinting: true,
             dilation: 0,
         };
         let bounds = text_system.glyph_raster_bounds(&params)?;

@@ -63,6 +63,10 @@ pub struct Scene {
     /// The window stamps it on every present, so a frame that only advances
     /// pulses re-presents this scene without rebuilding it.
     pub pulse_clock_ms: u32,
+    /// Composite glyph coverage as rasterized, without the contrast and
+    /// gamma adjustment: [`crate::TextRenderingMode::Outline`]. The window
+    /// stamps it on every present like [`Self::pulse_clock_ms`].
+    pub exact_text_coverage: bool,
     /// The frame of a [`crate::SnapshotTransition`] to composite over this
     /// scene, stamped by the window on every present like
     /// [`Self::pulse_clock_ms`]. `None` when no transition plays; a renderer

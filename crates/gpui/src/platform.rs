@@ -2379,6 +2379,10 @@ pub enum TextRenderingMode {
     Subpixel,
     /// Use grayscale text rendering.
     Grayscale,
+    /// Grayscale coverage of the exact, unhinted outline, composited without
+    /// contrast or gamma adjustment: stems keep their true weight and
+    /// position instead of snapping to the pixel grid.
+    Outline,
 }
 
 /// The options that can be configured for a file dialog prompt

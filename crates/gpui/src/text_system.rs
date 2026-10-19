@@ -1079,6 +1079,9 @@ pub struct RenderGlyphParams {
     pub scale_factor: f32,
     pub is_emoji: bool,
     pub subpixel_rendering: bool,
+    /// Grid-fit the outline before rasterizing; off for
+    /// [`TextRenderingMode::Outline`].
+    pub hinting: bool,
     pub dilation: u8,
 }
 
@@ -1093,6 +1096,7 @@ impl Hash for RenderGlyphParams {
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
         self.subpixel_rendering.hash(state);
+        self.hinting.hash(state);
         self.dilation.hash(state);
     }
 }

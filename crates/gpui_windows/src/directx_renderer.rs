@@ -728,6 +728,7 @@ impl DirectXRenderer {
         &self,
         clear_color: &[f32; 4],
         pulse_clock_ms: u32,
+        exact_text_coverage: bool,
         clip: Option<DamageRect>,
     ) -> Result<()> {
         let resources = self.resources.as_ref().expect("resources missing");
@@ -740,10 +741,23 @@ impl DirectXRenderer {
             device_context,
             self.globals.global_params_buffer.as_ref().unwrap(),
             &[GlobalParams {
-                gamma_ratios: self.font_info.gamma_ratios,
+                // Zero ratios and contrast leave the coverage untouched.
+                gamma_ratios: if exact_text_coverage {
+                    [0.0; 4]
+                } else {
+                    self.font_info.gamma_ratios
+                },
                 viewport_size: [resources.viewport.Width, resources.viewport.Height],
-                grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
-                subpixel_enhanced_contrast: self.font_info.subpixel_enhanced_contrast,
+                grayscale_enhanced_contrast: if exact_text_coverage {
+                    0.0
+                } else {
+                    self.font_info.grayscale_enhanced_contrast
+                },
+                subpixel_enhanced_contrast: if exact_text_coverage {
+                    0.0
+                } else {
+                    self.font_info.subpixel_enhanced_contrast
+                },
                 is_bgr: self.font_info.is_bgr as u32,
                 pulse_clock_ms,
                 _pad: [0; 2],
@@ -1121,6 +1135,7 @@ impl DirectXRenderer {
                 _ => [0.0f32; 4],
             },
             scene.pulse_clock_ms,
+            scene.exact_text_coverage,
             clip,
         )?;
 

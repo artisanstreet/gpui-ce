@@ -718,9 +718,13 @@ impl DirectWriteState {
             )?;
         }
         let rendering_mode = match rendering_mode {
+            _ if !params.hinting => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             DWRITE_RENDERING_MODE1_OUTLINE => DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
             m => m,
         };
+        if !params.hinting {
+            grid_fit_mode = DWRITE_GRID_FIT_MODE_DISABLED;
+        }
 
         let antialias_mode = if params.subpixel_rendering {
             DWRITE_TEXT_ANTIALIAS_MODE_CLEARTYPE
@@ -2029,6 +2033,7 @@ mod tests {
                 scale_factor: 1.0,
                 is_emoji: true,
                 subpixel_rendering: false,
+                hinting: true,
                 dilation: 0,
             };
             let raster_bounds = text_system.glyph_raster_bounds(&params)?;

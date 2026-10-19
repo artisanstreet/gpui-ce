@@ -36,6 +36,7 @@ fn glyph_tile(renderer: &DirectXRenderer, subpixel: bool) -> Result<AtlasTile> {
         scale_factor: 1.0,
         is_emoji: false,
         subpixel_rendering: subpixel,
+        hinting: true,
         dilation: 0,
     });
     renderer
