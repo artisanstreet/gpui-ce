@@ -318,6 +318,50 @@ fn a_vector_outgrowing_its_buffer_uploads_whole() -> Result<()> {
 }
 
 #[test]
+fn a_buffer_left_from_a_busy_scene_shrinks_and_still_draws_the_next_one() -> Result<()> {
+    let background = WindowBackgroundAppearance::Transparent;
+    let square = rect(30.0, 30.0, 12.0, 12.0);
+    let dots: Vec<Quad> = (0..1000)
+        .map(|ix| Quad {
+            order: 8 + ix,
+            bounds: rect((ix % 40) as f32 * 2.0, (ix / 40) as f32 * 2.0, 1.0, 1.0),
+            content_mask: ContentMask {
+                bounds: rect(0.0, 0.0, 96.0, 96.0),
+            },
+            background: hsla(ix as f32 / 1000.0, 0.8, 0.5, 1.0).into(),
+            ..Default::default()
+        })
+        .collect();
+    let busy = scene(1, 0.0, square, false, false, &dots);
+    let calm = scene(2, 0.33, square, false, false, &[corner(0.8)]);
+    let mut renderer = renderer(VIEWPORT)?;
+    let backdate = |renderer: &mut super::DirectXRenderer| {
+        renderer.pipelines.quad_pipeline.peak_since =
+            std::time::Instant::now() - super::INSTANCE_BUFFER_SHRINK_AFTER;
+    };
+    renderer.render(&busy, background, &Repaint::Full)?;
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, 1024);
+
+    // The window that just closed saw the busy scene, so the buffer keeps its size.
+    backdate(&mut renderer);
+    renderer.render(&calm, background, &Repaint::Full)?;
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, 1024);
+
+    // A whole window of calm frames shrinks it. The new buffer starts empty, so this frame must
+    // upload every quad even though it claims only the square changed.
+    backdate(&mut renderer);
+    let mut calm_again = scene(3, 0.66, square, false, false, &[corner(0.8)]);
+    calm_again.changed_primitives = Some(PrimitiveRanges {
+        quads: 1..2,
+        ..Default::default()
+    });
+    renderer.render(&calm_again, background, &Repaint::Full)?;
+    assert_eq!(renderer.pipelines.quad_pipeline.buffer_size, 64);
+    assert!(renderer.read_render_target()? == render_fresh(&calm_again)?);
+    Ok(())
+}
+
+#[test]
 fn slack_instances_widen_no_batch() {
     let full = ContentMask {
         bounds: rect(0.0, 0.0, 96.0, 96.0),

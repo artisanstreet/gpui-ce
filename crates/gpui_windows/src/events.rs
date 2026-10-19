@@ -259,6 +259,13 @@ impl WindowsWindowInner {
             self.state
                 .restore_from_minimized
                 .set(self.state.callbacks.request_frame.take());
+            // A minimized window draws nothing, so its offscreen targets are dead weight.
+            #[cfg(not(feature = "wgpu"))]
+            if let Ok(mut renderer) = self.state.renderer.try_borrow_mut()
+                && let Err(error) = renderer.release_offscreen()
+            {
+                log::warn!("releasing the minimized window's offscreen targets failed: {error:#}");
+            }
             return Some(0);
         }
 

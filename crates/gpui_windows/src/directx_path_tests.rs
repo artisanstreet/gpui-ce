@@ -57,8 +57,9 @@ fn render_paths(
     let resources = renderer.resources.as_mut().unwrap();
     resources.paths = None;
     resources.ensure_paths(&devices.device, Some(size))?;
-    renderer.draw_paths_to_intermediate_at(paths, origin, None)?;
-    renderer.draw_paths_from_intermediate(paths)?;
+    let paths: Vec<&Path<ScaledPixels>> = paths.iter().collect();
+    renderer.draw_paths_to_intermediate_at(&paths, origin, None)?;
+    renderer.draw_paths_from_intermediate(&paths)?;
     let devices = renderer.devices.as_ref().unwrap();
     let resources = renderer.resources.as_ref().unwrap();
     readback(
@@ -286,6 +287,39 @@ fn ordinary_render_releases_path_targets_after_paths_disappear() -> Result<()> {
         gpui::WindowBackgroundAppearance::Transparent,
     )?;
     assert!(renderer.resources.as_ref().unwrap().paths.is_none());
+    Ok(())
+}
+
+#[test]
+fn distant_paths_draw_through_a_target_sized_to_one_of_them() -> Result<()> {
+    let mut renderer = renderer([640, 117])?;
+    let mut scene = Scene::default();
+    scene.insert_primitive(curved_path(hsla(0.2, 0.8, 0.5, 0.7).into(), 0.0));
+    let mut far = curved_path(hsla(0.6, 0.8, 0.5, 0.7).into(), 540.0);
+    far.content_mask.bounds.origin.x.0 += 540.0;
+    scene.insert_primitive(far);
+    scene.finish();
+    let pixels = renderer.render_to_image(&scene, gpui::WindowBackgroundAppearance::Transparent)?;
+    let drawn = |columns: std::ops::Range<u32>| {
+        pixels
+            .enumerate_pixels()
+            .filter(|(x, _, p)| columns.contains(x) && p[3] != 0)
+            .count()
+    };
+    assert!(drawn(0..320) > 200);
+    assert!(drawn(320..640) > 200);
+    // One batch spans 600 px; each of its clusters fits a 64 px bucket.
+    assert_eq!(
+        renderer
+            .resources
+            .as_ref()
+            .unwrap()
+            .paths
+            .as_ref()
+            .unwrap()
+            .size,
+        [64, 64]
+    );
     Ok(())
 }
 

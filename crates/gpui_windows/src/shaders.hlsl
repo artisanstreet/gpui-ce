@@ -1341,11 +1341,15 @@ cbuffer BlurParams: register(b1) {
     float blur_tap_count;
     float blur_clip_rounded;
     // 1.0 = snapped 2:1 box downsample (anchor the half-res grid to a fixed 2px grid at the origin
-    // so a stationary element blurs identically at every window size); 0.0 = 1:1 copy (scene blit).
+    // so a stationary element blurs identically at every window size); 0.0 = 1:1 copy.
     float blur_downsample;
     // Spacing between taps in pixels (gaussian passes only); >1 lets `blur_tap_count` taps span
     // very large radii without truncating the gaussian.
     float blur_tap_step;
+    // Where the source's top left sits in the target, in device pixels: a backdrop copy holds
+    // only the region under its filter. Downsample pass only.
+    float2 blur_source_origin;
+    float2 blur_pad;
 };
 
 struct BlurVertexOutput {
@@ -1374,7 +1378,7 @@ float4 blur_downsample_fragment(BlurVertexOutput input): SV_Target {
         // implicit floor(W/2) grid stretches and the halo wobbles by ~1px on resize.
         uint sw, sh;
         t_sprite.GetDimensions(sw, sh);
-        float2 src_uv = (floor(input.position.xy) * 2.0 + 1.0) / float2(sw, sh);
+        float2 src_uv = (floor(input.position.xy) * 2.0 + 1.0 - blur_source_origin) / float2(sw, sh);
         return t_sprite.SampleLevel(s_sprite, src_uv, 0.0);
     }
     // 1:1 copy at matching resolution (used to blit the offscreen scene into the swapchain).

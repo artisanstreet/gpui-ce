@@ -2,6 +2,7 @@ use std::{
     ops::Range,
     slice,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -26,7 +27,7 @@ use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, Sh
 use crate::*;
 use gpui::*;
 
-use gpui::path_targets::{path_batch_bounds, path_target_size, retained_path_target_size};
+use gpui::path_targets::{clustered_path_target_size, path_clusters, retained_path_target_size};
 
 /// The largest blur radius in a scene-space filter chain, in device pixels — used to size the
 /// blur kernel and the dilated region the blur passes are scissored to.
@@ -158,6 +159,13 @@ const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 // This configuration is used for MSAA rendering on paths only, and it's guaranteed to be supported by DirectX 11.
 const PATH_MULTISAMPLE_COUNT: u32 = 4;
 const MAX_INSTANCE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
+/// An instance buffer whose uploads have all fit in a quarter of it for this long shrinks to
+/// twice the largest of them. Buffers only grew before, so one busy scene kept its peak
+/// (tens of MB of driver memory) for the life of the window.
+const INSTANCE_BUFFER_SHRINK_AFTER: Duration = Duration::from_secs(5);
+/// Path and backdrop targets follow the same rule: one that has been larger than every frame
+/// needed for this long is recreated at the size those frames did need.
+const TARGET_SHRINK_AFTER: Duration = INSTANCE_BUFFER_SHRINK_AFTER;
 
 /// Number of content-filter (`filter`) nesting levels that get their own isolated group target.
 /// Two covers the realistic "a blurred element inside another blurred element" case; deeper nests
@@ -208,9 +216,8 @@ pub(crate) struct DirectXRenderer {
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
 
-    /// The render target currently bound for the main scene this frame (the offscreen
-    /// `scene_color` when blur filters are present, a content-filter group texture inside such a
-    /// group, or the swapchain otherwise). `draw_paths_to_intermediate` restores to this after
+    /// The render target currently bound for the main scene this frame (a content-filter group
+    /// texture inside such a group, the swapchain otherwise). `draw_paths_to_intermediate_at` restores to this after
     /// its own pass so paths land on the correct target.
     active_render_target: Option<ID3D11RenderTargetView>,
     meshes: Option<crate::directx_mesh::MeshRenderer>,
@@ -310,12 +317,51 @@ struct DirectXResources {
 
     // One scratch pair shared by path batches, allocated only while paths are visible.
     paths: Option<PathTargets>,
+    paths_capacity: RetainedSize,
 
     // Offscreen targets for blur filters (each is render-target + shader-resource).
     blur: Option<BlurResources>,
 
     // Cached viewport
     viewport: D3D11_VIEWPORT,
+}
+
+/// Capacity for a reused render target: it grows to whatever a frame needs and, once every frame
+/// for [`TARGET_SHRINK_AFTER`] has needed less, shrinks to the largest of those needs. Growing
+/// alone kept one tall-and-wide moment's size for as long as the target lived.
+#[derive(Default)]
+struct RetainedSize {
+    /// The largest need since `since`.
+    peak: [u32; 2],
+    since: Option<Instant>,
+}
+
+impl RetainedSize {
+    /// The size the target should have this frame, given its `current` size and the frame's
+    /// `required` one (`None`: the frame needs no target, which releases it).
+    fn next(&mut self, current: Option<[u32; 2]>, required: Option<[u32; 2]>) -> Option<[u32; 2]> {
+        let Some(required) = required else {
+            *self = Self::default();
+            return None;
+        };
+        let now = Instant::now();
+        let since = *self.since.get_or_insert(now);
+        self.peak = [self.peak[0].max(required[0]), self.peak[1].max(required[1])];
+        let mut next = retained_path_target_size(current, Some(required));
+        if now.duration_since(since) >= TARGET_SHRINK_AFTER {
+            if next.is_some_and(|next| self.peak[0] < next[0] || self.peak[1] < next[1]) {
+                next = Some(self.peak);
+            }
+            self.peak = required;
+            self.since = Some(now);
+        }
+        if next != current {
+            // A new target starts a new window.
+            self.peak = required;
+            self.since = Some(now);
+        }
+        next
+    }
 }
 
 struct PathTargets {
@@ -355,16 +401,14 @@ struct PathParams {
     size: [f32; 2],
 }
 
-/// Offscreen render targets used by the blur filters. The scene is rendered into `scene_color`
-/// (so filters can sample it), `ping`/`pong` are half-resolution scratch for the separable
-/// gaussian, and `groups` isolate content-filter (`filter`) subtrees — one per nesting level
-/// (indexed by isolation depth), up to [`MAX_FILTER_DEPTH`], so nested content blurs isolate
-/// correctly; deeper nests render inline.
+/// Offscreen render targets used by the blur filters. `backdrop` holds a copy of the pixels under
+/// a backdrop filter (the scene itself draws straight to the swapchain), `ping`/`pong` are
+/// half-resolution scratch for the separable gaussian, and `groups` isolate content-filter
+/// (`filter`) subtrees — one per nesting level (indexed by isolation depth), up to
+/// [`MAX_FILTER_DEPTH`], so nested content blurs isolate correctly; deeper nests render inline.
 struct BlurResources {
-    #[cfg_attr(not(test), expect(dead_code))]
-    scene_color: ID3D11Texture2D,
-    scene_color_rtv: Option<ID3D11RenderTargetView>,
-    scene_color_srv: Option<ID3D11ShaderResourceView>,
+    backdrop: Option<BackdropCopy>,
+    backdrop_capacity: RetainedSize,
     #[cfg_attr(not(test), expect(dead_code))]
     ping: ID3D11Texture2D,
     ping_rtv: Option<ID3D11RenderTargetView>,
@@ -383,14 +427,11 @@ impl BlurResources {
     fn new(device: &ID3D11Device, width: u32, height: u32) -> Result<Self> {
         let half_w = (width / 2).max(1);
         let half_h = (height / 2).max(1);
-        let (scene_color, scene_color_rtv, scene_color_srv) =
-            create_color_target(device, width, height)?;
         let (ping, ping_rtv, ping_srv) = create_color_target(device, half_w, half_h)?;
         let (pong, pong_rtv, pong_srv) = create_color_target(device, half_w, half_h)?;
         Ok(Self {
-            scene_color,
-            scene_color_rtv,
-            scene_color_srv,
+            backdrop: None,
+            backdrop_capacity: RetainedSize::default(),
             ping,
             ping_rtv,
             ping_srv,
@@ -413,6 +454,19 @@ impl BlurResources {
         }
     }
 
+    /// Sizes the backdrop copy for this frame's largest backdrop region (`None`: no backdrop
+    /// filters, which releases it).
+    fn ensure_backdrop(&mut self, device: &ID3D11Device, required: Option<[u32; 2]>) -> Result<()> {
+        let current = self.backdrop.as_ref().map(|backdrop| backdrop.size);
+        let next = self.backdrop_capacity.next(current, required);
+        if next != current {
+            self.backdrop = next
+                .map(|size| BackdropCopy::new(device, size))
+                .transpose()?;
+        }
+        Ok(())
+    }
+
     fn ensure_groups(
         &mut self,
         device: &ID3D11Device,
@@ -428,6 +482,74 @@ impl BlurResources {
         }
         Ok(())
     }
+}
+
+/// The pixels under one backdrop filter, copied out of the target it draws over so the blur can
+/// sample them while that target stays bound.
+struct BackdropCopy {
+    size: [u32; 2],
+    texture: ID3D11Texture2D,
+    srv: Option<ID3D11ShaderResourceView>,
+}
+
+impl BackdropCopy {
+    fn new(device: &ID3D11Device, size: [u32; 2]) -> Result<Self> {
+        let (texture, _, srv) = create_color_target(device, size[0], size[1])?;
+        Ok(Self { size, texture, srv })
+    }
+}
+
+/// What a blur reads: a texture already holding the content (a content-filter group), or the
+/// region under a backdrop filter, copied out of the target it draws over.
+enum BlurSource<'a> {
+    View(&'a Option<ID3D11ShaderResourceView>),
+    CopyOf(&'a Option<ID3D11RenderTargetView>),
+}
+
+/// The full-resolution region `[x0, y0, x1, y1]` a blur of `bounds` reads: its half-resolution
+/// scissor doubled, so it starts on the even grid the snapped downsample samples. `None` when the
+/// region is empty.
+fn blur_region(
+    bounds: Bounds<ScaledPixels>,
+    blur_radius: f32,
+    width: u32,
+    height: u32,
+) -> Option<[u32; 4]> {
+    let half_w = (width / 2).max(1);
+    let half_h = (height / 2).max(1);
+    // Match the shipping WGPU pass footprint, including the transparent
+    // outside pixels sampled by later passes of a content filter.
+    let dilation = 3.0 * blur_radius;
+    let x0 = (((bounds.origin.x.0 - dilation) * 0.5).floor().max(0.0) as u32).min(half_w);
+    let y0 = (((bounds.origin.y.0 - dilation) * 0.5).floor().max(0.0) as u32).min(half_h);
+    let x1 = ((((bounds.origin.x.0 + bounds.size.width.0 + dilation) * 0.5)
+        .ceil()
+        .max(0.0) as u32)
+        .min(half_w))
+    .max(x0);
+    let y1 = ((((bounds.origin.y.0 + bounds.size.height.0 + dilation) * 0.5)
+        .ceil()
+        .max(0.0) as u32)
+        .min(half_h))
+    .max(y0);
+    (x0 != x1 && y0 != y1).then_some([2 * x0, 2 * y0, 2 * x1, 2 * y1])
+}
+
+/// The backdrop copy a scene needs: the largest region any of its backdrop filters reads.
+fn backdrop_copy_size(scene: &Scene, width: u32, height: u32) -> Option<[u32; 2]> {
+    scene
+        .backdrop_filters
+        .iter()
+        .filter_map(|filter| {
+            blur_region(
+                filter.bounds,
+                max_blur_radius(&filter.filters),
+                width,
+                height,
+            )
+        })
+        .map(|[x0, y0, x1, y1]| [x1 - x0, y1 - y0])
+        .reduce(|a, b| [a[0].max(b[0]), a[1].max(b[1])])
 }
 
 struct DirectXRenderPipelines {
@@ -872,21 +994,11 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
     ) -> FramePlan {
-        let blur_missing = (!scene.backdrop_filters.is_empty()
-            || !scene.filter_boundaries.is_empty())
-            && self
-                .resources
-                .as_ref()
-                .is_some_and(|resources| resources.blur.is_none());
         let partial_supported = self
             .devices
             .as_ref()
             .is_some_and(|devices| devices.region_clear.is_some());
-        // A fresh offscreen scene target holds nothing to retain.
-        if self.background_appearance != Some(background_appearance)
-            || blur_missing
-            || !partial_supported
-        {
+        if self.background_appearance != Some(background_appearance) || !partial_supported {
             self.damage.invalidate();
             self.background_appearance = Some(background_appearance);
         }
@@ -947,27 +1059,23 @@ impl DirectXRenderer {
             }
             resources.ensure_paths(
                 &devices.device,
-                path_target_size(scene, [self.width, self.height]),
+                clustered_path_target_size(scene, [self.width, self.height]),
             )?;
         }
 
-        // Only route through the offscreen scene texture when the scene contains blur filters;
-        // otherwise render straight to the swapchain exactly as before.
-        let use_offscreen =
-            !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
+        // Blur scratch exists only while the scene contains blur filters. The scene itself always
+        // draws straight to the swapchain.
+        let has_blur = !scene.backdrop_filters.is_empty() || !scene.filter_boundaries.is_empty();
         let content_depth = filter_group_depth(&scene.filter_boundaries);
         let resources = self.resources.as_mut().context("resources missing")?;
-        if use_offscreen {
+        if has_blur {
             let device = &self.devices.as_ref().context("devices missing")?.device;
             if resources.blur.is_none() {
                 resources.blur = Some(BlurResources::new(device, self.width, self.height)?);
             }
-            resources.blur.as_mut().unwrap().ensure_groups(
-                device,
-                self.width,
-                self.height,
-                content_depth,
-            )?;
+            let blur = resources.blur.as_mut().unwrap();
+            blur.ensure_groups(device, self.width, self.height, content_depth)?;
+            blur.ensure_backdrop(device, backdrop_copy_size(scene, self.width, self.height))?;
         } else {
             // pre_draw rebound the swapchain, and blur passes unbind their SRVs.
             // The immediate context retains anything needed by pending GPU work.
@@ -983,13 +1091,7 @@ impl DirectXRenderer {
         self.damage_sources.update(scene);
         let batch_bounds = std::mem::take(&mut self.damage_sources.batches);
         let result = clips.into_iter().try_for_each(|clip| {
-            self.render_pass(
-                scene,
-                background_appearance,
-                clip,
-                use_offscreen,
-                &batch_bounds,
-            )
+            self.render_pass(scene, background_appearance, clip, &batch_bounds)
         });
         self.damage_sources.batches = batch_bounds;
         self.active_render_target = None;
@@ -1009,7 +1111,6 @@ impl DirectXRenderer {
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
         clip: Option<DamageRect>,
-        use_offscreen: bool,
         batch_bounds: &[Option<DamageRect>],
     ) -> Result<()> {
         self.pre_draw(
@@ -1023,24 +1124,16 @@ impl DirectXRenderer {
 
         // Clone the views we need (AddRef) so the loop can rebind render targets without holding a
         // borrow of `self` across the `&mut self` draw_* calls.
-        let (scene_rtv, scene_srv, group_rtvs, group_srvs, swapchain_rtv) = {
+        let (group_rtvs, group_srvs, swapchain_rtv) = {
             let r = self.resources.as_ref().context("resources missing")?;
             if let Some(blur) = r.blur.as_ref() {
                 (
-                    blur.scene_color_rtv.clone(),
-                    blur.scene_color_srv.clone(),
                     blur.group_rtvs.clone(),
                     blur.group_srvs.clone(),
                     r.render_target_view.clone(),
                 )
             } else {
-                (
-                    None,
-                    None,
-                    Vec::new(),
-                    Vec::new(),
-                    r.render_target_view.clone(),
-                )
+                (Vec::new(), Vec::new(), r.render_target_view.clone())
             }
         };
         let ctx = self
@@ -1050,25 +1143,12 @@ impl DirectXRenderer {
             .device_context
             .clone();
 
-        if use_offscreen {
-            if let Some(rtv) = scene_rtv.as_ref() {
-                self.clear_target(rtv, &[0.0; 4], clip)?;
-            }
-            unsafe {
-                ctx.OMSetRenderTargets(Some(slice::from_ref(&scene_rtv)), None);
-            }
-            self.active_render_target = scene_rtv;
-        } else {
-            self.active_render_target = swapchain_rtv.clone();
-        }
+        self.active_render_target = swapchain_rtv.clone();
 
-        // Current target for the main scene + a parent stack for content-filter groups.
+        // Current target for the main scene + a parent stack for content-filter groups. Only a
+        // group target has a view to sample; a backdrop over the swapchain copies its region.
         let mut current_rtv = self.active_render_target.clone();
-        let mut current_srv = if use_offscreen {
-            scene_srv.clone()
-        } else {
-            None
-        };
+        let mut current_srv: Option<ID3D11ShaderResourceView> = None;
         // (parent_rtv, parent_srv, isolated)
         let mut filter_stack: Vec<(
             Option<ID3D11RenderTargetView>,
@@ -1095,18 +1175,7 @@ impl DirectXRenderer {
             match batch {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
-                PrimitiveBatch::Paths(range) => {
-                    let paths = &scene.paths[range];
-                    if paths
-                        .iter()
-                        .any(|path| repaints(clip, damage_rect(path.clipped_bounds())))
-                    {
-                        self.draw_paths_to_intermediate(paths, clip)?;
-                        self.draw_paths_from_intermediate(paths)
-                    } else {
-                        Ok(())
-                    }
-                }
+                PrimitiveBatch::Paths(range) => self.draw_paths(&scene.paths[range], clip),
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
                     self.draw_monochrome_sprites(texture_id, range.start, range.len())
@@ -1128,8 +1197,13 @@ impl DirectXRenderer {
                             if !repaints(clip, blur_footprint(filter.bounds, &filter.filters)) {
                                 continue;
                             }
+                            let source = if current_srv.is_some() {
+                                BlurSource::View(&current_srv)
+                            } else {
+                                BlurSource::CopyOf(&current_rtv)
+                            };
                             self.dx_blur_and_composite(
-                                &current_srv,
+                                source,
                                 &current_rtv,
                                 filter.bounds,
                                 filter.content_mask.bounds,
@@ -1175,7 +1249,7 @@ impl DirectXRenderer {
                             && repaints(clip, blur_footprint(boundary.bounds, &boundary.filters))
                         {
                             self.dx_blur_and_composite(
-                                &current_srv,
+                                BlurSource::View(&current_srv),
                                 &parent_rtv,
                                 boundary.bounds,
                                 boundary.content_mask.bounds,
@@ -1213,10 +1287,6 @@ impl DirectXRenderer {
                     scene.surfaces.len(),
                 )
             })?;
-        }
-        // Present the offscreen scene by blitting it into the swapchain.
-        if use_offscreen {
-            self.dx_blit(&scene_srv, &swapchain_rtv)?;
         }
         if let Some(clip) = clip {
             self.draw_damage_overlay(clip, &swapchain_rtv, scene.pulse_clock_ms)?;
@@ -1549,20 +1619,33 @@ impl DirectXRenderer {
         )
     }
 
-    fn draw_paths_to_intermediate(
-        &mut self,
-        paths: &[Path<ScaledPixels>],
-        clip: Option<DamageRect>,
-    ) -> Result<()> {
-        let [x, y, _, _] = path_batch_bounds(paths, [self.width, self.height]);
-        self.draw_paths_to_intermediate_at(paths, [x, y], clip)
+    /// Rasterizes a path batch cluster by cluster, so the shared targets only need to fit the
+    /// largest cluster rather than the span of the whole batch.
+    fn draw_paths(&mut self, paths: &[Path<ScaledPixels>], clip: Option<DamageRect>) -> Result<()> {
+        for cluster in path_clusters(paths, [self.width, self.height]) {
+            let members: Vec<&Path<ScaledPixels>> =
+                cluster.paths.iter().map(|&ix| &paths[ix]).collect();
+            if !members
+                .iter()
+                .any(|path| repaints(clip, damage_rect(path.clipped_bounds())))
+            {
+                continue;
+            }
+            self.draw_paths_to_intermediate_at(
+                &members,
+                [cluster.bounds[0], cluster.bounds[1]],
+                clip,
+            )?;
+            self.draw_paths_from_intermediate(&members)?;
+        }
+        Ok(())
     }
 
     /// Rasterizes the paths of `paths` that touch `clip`; the rest would only be copied outside
     /// the scissor.
     fn draw_paths_to_intermediate_at(
         &mut self,
-        paths: &[Path<ScaledPixels>],
+        paths: &[&Path<ScaledPixels>],
         origin: [u32; 2],
         clip: Option<DamageRect>,
     ) -> Result<()> {
@@ -1670,7 +1753,7 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    fn draw_paths_from_intermediate(&mut self, paths: &[Path<ScaledPixels>]) -> Result<()> {
+    fn draw_paths_from_intermediate(&mut self, paths: &[&Path<ScaledPixels>]) -> Result<()> {
         let Some(first_path) = paths.first() else {
             return Ok(());
         };
@@ -1880,13 +1963,13 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Blur `source_srv` (full-resolution) using the half-res ping/pong textures and composite the
+    /// Blur `source` (full-resolution) using the half-res ping/pong textures and composite the
     /// result into `target_rtv`, clipped to `bounds`/`corner_radii`/`content_mask` and modulated
     /// by `opacity`. Shared by the backdrop and content-filter paths.
     #[allow(clippy::too_many_arguments)]
     fn dx_blur_and_composite(
         &self,
-        source_srv: &Option<ID3D11ShaderResourceView>,
+        source: BlurSource<'_>,
         target_rtv: &Option<ID3D11RenderTargetView>,
         bounds: Bounds<ScaledPixels>,
         content_mask: Bounds<ScaledPixels>,
@@ -1914,29 +1997,21 @@ impl DirectXRenderer {
         };
         let half_w = (self.width / 2).max(1);
         let half_h = (self.height / 2).max(1);
-        // Match the shipping WGPU pass footprint, including the transparent
-        // outside pixels sampled by later passes of a content filter.
-        let dilation = 3.0 * blur_radius;
-        let x0 = (((bounds.origin.x.0 - dilation) * 0.5).floor().max(0.0) as u32).min(half_w);
-        let y0 = (((bounds.origin.y.0 - dilation) * 0.5).floor().max(0.0) as u32).min(half_h);
-        let x1 = ((((bounds.origin.x.0 + bounds.size.width.0 + dilation) * 0.5)
-            .ceil()
-            .max(0.0) as u32)
-            .min(half_w))
-        .max(x0);
-        let y1 = ((((bounds.origin.y.0 + bounds.size.height.0 + dilation) * 0.5)
-            .ceil()
-            .max(0.0) as u32)
-            .min(half_h))
-        .max(y0);
-        if x0 == x1 || y0 == y1 {
+        let Some(region) = blur_region(bounds, blur_radius, self.width, self.height) else {
             return Ok(());
-        }
+        };
         let scissor = RECT {
-            left: x0 as i32,
-            top: y0 as i32,
-            right: x1 as i32,
-            bottom: y1 as i32,
+            left: (region[0] / 2) as i32,
+            top: (region[1] / 2) as i32,
+            right: (region[2] / 2) as i32,
+            bottom: (region[3] / 2) as i32,
+        };
+        let (source_srv, source_origin) = match source {
+            BlurSource::View(srv) => (srv.clone(), [0.0; 2]),
+            BlurSource::CopyOf(rtv) => (
+                self.copy_backdrop(rtv, region)?,
+                [region[0] as f32, region[1] as f32],
+            ),
         };
         let half_vp = D3D11_VIEWPORT {
             TopLeftX: 0.0,
@@ -1964,9 +2039,10 @@ impl DirectXRenderer {
             &self.pipelines.blur_downsample_fragment,
             &self.pipelines.blur_blend_replace,
             &ping_rtv,
-            source_srv,
+            &source_srv,
             BlurParams {
                 downsample: 1.0,
+                source_origin,
                 ..Default::default()
             },
             &half_vp,
@@ -2037,32 +2113,51 @@ impl DirectXRenderer {
         Ok(())
     }
 
-    /// Copy the offscreen scene texture into the swapchain render target. The full-screen
-    /// triangle replaces every pixel the scissor lets through, so the target is not cleared:
-    /// a partial repaint keeps the retained pixels outside it.
-    fn dx_blit(
+    /// Copies `region` (`[x0, y0, x1, y1]`) of the texture behind `target` to the top left of the
+    /// backdrop copy and returns the copy's view.
+    fn copy_backdrop(
         &self,
-        source_srv: &Option<ID3D11ShaderResourceView>,
-        target_rtv: &Option<ID3D11RenderTargetView>,
-    ) -> Result<()> {
-        let full_vp = self
+        target: &Option<ID3D11RenderTargetView>,
+        region: [u32; 4],
+    ) -> Result<Option<ID3D11ShaderResourceView>> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        let backdrop = self
             .resources
             .as_ref()
-            .context("resources missing")?
-            .viewport;
-        self.dx_blur_pass(
-            &self.pipelines.blur_downsample_vertex,
-            &self.pipelines.blur_downsample_fragment,
-            &self.pipelines.blur_blend_replace,
-            target_rtv,
-            source_srv,
-            BlurParams::default(),
-            &full_vp,
-            None,
-            D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST,
-            3,
-            false,
-        )
+            .and_then(|r| r.blur.as_ref())
+            .and_then(|blur| blur.backdrop.as_ref())
+            .context("backdrop copy missing")?;
+        anyhow::ensure!(
+            region[2] - region[0] <= backdrop.size[0] && region[3] - region[1] <= backdrop.size[1],
+            "backdrop region {region:?} exceeds the copy's {:?}",
+            backdrop.size
+        );
+        let source = unsafe {
+            target
+                .as_ref()
+                .context("blur target view missing")?
+                .GetResource()?
+        };
+        unsafe {
+            devices.device_context.CopySubresourceRegion(
+                &backdrop.texture,
+                0,
+                0,
+                0,
+                0,
+                &source,
+                0,
+                Some(&D3D11_BOX {
+                    left: region[0],
+                    top: region[1],
+                    front: 0,
+                    right: region[2],
+                    bottom: region[3],
+                    back: 1,
+                }),
+            );
+        }
+        Ok(backdrop.srv.clone())
     }
 
     /// With [`SHOW_DAMAGE`] set, tints `rect` of `target`, cycling hues so successive repaints
@@ -2177,6 +2272,48 @@ impl DirectXRenderer {
         })
     }
 
+    /// Frees what only drawing needs while the window cannot be seen: path, blur and snapshot
+    /// targets, mesh buffers and grown instance buffers, then lets the driver trim its own
+    /// allocations. The next frame recreates what its scene needs and uploads it whole.
+    pub(crate) fn release_offscreen(&mut self) -> Result<()> {
+        if let Some(resources) = self.resources.as_mut() {
+            resources.paths = None;
+            resources.paths_capacity = RetainedSize::default();
+            resources.blur = None;
+        }
+        self.snapshot = None;
+        self.meshes = None;
+        self.uploaded_generation = None;
+        self.active_render_target = None;
+        let Some(devices) = self.devices.as_ref() else {
+            return Ok(());
+        };
+        let pipelines = &mut self.pipelines;
+        pipelines.shadow_pipeline.release(&devices.device)?;
+        pipelines.quad_pipeline.release(&devices.device)?;
+        pipelines
+            .path_rasterization_pipeline
+            .release(&devices.device)?;
+        pipelines.path_sprite_pipeline.release(&devices.device)?;
+        pipelines.underline_pipeline.release(&devices.device)?;
+        pipelines.mono_sprites.release(&devices.device)?;
+        pipelines.subpixel_sprites.release(&devices.device)?;
+        pipelines.poly_sprites.release(&devices.device)?;
+        unsafe {
+            // Trim skips resources still bound; pre_draw rebinds the swapchain next frame.
+            devices.device_context.OMSetRenderTargets(None, None);
+            devices
+                .device_context
+                .VSSetShaderResources(0, Some(&[None]));
+            devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+            devices.device_context.Flush();
+            devices.device.cast::<IDXGIDevice3>()?.Trim();
+        }
+        Ok(())
+    }
+
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
     }
@@ -2185,7 +2322,7 @@ impl DirectXRenderer {
 impl DirectXResources {
     fn ensure_paths(&mut self, device: &ID3D11Device, required: Option<[u32; 2]>) -> Result<()> {
         let current = self.paths.as_ref().map(|targets| targets.size);
-        let retained = retained_path_target_size(current, required);
+        let retained = self.paths_capacity.next(current, required);
         if current != retained {
             self.paths = retained
                 .map(|size| PathTargets::new(device, size))
@@ -2221,6 +2358,7 @@ impl DirectXResources {
             render_target: Some(render_target),
             render_target_view,
             paths: None,
+            paths_capacity: RetainedSize::default(),
             blur: None,
             viewport,
         })
@@ -2238,6 +2376,7 @@ impl DirectXResources {
         self.render_target = Some(render_target);
         self.render_target_view = render_target_view;
         self.paths = None;
+        self.paths_capacity = RetainedSize::default();
         self.blur = None;
         self.viewport = viewport;
         Ok(())
@@ -2485,12 +2624,16 @@ struct BlurParams {
     /// its bounds like CSS `filter: blur`.
     clip_rounded: f32,
     /// 1.0 = snapped 2:1 box downsample (anchor the half-res grid to a fixed 2px grid at the
-    /// origin, so a stationary element blurs identically at every window size); 0.0 = 1:1 copy
-    /// (the scene blit, which must not downsample). Downsample pass only.
+    /// origin, so a stationary element blurs identically at every window size); 0.0 = 1:1 copy.
+    /// Downsample pass only.
     downsample: f32,
     /// Spacing between taps in pixels (gaussian passes only); >1 lets `tap_count` taps span very
     /// large radii without truncating the gaussian, matching the wgpu backend.
     tap_step: f32,
+    /// Where the source texture's top left sits in the target, in device pixels: a backdrop copy
+    /// holds only the region under its filter. Downsample pass only.
+    source_origin: [f32; 2],
+    _pad: [f32; 2],
 }
 
 impl Default for BlurParams {
@@ -2506,6 +2649,8 @@ impl Default for BlurParams {
             clip_rounded: 0.0,
             downsample: 0.0,
             tap_step: 0.0,
+            source_origin: [0.0; 2],
+            _pad: [0.0; 2],
         }
     }
 }
@@ -2551,9 +2696,15 @@ struct PipelineState<T> {
     fragment: ID3D11PixelShader,
     buffer: ID3D11Buffer,
     buffer_size: usize,
+    /// The size the pipeline starts with; shrinking never goes below it.
+    initial_size: usize,
     upload: InstanceUpload,
     /// How many instances the buffer holds from the last upload.
     uploaded_len: usize,
+    /// The largest upload since `peak_since`, which restarts whenever the buffer is reallocated
+    /// or the window passes without shrinking.
+    peak_len: usize,
+    peak_since: Instant,
     view: Option<ID3D11ShaderResourceView>,
     blend_state: ID3D11BlendState,
     _marker: std::marker::PhantomData<T>,
@@ -2585,12 +2736,34 @@ impl<T> PipelineState<T> {
             fragment,
             buffer,
             buffer_size,
+            initial_size: buffer_size,
             upload,
             uploaded_len: 0,
+            peak_len: 0,
+            peak_since: Instant::now(),
             view,
             blend_state,
             _marker: std::marker::PhantomData,
         })
+    }
+
+    /// Returns the buffer to its starting size; the next upload writes every instance.
+    fn release(&mut self, device: &ID3D11Device) -> Result<()> {
+        if self.buffer_size != self.initial_size {
+            let buffer = create_buffer(
+                device,
+                std::mem::size_of::<T>(),
+                self.initial_size,
+                self.upload,
+            )?;
+            self.view = create_buffer_view(device, &buffer)?;
+            self.buffer = buffer;
+            self.buffer_size = self.initial_size;
+        }
+        self.uploaded_len = 0;
+        self.peak_len = 0;
+        self.peak_since = Instant::now();
+        Ok(())
     }
 
     fn update_buffer(
@@ -2611,9 +2784,9 @@ impl<T> PipelineState<T> {
         data: &[T],
         changed: Option<Range<usize>>,
     ) -> Result<()> {
-        let mut regrown = false;
+        self.peak_len = self.peak_len.max(data.len());
+        let mut new_buffer_size = None;
         if self.buffer_size < data.len() {
-            regrown = true;
             let element_size = std::mem::size_of::<T>();
             let required_size = std::mem::size_of_val(data);
             anyhow::ensure!(
@@ -2621,10 +2794,21 @@ impl<T> PipelineState<T> {
                 "{} buffer needs {required_size} bytes, above the maximum of {MAX_INSTANCE_BUFFER_SIZE}",
                 self.label
             );
-            let new_buffer_size = data
-                .len()
-                .next_power_of_two()
-                .min(MAX_INSTANCE_BUFFER_SIZE / element_size);
+            new_buffer_size = Some(
+                data.len()
+                    .next_power_of_two()
+                    .min(MAX_INSTANCE_BUFFER_SIZE / element_size),
+            );
+        } else if self.peak_since.elapsed() >= INSTANCE_BUFFER_SHRINK_AFTER {
+            let needed = self.peak_len.max(1).next_power_of_two();
+            if needed * 4 <= self.buffer_size {
+                new_buffer_size = Some((needed * 2).max(self.initial_size));
+            }
+            self.peak_len = data.len();
+            self.peak_since = Instant::now();
+        }
+        let regrown = new_buffer_size.is_some();
+        if let Some(new_buffer_size) = new_buffer_size {
             log::debug!(
                 "Updating {} buffer size from {} to {}",
                 self.label,
@@ -2641,6 +2825,8 @@ impl<T> PipelineState<T> {
             self.buffer = buffer;
             self.view = view;
             self.buffer_size = new_buffer_size;
+            self.peak_len = data.len();
+            self.peak_since = Instant::now();
         }
         let range = match changed {
             Some(changed) if !regrown && self.upload == InstanceUpload::Retained => {
@@ -3306,7 +3492,9 @@ fn report_live_objects(device: &ID3D11Device) -> Result<()> {
     Ok(())
 }
 
-const BUFFER_COUNT: usize = 3;
+/// Two buffers, as Chromium's composition swapchains use: one on screen, one being drawn. Each
+/// costs a window-sized texture.
+const BUFFER_COUNT: usize = 2;
 
 pub(crate) mod shader_resources {
     use anyhow::Result;
@@ -3799,7 +3987,7 @@ mod resource_tests {
     fn blur_groups_allocate_only_required_depth_and_reuse_existing_textures() -> Result<()> {
         let devices = test_devices()?;
         let mut blur = BlurResources::new(&devices.device, 65, 33)?;
-        assert_eq!(texture_size(&blur.scene_color), (65, 33));
+        assert!(blur.backdrop.is_none());
         assert_eq!(texture_size(&blur.ping), (32, 16));
         assert_eq!(texture_size(&blur.pong), (32, 16));
         assert!(blur.groups.is_empty());
@@ -3846,14 +4034,14 @@ mod resource_tests {
         assert!(resources.blur.is_none());
         let mut blur = BlurResources::new(&devices.device, 65, 33)?;
         blur.ensure_groups(&devices.device, 65, 33, 1)?;
-        let old_scene = blur.scene_color.clone();
+        let old_ping = blur.ping.clone();
         let old_group_view = blur.group_rtvs[0].clone().unwrap();
         resources.blur = Some(blur);
 
         resources.recreate_resources(&devices, 65, 33)?;
         assert!(resources.blur.is_none());
         let replacement = BlurResources::new(&devices.device, 65, 33)?;
-        assert_ne!(replacement.scene_color, old_scene);
+        assert_ne!(replacement.ping, old_ping);
         assert!(replacement.groups.is_empty());
         resources.blur = Some(replacement);
         drop(resources);
@@ -3865,7 +4053,6 @@ mod resource_tests {
         assert!(replacement.blur.is_none());
         replacement.blur = Some(BlurResources::new(&devices.device, 97, 49)?);
         let blur = replacement.blur.as_ref().unwrap();
-        assert_eq!(texture_size(&blur.scene_color), (97, 49));
         assert_eq!(texture_size(&blur.ping), (48, 24));
         assert!(blur.groups.is_empty());
         Ok(())

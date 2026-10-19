@@ -22,6 +22,86 @@ pub fn path_target_size(scene: &Scene, viewport: [u32; 2]) -> Option<[u32; 2]> {
     ])
 }
 
+/// Paths of one batch that rasterize together: their [`path_batch_bounds`] rectangles overlap,
+/// directly or through other members. Distinct clusters of a batch have disjoint `bounds`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathCluster {
+    /// `[x, y, width, height]` in device pixels, as [`path_batch_bounds`] gives it.
+    pub bounds: [u32; 4],
+    /// Indices into the batch, ascending.
+    pub paths: Vec<usize>,
+}
+
+/// Batches with more paths than this rasterize as one cluster, keeping the grouping cost bounded.
+const MAX_CLUSTERED_PATHS: usize = 256;
+
+/// Splits a batch into [`PathCluster`]s so distant paths no longer share one target spanning
+/// the space between them: a tab outline at the top of a window and a meter arc at its bottom
+/// used to need a window-sized multisampled target.
+pub fn path_clusters(paths: &[Path<ScaledPixels>], viewport: [u32; 2]) -> Vec<PathCluster> {
+    if paths.len() > MAX_CLUSTERED_PATHS {
+        return vec![PathCluster {
+            bounds: path_batch_bounds(paths, viewport),
+            paths: (0..paths.len()).collect(),
+        }];
+    }
+    let mut clusters: Vec<PathCluster> = Vec::new();
+    for (ix, path) in paths.iter().enumerate() {
+        let mut cluster = PathCluster {
+            bounds: path_batch_bounds(std::slice::from_ref(path), viewport),
+            paths: vec![ix],
+        };
+        // Absorbing a cluster grows the bounds, which can reach further clusters.
+        while let Some(found) = clusters
+            .iter()
+            .position(|other| rects_overlap(other.bounds, cluster.bounds))
+        {
+            let other = clusters.swap_remove(found);
+            cluster.bounds = union_rect(cluster.bounds, other.bounds);
+            cluster.paths.extend(other.paths);
+        }
+        clusters.push(cluster);
+    }
+    for cluster in &mut clusters {
+        cluster.paths.sort_unstable();
+    }
+    clusters.sort_unstable_by_key(|cluster| cluster.paths[0]);
+    clusters
+}
+
+/// Required target capacity when every batch rasterizes cluster by cluster, rounded to stable
+/// 64-pixel buckets.
+pub fn clustered_path_target_size(scene: &Scene, viewport: [u32; 2]) -> Option<[u32; 2]> {
+    if scene.paths.is_empty() {
+        return None;
+    }
+    let mut size = [1u32, 1];
+    for batch in scene.batches() {
+        if let PrimitiveBatch::Paths(range) = batch {
+            for cluster in path_clusters(&scene.paths[range], viewport) {
+                size[0] = size[0].max(cluster.bounds[2]);
+                size[1] = size[1].max(cluster.bounds[3]);
+            }
+        }
+    }
+    Some([
+        size[0].next_multiple_of(64).min(viewport[0]).max(1),
+        size[1].next_multiple_of(64).min(viewport[1]).max(1),
+    ])
+}
+
+fn rects_overlap(a: [u32; 4], b: [u32; 4]) -> bool {
+    a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
+}
+
+fn union_rect(a: [u32; 4], b: [u32; 4]) -> [u32; 4] {
+    let x = a[0].min(b[0]);
+    let y = a[1].min(b[1]);
+    let right = (a[0] + a[2]).max(b[0] + b[2]);
+    let bottom = (a[1] + a[3]).max(b[1] + b[3]);
+    [x, y, right - x, bottom - y]
+}
+
 /// Grow existing targets componentwise, releasing them when the scene has no paths.
 pub fn retained_path_target_size(
     current: Option<[u32; 2]>,
@@ -123,6 +203,57 @@ mod tests {
         // Nonoverlapping paths share one batch, so their relative positions
         // must remain intact even when most of its bounding rectangle is empty.
         assert_eq!(path_target_size(&scene, [1600, 1125]), Some([1600, 1125]));
+    }
+
+    #[test]
+    fn distant_paths_rasterize_apart_and_overlapping_ones_together() {
+        let viewport = [1600, 1125];
+        let paths = [
+            path(20.0, 20.0, 40.0, 30.0),
+            path(1500.0, 1000.0, 60.0, 80.0),
+            path(50.0, 40.0, 30.0, 30.0),
+        ];
+        let clusters = path_clusters(&paths, viewport);
+        assert_eq!(
+            clusters,
+            [
+                PathCluster {
+                    bounds: [19, 19, 62, 52],
+                    paths: vec![0, 2],
+                },
+                PathCluster {
+                    bounds: [1499, 999, 62, 82],
+                    paths: vec![1],
+                },
+            ]
+        );
+        let mut scene = Scene::default();
+        for path in paths {
+            scene.insert_primitive(path);
+        }
+        scene.finish();
+        // The batch spans the window, its clusters do not.
+        assert_eq!(path_target_size(&scene, viewport), Some([1600, 1088]));
+        assert_eq!(
+            clustered_path_target_size(&scene, viewport),
+            Some([64, 128])
+        );
+    }
+
+    #[test]
+    fn a_merged_cluster_absorbs_clusters_its_union_now_reaches() {
+        // The last path bridges the first two, and their union then covers the third, which
+        // touches none of them.
+        let paths = [
+            path(0.0, 0.0, 10.0, 10.0),
+            path(50.0, 50.0, 10.0, 10.0),
+            path(50.0, 0.0, 5.0, 3.0),
+            path(5.0, 5.0, 50.0, 50.0),
+        ];
+        let clusters = path_clusters(&paths, [256, 256]);
+        assert_eq!(clusters.len(), 1);
+        assert_eq!(clusters[0].paths, [0, 1, 2, 3]);
+        assert_eq!(clusters[0].bounds, path_batch_bounds(&paths, [256, 256]));
     }
 
     #[test]

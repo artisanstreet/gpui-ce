@@ -77,7 +77,6 @@ fn nested_content_groups_release_and_reappear_while_backdrop_blur_remains() -> R
     assert!(first.pixels().any(|p| p[3] > 0));
     let blur = renderer.resources.as_ref().unwrap().blur.as_ref().unwrap();
     assert_eq!(blur.groups.len(), 2);
-    let scene_color = blur.scene_color.clone();
     let ping = blur.ping.clone();
     let pong = blur.pong.clone();
     renderer.render_to_image(&scene(1), WindowBackgroundAppearance::Transparent)?;
@@ -99,7 +98,6 @@ fn nested_content_groups_release_and_reappear_while_backdrop_blur_remains() -> R
     assert!(blur.groups.is_empty());
     assert!(blur.group_rtvs.is_empty());
     assert!(blur.group_srvs.is_empty());
-    assert_eq!(blur.scene_color, scene_color);
     assert_eq!(blur.ping, ping);
     assert_eq!(blur.pong, pong);
     let restored = renderer.render_to_image(&nested, WindowBackgroundAppearance::Transparent)?;
@@ -186,4 +184,52 @@ fn queued_content_group_work_survives_pool_release_and_recreation() -> Result<()
         assert!(pixels.chunks_exact(4).all(|pixel| pixel == expected));
     }
     Ok(())
+}
+
+#[test]
+fn a_backdrop_blur_copies_only_the_region_under_it() -> Result<()> {
+    let mut renderer = renderer([400, 300])?;
+    renderer.render_to_image(&scene(0), WindowBackgroundAppearance::Transparent)?;
+    let blur = renderer.resources.as_ref().unwrap().blur.as_ref().unwrap();
+    // The 70x40 filter blurs 2 px: its region grows by three radii on each side, on the even
+    // grid, and nothing window-sized is allocated for the scene.
+    assert_eq!(blur.backdrop.as_ref().unwrap().size, [84, 54]);
+    Ok(())
+}
+
+#[test]
+fn a_minimized_window_frees_its_targets_and_draws_the_same_on_restore() -> Result<()> {
+    let mut renderer = renderer([97, 65])?;
+    let nested = scene(2);
+    let before = renderer.render_to_image(&nested, WindowBackgroundAppearance::Transparent)?;
+    renderer.release_offscreen()?;
+    assert!(renderer.resources.as_ref().unwrap().blur.is_none());
+    assert!(renderer.resources.as_ref().unwrap().paths.is_none());
+    let after = renderer.render_to_image(&nested, WindowBackgroundAppearance::Transparent)?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[test]
+fn retained_sizes_grow_at_once_and_shrink_after_a_quiet_window() {
+    use super::{RetainedSize, TARGET_SHRINK_AFTER};
+    let mut capacity = RetainedSize::default();
+    assert_eq!(capacity.next(None, Some([128, 64])), Some([128, 64]));
+    assert_eq!(
+        capacity.next(Some([128, 64]), Some([64, 192])),
+        Some([128, 192])
+    );
+    // Within the window the larger size stays, whatever later frames need.
+    assert_eq!(
+        capacity.next(Some([128, 192]), Some([64, 64])),
+        Some([128, 192])
+    );
+    // Once a window passes in which no frame needed it, it shrinks to the largest need.
+    capacity.since = Some(std::time::Instant::now() - TARGET_SHRINK_AFTER);
+    capacity.peak = [64, 64];
+    assert_eq!(
+        capacity.next(Some([128, 192]), Some([64, 64])),
+        Some([64, 64])
+    );
+    assert_eq!(capacity.next(Some([64, 64]), None), None);
 }
