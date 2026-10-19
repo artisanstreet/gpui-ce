@@ -9,7 +9,8 @@ cbuffer MeshUniforms : register(b2) {
 
 struct MeshInput {
     float3 position : POSITION;
-    float3 normal : NORMAL;
+    float4 normal : NORMAL;
+    // rgb: sRGB-encoded color; a: 1 to use it, 0 to use the base color.
     float4 color : COLOR;
 };
 struct MeshVarying {
@@ -20,13 +21,21 @@ struct MeshVarying {
     float3 barycentric : TEXCOORD3;
 };
 
+float3 mesh_srgb_to_linear(float3 color) {
+    float3 low = color / 12.92;
+    float3 high = pow((color + 0.055) / 1.055, 2.4);
+    return float3(color.r <= 0.04045 ? low.r : high.r,
+                  color.g <= 0.04045 ? low.g : high.g,
+                  color.b <= 0.04045 ? low.b : high.b);
+}
+
 MeshVarying mesh_vertex(MeshInput input, uint vertex_id : SV_VertexID) {
     float4 view_position = mul(mesh_view, float4(input.position, 1.0));
     MeshVarying output;
     output.position = mul(mesh_projection, view_position);
     output.view_position = view_position.xyz;
-    output.view_normal = mul(mesh_view, float4(input.normal, 0.0)).xyz;
-    output.albedo = input.color.a > 0.5 ? input.color.rgb : mesh_base_color.rgb;
+    output.view_normal = mul(mesh_view, float4(input.normal.xyz, 0.0)).xyz;
+    output.albedo = input.color.a > 0.5 ? mesh_srgb_to_linear(input.color.rgb) : mesh_base_color.rgb;
     uint corner = vertex_id % 3;
     output.barycentric = float3(corner == 0, corner == 1, corner == 2);
     return output;

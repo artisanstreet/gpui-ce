@@ -75,11 +75,7 @@ fn cube() -> Mesh {
     for (normal, u, v) in faces {
         let corner =
             |a: f32, b: f32| [0, 1, 2].map(|i| 0.5 * normal[i] + 0.5 * a * u[i] + 0.5 * b * v[i]);
-        let color = if normal[1] > 0.5 {
-            [1.0, 0.0, 0.0, 1.0]
-        } else {
-            [0.0; 4]
-        };
+        let color = (normal[1] > 0.5).then_some([1.0, 0.0, 0.0]);
         for (a, b) in [
             (-1.0, -1.0),
             (1.0, -1.0),
@@ -88,11 +84,7 @@ fn cube() -> Mesh {
             (1.0, 1.0),
             (-1.0, 1.0),
         ] {
-            vertices.push(MeshVertex {
-                position: corner(a, b),
-                normal,
-                color,
-            });
+            vertices.push(MeshVertex::new(corner(a, b), normal, color));
         }
     }
     Mesh::new(vertices)

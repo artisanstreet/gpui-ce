@@ -27,8 +27,8 @@ struct MeshUniforms {
 
 struct MeshVertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    // rgb: linear color; a: 1 to use it, 0 to use the base color.
+    @location(1) normal: vec4<f32>,
+    // rgb: sRGB-encoded color; a: 1 to use it, 0 to use the base color.
     @location(2) color: vec4<f32>,
 }
 
@@ -42,14 +42,20 @@ struct MeshVarying {
     @location(3) barycentric: vec3<f32>,
 }
 
+fn mesh_srgb_to_linear(color: vec3<f32>) -> vec3<f32> {
+    let low = color / 12.92;
+    let high = pow((color + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, color <= vec3<f32>(0.04045));
+}
+
 @vertex
 fn vs_mesh(input: MeshVertexInput, @builtin(vertex_index) vertex_index: u32) -> MeshVarying {
     let view_position = mesh.view * vec4<f32>(input.position, 1.0);
     var out: MeshVarying;
     out.position = mesh.projection * view_position;
     out.view_position = view_position.xyz;
-    out.view_normal = (mesh.view * vec4<f32>(input.normal, 0.0)).xyz;
-    out.albedo = select(mesh.base_color.rgb, input.color.rgb, input.color.a > 0.5);
+    out.view_normal = (mesh.view * vec4<f32>(input.normal.xyz, 0.0)).xyz;
+    out.albedo = select(mesh.base_color.rgb, mesh_srgb_to_linear(input.color.rgb), input.color.a > 0.5);
     // Geometry is a triangle soup, so the vertex index names the corner.
     let corner = vertex_index % 3u;
     out.barycentric = vec3<f32>(

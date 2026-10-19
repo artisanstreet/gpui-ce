@@ -19,7 +19,7 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 
 use bytemuck::{Pod, Zeroable};
-use gpui::{MeshId, PaintMesh};
+use gpui::{MeshId, MeshVertex, PaintMesh};
 
 /// The mesh pass, standalone.
 const MESH_SHADERS: &str = include_str!("shaders_mesh.wgsl");
@@ -46,8 +46,8 @@ const MAX_TARGET_SIDE: u32 = 4096;
 /// Half the width of wireframe edges, in device pixels.
 const EDGE_HALF_WIDTH: f32 = 0.6;
 
-/// Floats per vertex: position, normal, color.
-const VERTEX_FLOATS: usize = 3 + 3 + 4;
+/// Bytes per vertex: f32 position, snorm16 normal, unorm8 color, as [`MeshVertex`] lays out.
+const VERTEX_BYTES: usize = std::mem::size_of::<MeshVertex>();
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct MeshMemoryStats {
@@ -185,15 +185,28 @@ impl MeshRenderer {
             bind_group_layouts: &[Some(&mesh_layout)],
             immediate_size: 0,
         });
-        let float = |offset: usize, components: usize, location: u32| wgpu::VertexAttribute {
-            format: match components {
-                3 => wgpu::VertexFormat::Float32x3,
-                _ => wgpu::VertexFormat::Float32x4,
-            },
-            offset: (offset * 4) as u64,
+        let attribute = |format, offset: usize, location: u32| wgpu::VertexAttribute {
+            format,
+            offset: offset as u64,
             shader_location: location,
         };
-        let attributes = [float(0, 3, 0), float(3, 3, 1), float(6, 4, 2)];
+        let attributes = [
+            attribute(
+                wgpu::VertexFormat::Float32x3,
+                std::mem::offset_of!(MeshVertex, position),
+                0,
+            ),
+            attribute(
+                wgpu::VertexFormat::Snorm16x4,
+                std::mem::offset_of!(MeshVertex, normal),
+                1,
+            ),
+            attribute(
+                wgpu::VertexFormat::Unorm8x4,
+                std::mem::offset_of!(MeshVertex, color),
+                2,
+            ),
+        ];
         let mesh_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("mesh"),
             layout: Some(&mesh_pipeline_layout),
@@ -201,7 +214,7 @@ impl MeshRenderer {
                 module: &mesh_module,
                 entry_point: Some("vs_mesh"),
                 buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: (VERTEX_FLOATS * 4) as u64,
+                    array_stride: VERTEX_BYTES as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &attributes,
                 }],
@@ -616,7 +629,7 @@ fn upload(device: &wgpu::Device, paint: &PaintMesh) -> CachedGeometry {
     let vertices = paint.mesh.vertices();
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("mesh_vertices"),
-        size: (vertices.len() as u64) * (VERTEX_FLOATS as u64) * 4,
+        size: (vertices.len() * VERTEX_BYTES) as u64,
         usage: wgpu::BufferUsages::VERTEX,
         mapped_at_creation: !vertices.is_empty(),
     });
@@ -624,14 +637,18 @@ fn upload(device: &wgpu::Device, paint: &PaintMesh) -> CachedGeometry {
         let mut mapping = buffer.slice(..).get_mapped_range_mut();
         let mut destination = mapping.slice(..);
         for (index, vertex) in vertices.iter().enumerate() {
-            let [px, py, pz] = vertex.position;
-            let [nx, ny, nz] = vertex.normal;
-            let [r, g, b, a] = vertex.color;
-            let data = [px, py, pz, nx, ny, nz, r, g, b, a];
-            let start = index * VERTEX_FLOATS * 4;
+            let mut bytes = [0u8; VERTEX_BYTES];
+            for (axis, value) in vertex.position.iter().enumerate() {
+                bytes[axis * 4..axis * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for (axis, value) in vertex.normal.iter().enumerate() {
+                bytes[12 + axis * 2..14 + axis * 2].copy_from_slice(&value.to_le_bytes());
+            }
+            bytes[20..24].copy_from_slice(&vertex.color);
+            let start = index * VERTEX_BYTES;
             destination
-                .slice(start..start + VERTEX_FLOATS * 4)
-                .copy_from_slice(bytemuck::bytes_of(&data));
+                .slice(start..start + VERTEX_BYTES)
+                .copy_from_slice(&bytes);
         }
         drop(mapping);
         buffer.unmap();

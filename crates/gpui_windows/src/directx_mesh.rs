@@ -48,9 +48,9 @@ struct CompositeParams {
 }
 
 const _: () = {
-    assert!(size_of::<MeshVertex>() == 40);
+    assert!(size_of::<MeshVertex>() == 24);
     assert!(std::mem::offset_of!(MeshVertex, normal) == 12);
-    assert!(std::mem::offset_of!(MeshVertex, color) == 24);
+    assert!(std::mem::offset_of!(MeshVertex, color) == 20);
     assert!(size_of::<MeshUniforms>() == 176);
     assert!(size_of::<CompositeParams>() == 80);
 };
@@ -116,8 +116,8 @@ impl MeshRenderer {
         let mut input_layout = None;
         let elements = [
             (s!("POSITION"), DXGI_FORMAT_R32G32B32_FLOAT, 0),
-            (s!("NORMAL"), DXGI_FORMAT_R32G32B32_FLOAT, 12),
-            (s!("COLOR"), DXGI_FORMAT_R32G32B32A32_FLOAT, 24),
+            (s!("NORMAL"), DXGI_FORMAT_R16G16B16A16_SNORM, 12),
+            (s!("COLOR"), DXGI_FORMAT_R8G8B8A8_UNORM, 20),
         ]
         .map(|(name, format, offset)| D3D11_INPUT_ELEMENT_DESC {
             SemanticName: name,
