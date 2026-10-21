@@ -18,12 +18,16 @@ use windows::UI::Notifications::{
     ToastActivatedEventArgs, ToastDismissedEventArgs, ToastFailedEventArgs, ToastNotification,
     ToastNotificationManager, ToastNotifier,
 };
+use windows::core::HSTRING;
 use windows::core::{IInspectable, Interface as _, h};
 
 type ResponseCallback = Rc<RefCell<Option<Box<dyn FnMut(SystemNotificationResponse)>>>>;
 
 pub(crate) struct SystemNotificationState {
     notifier: Option<ToastNotifier>,
+    /// The AppUserModelID an unpackaged app's toasts are filed under, which
+    /// Notification Center needs to find them again.
+    app_identifier: Option<HSTRING>,
     active_toasts: Arc<Mutex<HashMap<SharedString, (u64, ToastNotification)>>>,
     next_generation: u64,
     response_sender: mpsc::UnboundedSender<SystemNotificationResponse>,
@@ -37,6 +41,7 @@ impl SystemNotificationState {
         let (response_sender, response_receiver) = mpsc::unbounded();
         Self {
             notifier: None,
+            app_identifier: None,
             active_toasts: Arc::new(Mutex::new(HashMap::new())),
             next_generation: 0,
             response_sender,
@@ -60,14 +65,8 @@ impl SystemNotificationState {
         let toast = ToastNotification::CreateToastNotification(&document)?;
         let generation = self.next_generation;
         self.next_generation += 1;
-        // Windows caps toast tags at 64 characters (post-Creators Update),
-        // so hash the arbitrary GPUI tag down to a fixed-width value.
-        let tag = {
-            let mut hasher = DefaultHasher::new();
-            notification.tag.hash(&mut hasher);
-            format!("{:016x}", hasher.finish())
-        };
-        toast.SetTag(&tag.into())?;
+        toast.SetTag(&native_tag(&notification.tag))?;
+        toast.SetGroup(TOAST_GROUP)?;
 
         let sender = self.response_sender.clone();
         let response_tag = notification.tag.clone();
@@ -134,14 +133,29 @@ impl SystemNotificationState {
     }
 
     pub(crate) fn dismiss(&mut self, tag: &str) {
-        let Some((_, toast)) = self.active_toasts.lock().remove(tag) else {
-            return;
-        };
         let Some(notifier) = &self.notifier else {
             return;
         };
-        if let Err(error) = notifier.Hide(&toast) {
-            log::warn!("failed to dismiss system notification: {error}");
+        let shown = self.active_toasts.lock().remove(tag);
+        if let Some((_, toast)) = shown
+            && let Err(error) = notifier.Hide(&toast)
+        {
+            log::warn!("failed to hide system notification: {error}");
+        }
+        // Hide only reaches a toast still on screen. One that timed out sits
+        // in Notification Center, which badges the taskbar button until it
+        // goes, and Windows removes it by tag rather than by object.
+        let tag = native_tag(tag);
+        let removed = ToastNotificationManager::History().and_then(|history| {
+            match &self.app_identifier {
+                Some(app_identifier) => {
+                    history.RemoveGroupedTagWithId(&tag, TOAST_GROUP, app_identifier)
+                }
+                None => history.RemoveGroupedTag(&tag, TOAST_GROUP),
+            }
+        });
+        if let Err(error) = removed {
+            log::warn!("failed to remove system notification from Notification Center: {error}");
         }
     }
 
@@ -189,12 +203,27 @@ impl SystemNotificationState {
                 return Ok(None);
             };
             register_app_user_model_id(app_identifier, app_name);
-            ToastNotificationManager::CreateToastNotifierWithId(&app_identifier.into())?
+            let app_identifier = HSTRING::from(app_identifier);
+            let notifier = ToastNotificationManager::CreateToastNotifierWithId(&app_identifier)?;
+            self.app_identifier = Some(app_identifier);
+            notifier
         };
 
         self.notifier = Some(notifier.clone());
         Ok(Some(notifier))
     }
+}
+
+/// Every toast shares one group, so Notification Center can be asked to
+/// remove one by its tag.
+const TOAST_GROUP: &HSTRING = h!("gpui");
+
+/// Windows caps toast tags at 64 characters (post-Creators Update), so the
+/// arbitrary GPUI tag is hashed down to a fixed-width value.
+fn native_tag(tag: &str) -> HSTRING {
+    let mut hasher = DefaultHasher::new();
+    tag.hash(&mut hasher);
+    format!("{:016x}", hasher.finish()).into()
 }
 
 /// Native events may arrive after the same tag has already been replaced.
