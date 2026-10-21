@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use gpui_util::ResultExt;
 use itertools::Itertools;
 use windows::Win32::{
-    Foundation::HMODULE,
+    Foundation::{CloseHandle, HMODULE, WAIT_OBJECT_0},
     Graphics::{
         Direct3D::{
             D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_10_1,
@@ -14,12 +14,12 @@ use windows::Win32::{
             D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext,
         },
         Dxgi::{
-            CreateDXGIFactory2, DXGI_CREATE_FACTORY_DEBUG, DXGI_CREATE_FACTORY_FLAGS,
-            IDXGIAdapter1, IDXGIFactory6,
+            CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_DEBUG,
+            DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory6, IDXGIFactory7,
         },
     },
+    System::Threading::{CreateEventW, INFINITE, WaitForSingleObject},
 };
-use windows::core::Interface;
 
 pub(crate) fn try_to_recover_from_device_lost<T>(mut f: impl FnMut() -> Result<T>) -> Result<T> {
     (0..5)
@@ -102,6 +102,9 @@ fn get_dxgi_factory(debug_layer_available: bool) -> Result<IDXGIFactory6> {
     unsafe { Ok(CreateDXGIFactory2(factory_flag)?) }
 }
 
+/// Hardware adapters come first: the software rasterizer (Microsoft Basic
+/// Render Driver) is only for when no GPU can make a device, such as while a
+/// display driver is being installed.
 #[inline]
 fn get_adapter(
     dxgi_factory: &IDXGIFactory6,
@@ -112,31 +115,95 @@ fn get_adapter(
     ID3D11DeviceContext,
     D3D_FEATURE_LEVEL,
 )> {
-    for adapter_index in 0.. {
-        let adapter: IDXGIAdapter1 = unsafe { dxgi_factory.EnumAdapters(adapter_index)?.cast()? };
-        if let Ok(desc) = unsafe { adapter.GetDesc1() } {
-            let gpu_name = String::from_utf16_lossy(&desc.Description)
-                .trim_matches(char::from(0))
-                .to_string();
-            log::info!("Using GPU: {}", gpu_name);
-        }
+    let (software, hardware): (Vec<_>, Vec<_>) =
+        adapters(dxgi_factory).partition(|adapter| is_software(adapter));
+    for adapter in hardware.into_iter().chain(software) {
+        let gpu_name = adapter_name(&adapter);
         // Check to see whether the adapter supports Direct3D 11 and create
         // the device if it does.
         let mut context: Option<ID3D11DeviceContext> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();
-        if let Some(device) = get_device(
+        match get_device(
             &adapter,
             Some(&mut context),
             Some(&mut feature_level),
             debug_layer_available,
-        )
-        .log_err()
-        {
-            return Ok((adapter, device, context.unwrap(), feature_level));
+        ) {
+            Ok(device) => {
+                if is_software(&adapter) {
+                    log::warn!(
+                        "Using GPU: {gpu_name} (software rendering: no hardware adapter made a device)"
+                    );
+                } else {
+                    log::info!("Using GPU: {gpu_name}");
+                }
+                return Ok((adapter, device, context.unwrap(), feature_level));
+            }
+            Err(error) => log::warn!("Skipping GPU {gpu_name}: {error:#}"),
         }
     }
+    Err(anyhow::anyhow!(
+        "No DXGI adapter could create a Direct3D 11 device"
+    ))
+}
 
-    unreachable!()
+fn adapters(dxgi_factory: &IDXGIFactory6) -> impl Iterator<Item = IDXGIAdapter1> + '_ {
+    (0..).map_while(move |index| unsafe { dxgi_factory.EnumAdapters1(index) }.ok())
+}
+
+fn adapter_name(adapter: &IDXGIAdapter1) -> String {
+    unsafe { adapter.GetDesc1() }.map_or_else(
+        |_| "<unknown>".to_owned(),
+        |desc| {
+            String::from_utf16_lossy(&desc.Description)
+                .trim_matches(char::from(0))
+                .to_string()
+        },
+    )
+}
+
+pub(crate) fn is_software(adapter: &IDXGIAdapter1) -> bool {
+    unsafe { adapter.GetDesc1() }
+        .is_ok_and(|desc| desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
+}
+
+/// Whether a hardware adapter can make a device now. A device made while the
+/// GPU was away (a driver update or reset) lands on the software rasterizer,
+/// which never reports itself lost; this is how recovery knows to move back.
+pub(crate) fn hardware_device_available() -> bool {
+    let Ok(factory) = get_dxgi_factory(false) else {
+        return false;
+    };
+    adapters(&factory)
+        .filter(|adapter| !is_software(adapter))
+        .any(|adapter| get_device(&adapter, None, None, false).is_ok())
+}
+
+/// Calls `changed` whenever a GPU adapter is added or removed, until it
+/// returns false. Display messages alone do not reliably follow a display
+/// driver coming back after an install.
+pub(crate) fn watch_adapter_changes(changed: impl Fn() -> bool + Send + 'static) {
+    let watch = move || -> Result<()> {
+        let factory: IDXGIFactory7 =
+            unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS::default()) }
+                .context("Creating DXGI factory")?;
+        let event = unsafe { CreateEventW(None, false, false, None) }
+            .context("Creating the adapter change event")?;
+        let registered = unsafe { factory.RegisterAdaptersChangedEvent(event) }
+            .context("Registering for adapter changes");
+        if registered.is_ok() {
+            while unsafe { WaitForSingleObject(event, INFINITE) } == WAIT_OBJECT_0 && changed() {}
+        }
+        unsafe { CloseHandle(event) }.log_err();
+        registered.map(drop)
+    };
+    std::thread::Builder::new()
+        .name("GpuAdapters".to_owned())
+        .spawn(move || {
+            watch().context("Watching GPU adapter changes").log_err();
+        })
+        .context("Starting the GPU adapter watcher")
+        .log_err();
 }
 
 #[inline]

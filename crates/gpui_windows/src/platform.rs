@@ -346,6 +346,14 @@ impl WindowsPlatform {
             .unwrap_or_default();
         let recovery = self.inner.state.device_recovery.clone();
 
+        crate::directx_devices::watch_adapter_changes({
+            let recovery = recovery.clone();
+            let all_windows = all_windows.clone();
+            move || {
+                recovery.request_check();
+                all_windows.strong_count() > 0
+            }
+        });
         std::thread::Builder::new()
             .name("GpuRecovery".to_owned())
             .spawn(move || {
@@ -353,7 +361,9 @@ impl WindowsPlatform {
                     if all_windows.upgrade().is_none() {
                         break;
                     }
-                    if (invalidated || check_device_lost(&directx_device.device))
+                    if (invalidated
+                        || check_device_lost(&directx_device.device)
+                        || stranded_on_software(&directx_device))
                         && let Err(err) = handle_gpu_device_lost(
                             &mut directx_device,
                             platform_window.as_raw(),
@@ -1470,6 +1480,18 @@ fn check_device_lost(device: &ID3D11Device) -> bool {
             true
         }
     }
+}
+
+/// A device made while the GPU was away stays on the software rasterizer;
+/// it moves back once a hardware adapter can make a device again.
+#[cfg(not(feature = "wgpu"))]
+fn stranded_on_software(devices: &DirectXDevices) -> bool {
+    let stranded = crate::directx_devices::is_software(&devices.adapter)
+        && crate::directx_devices::hardware_device_available();
+    if stranded {
+        log::warn!("A hardware GPU is available again; leaving software rendering");
+    }
+    stranded
 }
 
 #[cfg(not(feature = "wgpu"))]
