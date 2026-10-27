@@ -2,7 +2,7 @@
 name = "gpui_ce_derive_refineable"
 version = "0.2.2"
 edition = "2024"
-license = "Apache-2.0"
+license = "BSD-3-Clause AND Apache-2.0"
 publish = true
 description = "Derive macro for gpui-ce's Refineable (vendored from Zed)."
 
