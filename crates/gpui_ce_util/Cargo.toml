@@ -2,7 +2,7 @@
 name = "gpui_ce_util"
 version = "0.2.6"
 edition = "2024"
-license = "Apache-2.0"
+license = "BSD-3-Clause AND Apache-2.0"
 publish = true
 description = "Utility structs and functions used by gpui-ce (vendored from Zed's gpui_util)."
 repository = "https://github.com/gpui-ce/gpui-ce"

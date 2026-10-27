@@ -4,7 +4,7 @@ version = "0.1.0"
 description.workspace = true
 edition.workspace = true
 publish.workspace = true
-license = "Apache-2.0"
+license = "BSD-3-Clause AND Apache-2.0"
 
 [lints]
 workspace = true

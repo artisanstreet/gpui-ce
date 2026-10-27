@@ -2,7 +2,7 @@
 name = "gpui_ce_path"
 version = "0.2.2"
 edition = "2024"
-license = "Apache-2.0"
+license = "BSD-3-Clause AND Apache-2.0"
 publish = true
 description = "Relative/absolute path types used by gpui-ce (vendored from Zed's path crate)."
 repository = "https://github.com/gpui-ce/gpui-ce"
